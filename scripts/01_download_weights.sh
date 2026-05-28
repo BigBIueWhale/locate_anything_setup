@@ -12,6 +12,48 @@ _SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 source "${_SCRIPT_DIR}/lib/common.sh"
 load_versions
 
+print_help() {
+    cat <<EOF
+01_download_weights.sh — pull the model snapshot and generate the
+calibration image.
+
+Usage:
+    bash scripts/01_download_weights.sh [-h|--help]
+
+Three concrete actions:
+
+    1. Pull ${LA_MODEL_HF_REPO}
+       at commit ${LA_MODEL_HF_REVISION}
+       into ./models/LocateAnything-3B/ via huggingface_hub's
+       snapshot_download (~7.66 GiB on first run).
+    2. Synthesize ./test_data/calibration.jpg (1024x768 RGB with four
+       polygons) for the in-container boot self-test.
+    3. Regenerate rust_server/Cargo.lock if missing, using the host's
+       cargo. (Already present on a normal checkout.)
+
+Idempotent: each step skips itself if its output already exists at
+sufficient size. To force a re-download, delete ./models/LocateAnything-3B/.
+
+Network: needed only when ./models/LocateAnything-3B/ is missing or
+incomplete. The huggingface_hub download is checked against HF's LFS
+SHA-256 per file during download. Boot-time content verification
+(scripts/lib/versions.sh-pinned per-file SHA-256) catches any
+corruption introduced after the download succeeded.
+
+Runs under Docker as the host user (no sudo, no host pip pollution).
+
+EOF
+}
+
+for arg in "$@"; do
+    case "${arg}" in
+        -h|--help) print_help; exit 0 ;;
+        *) log_err "unknown argument: ${arg@Q}"
+           log_err "Run 'bash scripts/01_download_weights.sh --help' for usage."
+           exit 2 ;;
+    esac
+done
+
 PROJECT_ROOT="$(project_root)"
 LOCAL_MODEL_DIR="${PROJECT_ROOT}/models/LocateAnything-3B"
 TEST_DATA_DIR="${PROJECT_ROOT}/test_data"

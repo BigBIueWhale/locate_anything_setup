@@ -15,6 +15,45 @@ _SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 source "${_SCRIPT_DIR}/lib/common.sh"
 load_versions
 
+print_help() {
+    cat <<EOF
+00_validate_host.sh — strict host-precondition checks.
+
+Usage:
+    bash scripts/00_validate_host.sh [-h|--help]
+
+Refuses to run as root. Verifies, in this order:
+
+    OS                Ubuntu 24.04 LTS (noble)
+    NVIDIA driver     ≥ ${LA_REQUIRE_DRIVER_MIN}
+    GPU               compute capability == ${LA_REQUIRE_GPU_COMPUTE_CAP} (sm_120 / Blackwell)
+    GPU VRAM          ≥ ${LA_REQUIRE_GPU_MEM_MIN_MIB} MiB
+    Docker            major == ${LA_REQUIRE_DOCKER_MAJOR} and 'docker ps' works
+    nvidia runtime    registered in 'docker info'
+    nvidia-ctk        == ${LA_REQUIRE_NVCTK_VERSION}
+    GPU passthrough   'docker run --gpus all nvidia/cuda nvidia-smi' succeeds
+    Disk free         ≥ ${LA_REQUIRE_DISK_FREE_GIB} GiB at the project directory
+    Host port         ${LA_HOST_PORT} is unbound
+
+Read-only: this script does not modify the host. It only reads
+system metadata (and pulls the GPU-smoke image if not cached, then
+runs it once with --rm). All pins are defined in
+scripts/lib/versions.sh.
+
+Idempotent: re-running on a healthy host is a fast no-op.
+
+EOF
+}
+
+for arg in "$@"; do
+    case "${arg}" in
+        -h|--help) print_help; exit 0 ;;
+        *) log_err "unknown argument: ${arg@Q}"
+           log_err "Run 'bash scripts/00_validate_host.sh --help' for usage."
+           exit 2 ;;
+    esac
+done
+
 log_section "Host preflight"
 
 # ---- root check (reverse) -------------------------------------------------

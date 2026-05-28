@@ -11,17 +11,47 @@ load_versions
 PROJECT_ROOT="$(project_root)"
 cd "${PROJECT_ROOT}"
 
-# --- --rebuild flag ---
-# Default behavior: if an image with the pinned tag is already present
-# locally, skip the build. This is what makes setup.sh offline-resumable
-# after a reboot when the build succeeded once. Pass `--rebuild` to
-# force a fresh build (the BuildKit layer cache still helps — only
-# changed layers are rebuilt).
+print_help() {
+    cat <<EOF
+02_build_image.sh — build the Docker image.
+
+Usage:
+    bash scripts/02_build_image.sh [-h|--help] [--rebuild]
+
+Builds the multi-stage image at tag '${LA_IMAGE_TAG}' from
+./Dockerfile. Forwards every version pin from scripts/lib/versions.sh
+as a --build-arg.
+
+First build: ~25 minutes wall time, dominated by the flash-attn
+${LA_FLASH_ATTN_VERSION} source compile (FLASH_ATTN_CUDA_ARCHS=${LA_FLASH_ATTN_ARCHS},
+MAX_JOBS=8). Subsequent runs reuse BuildKit's layer cache, so source
+edits to worker/ or rust_server/ rebuild only the small COPY layers
+near the end.
+
+Flags:
+
+    --rebuild   Force a fresh build even when an image with the
+                pinned tag is already present locally. Without this
+                flag, the script short-circuits with an "already
+                built" message when 'docker image inspect ${LA_IMAGE_TAG}'
+                succeeds — that's what makes setup.sh offline-resumable
+                after a reboot.
+
+Idempotent in the default mode (skip-if-built); not idempotent under
+--rebuild (the build runs even when the image is current).
+
+EOF
+}
+
+# --- arg parsing ---
 LA_REBUILD=0
 for arg in "$@"; do
     case "${arg}" in
+        -h|--help) print_help; exit 0 ;;
         --rebuild) LA_REBUILD=1 ;;
-        *) die "unknown arg ${arg@Q}; supported: --rebuild" ;;
+        *) log_err "unknown argument: ${arg@Q}"
+           log_err "Run 'bash scripts/02_build_image.sh --help' for usage."
+           exit 2 ;;
     esac
 done
 

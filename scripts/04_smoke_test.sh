@@ -17,6 +17,46 @@ _SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 source "${_SCRIPT_DIR}/lib/common.sh"
 load_versions
 
+print_help() {
+    cat <<EOF
+04_smoke_test.sh — end-to-end smoke test.
+
+Usage:
+    bash scripts/04_smoke_test.sh [-h|--help]
+
+Concrete actions:
+
+    1. curl GET http://${LA_HOST_BIND_IP}:${LA_HOST_PORT}/v1/health         → assert status==ok
+    2. curl GET http://${LA_HOST_BIND_IP}:${LA_HOST_PORT}/v1/capabilities   → assert
+                model=='nvidia/LocateAnything-3B'
+    3. curl GET http://${LA_HOST_BIND_IP}:${LA_HOST_PORT}/v1/info           → log GPU name
+    4. docker exec '${LA_CONTAINER_NAME}' python /opt/locate_anything/
+       scripts/lib/smoke_ws_client.py → one Frame round-trip through
+       WS /v1/stream against the bundled calibration image. Asserts
+       the model is loaded, calibration ran, JPEG → JSON works, and
+       the parser produces a list shape.
+
+Prerequisites:
+    Container '${LA_CONTAINER_NAME}' must be running (scripts/03_start_service.sh)
+    'curl' and 'jq' on the host.
+
+Offline-safe: every step runs over loopback or via 'docker exec'.
+No 'pip install' fires, no auxiliary container is launched.
+
+Idempotent: read-only with respect to the running service.
+
+EOF
+}
+
+for arg in "$@"; do
+    case "${arg}" in
+        -h|--help) print_help; exit 0 ;;
+        *) log_err "unknown argument: ${arg@Q}"
+           log_err "Run 'bash scripts/04_smoke_test.sh --help' for usage."
+           exit 2 ;;
+    esac
+done
+
 BASE_URL="http://${LA_HOST_BIND_IP}:${LA_HOST_PORT}"
 PROJECT_ROOT="$(project_root)"
 

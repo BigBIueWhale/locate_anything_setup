@@ -8,6 +8,54 @@ _SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 source "${_SCRIPT_DIR}/lib/common.sh"
 load_versions
 
+print_help() {
+    cat <<EOF
+03_start_service.sh — start the container and wait until healthy.
+
+Usage:
+    bash scripts/03_start_service.sh [-h|--help]
+
+Concrete actions:
+
+    1. Create ./cache/huggingface (host-side RW bind mount) if absent.
+    2. If a previous '${LA_CONTAINER_NAME}' container exists, remove
+       it (regardless of state).
+    3. 'docker run -d' the image at '${LA_IMAGE_TAG}' with all the
+       hardening + GPU flags (--gpus all, --read-only, --tmpfs /tmp,
+       --cap-drop ALL, --security-opt no-new-privileges, AppArmor
+       docker-default, --memory ${LA_CONTAINER_MEM},
+       --cpus ${LA_CONTAINER_CPUS}, --pids-limit ${LA_CONTAINER_PIDS}, log
+       rotation ${LA_LOG_MAX_SIZE}×${LA_LOG_MAX_FILES}, healthcheck
+       deep-probe).
+    4. Verify via 'ss -tlnH' that the kernel-side listener is exactly
+       ${LA_HOST_BIND_IP}:${LA_HOST_PORT} (not 0.0.0.0, not [::], not [::1]).
+    5. Poll 'docker inspect .State.Health.Status' until 'healthy' or
+       fail loud (240 s start_period + 10 retries × 15 s interval).
+
+Bind mounts:
+    ./models/LocateAnything-3B  →  /opt/locate_anything/model    (RO)
+    ./cache/huggingface         →  /opt/locate_anything/hf_cache (RW)
+
+Idempotent: re-running while the service is healthy stops the old
+container, starts a fresh one off the same image, and re-verifies.
+
+Prerequisites: the image at '${LA_IMAGE_TAG}' must exist locally
+(scripts/02_build_image.sh) and the model snapshot at
+./models/LocateAnything-3B/ must be present
+(scripts/01_download_weights.sh).
+
+EOF
+}
+
+for arg in "$@"; do
+    case "${arg}" in
+        -h|--help) print_help; exit 0 ;;
+        *) log_err "unknown argument: ${arg@Q}"
+           log_err "Run 'bash scripts/03_start_service.sh --help' for usage."
+           exit 2 ;;
+    esac
+done
+
 PROJECT_ROOT="$(project_root)"
 LOCAL_MODEL_DIR="${PROJECT_ROOT}/models/LocateAnything-3B"
 HF_CACHE_DIR="${PROJECT_ROOT}/cache/huggingface"
