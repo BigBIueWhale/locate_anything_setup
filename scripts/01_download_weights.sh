@@ -31,6 +31,12 @@ Three concrete actions:
     3. Regenerate rust_server/Cargo.lock if missing, using the host's
        cargo. (Already present on a normal checkout.)
 
+Prerequisite: the main image at '${LA_IMAGE_TAG}' must exist
+locally — this script uses it as the Python helper for steps 1 and 2
+(it already carries huggingface_hub, hf_transfer, and Pillow at
+pinned versions). Run scripts/02_build_image.sh first, or use
+setup.sh which orders the steps correctly.
+
 Idempotent: each step skips itself if its output already exists at
 sufficient size. To force a re-download, delete ./models/LocateAnything-3B/.
 
@@ -71,23 +77,34 @@ if (( existing_safetensors >= required_min_bytes )); then
     log_info "Re-download by deleting ${LOCAL_MODEL_DIR}."
 else
     log_info "Local snapshot incomplete or absent — downloading."
-    # HOME=/tmp: the default python image's HOME is /, which is not
-    # writable when we run as host UID 1000 (--user below). Without an
-    # explicit HOME, `pip install` tries to write to /.local and fails
-    # with "Permission denied: '/.local'". Setting HOME to the
-    # in-container /tmp (writable, no bind-mount) lets pip place its
-    # own caches and __pycache__ files there. Output (the downloaded
-    # snapshot) still goes to /dst which is the host bind-mount.
+    # The helper here runs INSIDE the main project image
+    # (${LA_IMAGE_TAG}), which already carries pinned huggingface_hub,
+    # hf_transfer, and Pillow from scripts/02_build_image.sh. We override
+    # the image's ENTRYPOINT (tini + the worker supervisor) with an
+    # explicit `bash -c "python ..."`. Three concrete benefits:
+    #
+    #   - No second base image to pull (python:3.12-slim-bookworm is
+    #     gone). One less network dependency on every re-run.
+    #   - No `pip install` from PyPI. The deps are already content-
+    #     pinned in the main image's layers.
+    #   - No /tmp / HOME / chown shenanigans: the image's `la` user
+    #     UID maps to the host UID via --user, so files written into
+    #     the bind-mount /dst are host-owned automatically.
+    #
+    # Precondition: ${LA_IMAGE_TAG} must exist locally — which is why
+    # setup.sh runs scripts/02_build_image.sh BEFORE this script.
+    if ! docker image inspect "${LA_IMAGE_TAG}" >/dev/null 2>&1; then
+        die "image '${LA_IMAGE_TAG}' not present locally. Run scripts/02_build_image.sh first, or use setup.sh which orders steps correctly."
+    fi
     docker run --rm \
         -e HF_HUB_ENABLE_HF_TRANSFER=1 \
         -e HF_HUB_DISABLE_TELEMETRY=1 \
-        -e HOME=/tmp \
         -v "${LOCAL_MODEL_DIR}":/dst \
         --user "$(id -u):$(id -g)" \
-        "python:3.12-slim-bookworm" \
+        --entrypoint "" \
+        "${LA_IMAGE_TAG}" \
         bash -c "
             set -Eeuo pipefail
-            pip install --quiet --no-cache-dir huggingface_hub==${LA_HFHUB_VERSION} hf_transfer==${LA_HF_TRANSFER_VERSION}
             python -c '
 import os
 from huggingface_hub import snapshot_download
@@ -118,15 +135,18 @@ else
     # Synthesize a 1024x768 RGB image with three simple objects so the model
     # can produce a parseable output during boot calibration. This avoids
     # fetching a third-party image and keeps the build hermetic.
-    # Same HOME fix as above — see the snapshot_download invocation.
+    # Same main-image-as-helper pattern as the snapshot block above —
+    # Pillow is already installed there.
+    if ! docker image inspect "${LA_IMAGE_TAG}" >/dev/null 2>&1; then
+        die "image '${LA_IMAGE_TAG}' not present locally. Run scripts/02_build_image.sh first, or use setup.sh which orders steps correctly."
+    fi
     docker run --rm \
-        -e HOME=/tmp \
         -v "${TEST_DATA_DIR}":/dst \
         --user "$(id -u):$(id -g)" \
-        "python:3.12-slim-bookworm" \
+        --entrypoint "" \
+        "${LA_IMAGE_TAG}" \
         bash -c "
             set -Eeuo pipefail
-            pip install --quiet --no-cache-dir Pillow==11.1.0
             python <<'PY'
 from PIL import Image, ImageDraw
 img = Image.new('RGB', (1024, 768), (230, 230, 235))

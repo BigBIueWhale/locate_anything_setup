@@ -39,13 +39,16 @@ re-running on a healthy install is a verify-and-skip no-op.
   scripts/00_validate_host.sh     host preflight (driver, GPU, Docker,
                                   nvidia-container-toolkit, free disk,
                                   free port). Refuses to run as root.
-  scripts/01_download_weights.sh  pull nvidia/LocateAnything-3B at the
-                                  pinned commit (~7.66 GiB on first run;
-                                  no-op once present).
   scripts/02_build_image.sh       docker build. First run is ~25 min,
                                   dominated by the flash-attn 2.8.4
                                   source compile. Pass --rebuild to
                                   force a fresh build.
+  scripts/01_download_weights.sh  pull nvidia/LocateAnything-3B at the
+                                  pinned commit (~7.66 GiB on first run;
+                                  no-op once present). Uses the main
+                                  image (just built in step 02) as the
+                                  download helper — no second base image,
+                                  no pip install from PyPI.
   scripts/03_start_service.sh     docker run + wait until healthy. Also
                                   verifies the kernel-side listener is
                                   exactly ${LA_HOST_BIND_IP}:${LA_HOST_PORT}.
@@ -88,11 +91,16 @@ log_info "Bind:         ${LA_HOST_BIND_IP}:${LA_HOST_PORT} (loopback only)"
 # --- step 0: host validation --------------------------------------------
 bash "${_SCRIPT_DIR}/scripts/00_validate_host.sh"
 
-# --- step 1: weights + Cargo.lock + calibration image -------------------
-bash "${_SCRIPT_DIR}/scripts/01_download_weights.sh"
-
-# --- step 2: docker build ------------------------------------------------
+# --- step 1: docker build ------------------------------------------------
+# Build precedes the weight download because the weight-download helper
+# uses the just-built main image (which carries huggingface_hub +
+# hf_transfer + Pillow). Building first means we don't need to pull a
+# second base image (python:3.12-slim-bookworm) and don't run any
+# pip install from PyPI in the helper — both are offline-fragile.
 bash "${_SCRIPT_DIR}/scripts/02_build_image.sh"
+
+# --- step 2: weights + Cargo.lock + calibration image -------------------
+bash "${_SCRIPT_DIR}/scripts/01_download_weights.sh"
 
 # --- step 3: start container & wait healthy ------------------------------
 bash "${_SCRIPT_DIR}/scripts/03_start_service.sh"
