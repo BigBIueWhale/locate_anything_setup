@@ -92,7 +92,14 @@ LA_TOKENIZERS_VERSION="0.22.0"
 LA_ACCELERATE_VERSION="1.5.2"
 LA_PEFT_VERSION="0.12.0"
 LA_SENTENCEPIECE_VERSION="0.2.0"
-LA_NUMPY_VERSION="1.25.0"
+# numpy: the upstream Embodied/pyproject.toml says >=1.25,<2. NVIDIA's
+# model-card example pins exactly 1.25.0, but 1.25.0 has no cp312 wheel
+# (Python 3.12 support landed in numpy 1.26.0, Sep 2023). pip's sdist
+# fallback for 1.25.0 then fails on Python 3.12 because setuptools'
+# pkg_resources references pkgutil.ImpImporter which 3.12 removed.
+# 1.26.4 is the last 1.x release, ships cp312 wheels, and stays within
+# the upstream <2 constraint.
+LA_NUMPY_VERSION="1.26.4"
 LA_PILLOW_VERSION="11.1.0"
 LA_OPENCV_VERSION="4.11.0.86"
 LA_DECORD_VERSION="0.6.0"
