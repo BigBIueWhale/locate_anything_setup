@@ -106,6 +106,61 @@ across a reboot.
 
 ---
 
+## Offline contract — what survives a global network outage
+
+The honest answer in one table:
+
+| Scenario                                     | Internet needed? |
+|----------------------------------------------|------------------|
+| Service running, host reboot                 | **No.** `--restart unless-stopped` brings the container back from the local image, weights bind-mounted from `./models/`. |
+| `./setup.sh` re-run after a successful first install | **No.** Every step short-circuits: GPU smoke uses `--pull=never` against the digest-pinned cached image, build skips because the image tag exists, weights skip because they're at full size on disk, container start uses the local image, smoke runs `docker exec`. |
+| `./uninstall.sh --remove-image` then re-`setup.sh` | **Yes — for the build only.** The image has to be re-built (`docker build` will pull the digest-pinned base images and the apt / PyPI / flash-attn deps the `RUN` layers need). Weights are kept by default and skip. |
+| `./uninstall.sh --remove-weights` then re-`setup.sh` | **Yes — for the HF download.** Weights have to be re-fetched from `https://huggingface.co/${LA_MODEL_HF_REPO}@${LA_MODEL_HF_REVISION}`. Build is skipped if the image is still cached. |
+| Brand-new box, never installed                | **Yes.** First install needs ~9 GiB of Docker base images + ~7.66 GiB of weights + ~500 MiB of PyPI wheels + the flash-attn source tarball. There is no way around this without sneakernet. |
+
+Every upstream artifact this project pulls is **pinned by sha256
+content digest**, not by a mutable tag:
+
+  - `nvidia/cuda:13.0.3-cudnn-devel-ubuntu24.04@sha256:0230...` — the build base
+  - `nvidia/cuda:13.0.3-base-ubuntu24.04@sha256:7c74...` — the GPU smoke image
+  - `rust:1.95-bookworm@sha256:6258...` — the Rust builder base
+  - `nvidia/LocateAnything-3B` at commit `7a81d810…` — the model weights
+  - Every `.py` and weight file inside the snapshot — content SHA-256
+    verified at every container boot by `worker/validate_startup.py`
+
+Re-pulls fetch exactly the same bytes you reviewed; an upstream
+tag re-publish cannot change behavior under your feet.
+
+### Sneakernet pattern for a target box with no internet
+
+If you have one box that can reach the network and one that cannot,
+the workflow is:
+
+```bash
+# On the box that has internet:
+./setup.sh                              # build + download
+docker save -o /tmp/locate-anything.tar \
+    locate-anything:la3b-cu130-torch2.12-fa2.8.4 \
+    nvidia/cuda:13.0.3-base-ubuntu24.04 \
+    nvidia/cuda:13.0.3-cudnn-devel-ubuntu24.04 \
+    rust:1.95-bookworm
+tar -czf /tmp/la_models.tar.gz ./models/
+
+# Copy /tmp/locate-anything.tar and /tmp/la_models.tar.gz
+# to a USB drive, walk to the offline box.
+
+# On the offline box:
+docker load -i locate-anything.tar     # restores all four images
+tar -xzf la_models.tar.gz              # restores ./models/
+./setup.sh                             # every step short-circuits;
+                                       # no network calls at all
+```
+
+The smoke test (`scripts/04_smoke_test.sh`) is fully offline-safe by
+design — it runs via `docker exec` against the running container,
+using the smoke client baked into the image. No `pip install`, no
+auxiliary container, no upstream contact.
+
 ## Offline operation
 
 After a successful `setup.sh` run, **the service runs entirely

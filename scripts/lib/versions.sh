@@ -53,13 +53,20 @@ LA_MODEL_PY_SHA256_modeling_qwen2="aadb676c0a587a16b7071977c159df16299fad22d88ee
 LA_MODEL_PY_SHA256_modeling_vit="96479eb121c840f009a32830c78740154171290419108caefcf8778580700373"
 LA_MODEL_PY_SHA256_processing_locateanything="682145ed054b1e912e66273b476e51a25b2d666d4a37b26385af9300b66d40d8"
 
-# ===== Container base image =====
+# ===== Container base image (multistage runtime stage) =====
 # Pinned by sha256 manifest-list digest. Tags are mutable — digests are not.
 # Obtained from registry-1.docker.io's Docker-Content-Digest header
 # (the source of truth, not Hub's web UI).
 LA_CUDA_BASE_IMAGE_TAG="nvidia/cuda:13.0.3-cudnn-devel-ubuntu24.04"
 LA_CUDA_BASE_IMAGE_DIGEST="sha256:0230b7f243483cb15969fa3cc724a9459599604427052fc2a0d4291c7c0647dd"
 LA_CUDA_BASE_IMAGE="${LA_CUDA_BASE_IMAGE_TAG}@${LA_CUDA_BASE_IMAGE_DIGEST}"
+
+# ===== GPU smoke-test image (used by 00_validate_host.sh) =====
+# A smaller CUDA base, just enough to run `nvidia-smi` for the GPU
+# passthrough check. Same digest-pinning policy as the main base.
+LA_GPU_SMOKE_IMAGE_TAG="nvidia/cuda:13.0.3-base-ubuntu24.04"
+LA_GPU_SMOKE_IMAGE_DIGEST="sha256:7c7413a56200486f71f181cad9310f6fd31b6bb21816ade15fc9c1e1e927a5c1"
+LA_GPU_SMOKE_IMAGE="${LA_GPU_SMOKE_IMAGE_TAG}@${LA_GPU_SMOKE_IMAGE_DIGEST}"
 
 # ===== Python and PyTorch =====
 # Ubuntu 24.04 ships python3.12 natively; we install python3.12 explicitly so

@@ -141,23 +141,36 @@ log_ok "nvidia-container-toolkit: ${NVCTK_VER}"
 # Verify GPU passthrough actually works.
 #
 # Two paths: if the smoke-test image is already cached locally, use
-# `--pull never` so the check is fully offline. If it's NOT cached, do
-# a `docker pull` explicitly first (so the failure message is precise:
-# "couldn't pull" rather than "couldn't run").
-LA_GPU_SMOKE_IMAGE="nvidia/cuda:13.0.3-base-ubuntu24.04"
-if docker image inspect "${LA_GPU_SMOKE_IMAGE}" >/dev/null 2>&1; then
-    log_ok "GPU smoke image '${LA_GPU_SMOKE_IMAGE}' present locally — running offline-safe smoke."
+# `--pull never` so the check is fully offline. If it's NOT cached,
+# pull the digest-pinned form. The digest pin survives upstream tag
+# mutations — Docker will refuse to load anything other than the
+# exact bytes named in versions.sh's LA_GPU_SMOKE_IMAGE_DIGEST.
+# Use LA_GPU_SMOKE_IMAGE_TAG (no digest) for local cache lookup, since
+# 'docker image inspect tag' resolves to whatever was last pulled.
+if docker image inspect "${LA_GPU_SMOKE_IMAGE_TAG}" >/dev/null 2>&1; then
+    LOCAL_DIGEST=$(docker image inspect "${LA_GPU_SMOKE_IMAGE_TAG}" \
+        --format '{{range .RepoDigests}}{{println .}}{{end}}' 2>/dev/null \
+        | head -1)
+    if [[ "${LOCAL_DIGEST}" != *"${LA_GPU_SMOKE_IMAGE_DIGEST}"* ]]; then
+        die "GPU smoke image '${LA_GPU_SMOKE_IMAGE_TAG}' is locally cached but \
+its digest does not match the pin in versions.sh.
+Local : ${LOCAL_DIGEST}
+Pinned: ${LA_GPU_SMOKE_IMAGE_DIGEST}
+Either the tag was re-published upstream (and you should review what changed before bumping the pin), or you have a stale local cache. To force the pinned bytes: \
+'docker rmi ${LA_GPU_SMOKE_IMAGE_TAG} && docker pull ${LA_GPU_SMOKE_IMAGE}'."
+    fi
+    log_ok "GPU smoke image '${LA_GPU_SMOKE_IMAGE_TAG}' present locally (digest matches pin) — running offline-safe smoke."
     GPU_SMOKE_PULL_FLAG="--pull=never"
 else
-    log_info "GPU smoke image not cached; pulling now (needs internet)…"
+    log_info "GPU smoke image not cached; pulling digest-pinned form now (needs internet)…"
     if ! docker pull "${LA_GPU_SMOKE_IMAGE}" >/dev/null; then
         die "docker pull '${LA_GPU_SMOKE_IMAGE}' failed. If you are offline, pre-cache this image; otherwise check connectivity to docker.io."
     fi
     GPU_SMOKE_PULL_FLAG="--pull=never"
 fi
-if ! docker run --rm "${GPU_SMOKE_PULL_FLAG}" --gpus all "${LA_GPU_SMOKE_IMAGE}" \
+if ! docker run --rm "${GPU_SMOKE_PULL_FLAG}" --gpus all "${LA_GPU_SMOKE_IMAGE_TAG}" \
         nvidia-smi --query-gpu=name --format=csv,noheader >/dev/null 2>&1; then
-    die "Docker GPU passthrough failed — 'docker run --gpus all ${LA_GPU_SMOKE_IMAGE} nvidia-smi' did not work."
+    die "Docker GPU passthrough failed — 'docker run --gpus all ${LA_GPU_SMOKE_IMAGE_TAG} nvidia-smi' did not work."
 fi
 log_ok "Docker GPU passthrough: smoke test passed"
 
