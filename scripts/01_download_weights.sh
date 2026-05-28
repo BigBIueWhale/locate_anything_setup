@@ -71,9 +71,17 @@ if (( existing_safetensors >= required_min_bytes )); then
     log_info "Re-download by deleting ${LOCAL_MODEL_DIR}."
 else
     log_info "Local snapshot incomplete or absent — downloading."
+    # HOME=/tmp: the default python image's HOME is /, which is not
+    # writable when we run as host UID 1000 (--user below). Without an
+    # explicit HOME, `pip install` tries to write to /.local and fails
+    # with "Permission denied: '/.local'". Setting HOME to the
+    # in-container /tmp (writable, no bind-mount) lets pip place its
+    # own caches and __pycache__ files there. Output (the downloaded
+    # snapshot) still goes to /dst which is the host bind-mount.
     docker run --rm \
         -e HF_HUB_ENABLE_HF_TRANSFER=1 \
         -e HF_HUB_DISABLE_TELEMETRY=1 \
+        -e HOME=/tmp \
         -v "${LOCAL_MODEL_DIR}":/dst \
         --user "$(id -u):$(id -g)" \
         "python:3.12-slim-bookworm" \
@@ -110,7 +118,9 @@ else
     # Synthesize a 1024x768 RGB image with three simple objects so the model
     # can produce a parseable output during boot calibration. This avoids
     # fetching a third-party image and keeps the build hermetic.
+    # Same HOME fix as above — see the snapshot_download invocation.
     docker run --rm \
+        -e HOME=/tmp \
         -v "${TEST_DATA_DIR}":/dst \
         --user "$(id -u):$(id -g)" \
         "python:3.12-slim-bookworm" \
