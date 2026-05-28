@@ -1,0 +1,51 @@
+# Optional alternative to scripts/03_start_service.sh.
+# Reads pins from .env (generated at build time from scripts/lib/versions.sh,
+# OR provided manually).
+#
+# Use ./setup.sh for the canonical path. This file exists for users who want
+# `docker compose up -d` semantics. It does NOT regenerate the image — the
+# image must already be built by scripts/02_build_image.sh.
+
+services:
+  locate-anything:
+    image: "${LA_IMAGE_TAG:-locate-anything:la3b-cu130-torch2.12-fa2.8.4}"
+    container_name: "${LA_CONTAINER_NAME:-locate-anything}"
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:rw,size=512m,noexec,nosuid,nodev
+    mem_limit: "${LA_CONTAINER_MEM:-14g}"
+    memswap_limit: "${LA_CONTAINER_MEM:-14g}"
+    cpus: ${LA_CONTAINER_CPUS:-8}
+    pids_limit: ${LA_CONTAINER_PIDS:-512}
+    logging:
+      driver: json-file
+      options:
+        max-size: "${LA_LOG_MAX_SIZE:-50m}"
+        max-file: "${LA_LOG_MAX_FILES:-5}"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    volumes:
+      - ./models/LocateAnything-3B:/opt/locate_anything/model:ro
+      - ./cache/huggingface:/opt/locate_anything/hf_cache:rw
+    ports:
+      # Loopback-only — see docs/SECURITY.md.
+      - "${LA_HOST_BIND_IP:-127.0.0.1}:${LA_HOST_PORT:-8765}:${LA_INTERNAL_PORT:-8000}/tcp"
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+      - apparmor=docker-default
+    shm_size: 512m
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - "curl -fsS http://127.0.0.1:${LA_INTERNAL_PORT:-8000}/v1/health || exit 1"
+      interval: 15s
+      timeout: 8s
+      retries: 10
+      start_period: 240s

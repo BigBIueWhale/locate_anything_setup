@@ -1,0 +1,6 @@
+# Anchored to rust_server/. Matches only rust_server/target — NOT any
+# other "target" that might appear elsewhere in the repo.
+
+# Cargo build output. Cargo.toml + Cargo.lock are committed; their
+# build product is not.
+/target/

@@ -1,0 +1,13 @@
+# Specific per-file attributes. No wildcards — every entry names an
+# exact file (or directory of files where strictly applicable).
+
+# Cargo's lockfile is committed for reproducible builds but it is a
+# generated artifact, not source. Marking it `linguist-generated` keeps
+# it out of GitHub's language statistics and folds it by default in
+# pull-request diffs.
+/rust_server/Cargo.lock linguist-generated=true
+
+# Model SHA-256 pin metadata. These are content addresses that may be
+# updated mechanically (re-run the lookup subagent) and should fold
+# in diffs.
+/worker/validate_startup.py linguist-language=Python

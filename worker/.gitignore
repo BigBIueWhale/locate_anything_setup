@@ -1,0 +1,5 @@
+# Anchored to worker/. Matches only worker/__pycache__.
+
+# CPython bytecode cache. Generated whenever the worker modules are
+# imported (unit tests, ad-hoc python -c, container builds via COPY).
+/__pycache__/

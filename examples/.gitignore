@@ -1,0 +1,5 @@
+# Anchored to examples/. Matches only examples/__pycache__.
+
+# CPython bytecode cache. Generated if someone runs
+# examples/reference_client.py locally.
+/__pycache__/

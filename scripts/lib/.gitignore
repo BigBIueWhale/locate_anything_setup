@@ -1,0 +1,7 @@
+# Anchored to scripts/lib/. Matches only scripts/lib/__pycache__.
+
+# CPython bytecode cache. Generated if someone runs
+# scripts/lib/smoke_ws_client.py locally outside Docker (the canonical
+# smoke test runs it inside the container via docker exec, where /tmp
+# is tmpfs and bytecode caches go nowhere visible).
+/__pycache__/

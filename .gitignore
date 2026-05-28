@@ -1,0 +1,18 @@
+# Items ignored at the project ROOT only. Each entry begins with `/`
+# to anchor to this exact directory — `git` will not match these
+# patterns against same-named files/folders nested deeper. Subdirectories
+# that need their own ignores carry their own .gitignore files.
+
+# Downloaded model snapshot (~7.66 GiB safetensors + configs). Created by
+# scripts/01_download_weights.sh; never committed.
+/models/
+
+# HuggingFace download cache + CUDA JIT cache. Created by
+# scripts/03_start_service.sh on first run; never committed.
+/cache/
+
+# Synthesized calibration image for the boot self-test. Regenerated
+# by scripts/01_download_weights.sh. The test_data/ directory itself
+# is kept (it may carry hand-curated assets later); only the generated
+# JPEG is ignored.
+/test_data/calibration.jpg
