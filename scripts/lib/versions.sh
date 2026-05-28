@@ -81,9 +81,11 @@ LA_TORCH_CUDA_TAG="cu130"
 LA_TORCH_INDEX_URL="https://download.pytorch.org/whl/${LA_TORCH_CUDA_TAG}"
 
 # ===== Flash-attention 2 (source-built for sm_120) =====
-# 2.8.4 is the latest 2.x stable. Source build (~25 min on this CPU).
-# FA4 does NOT run on RTX 5090 — TMEM hardware missing on GB202.
-LA_FLASH_ATTN_VERSION="2.8.4"
+# 2.8.3 is the latest 2.x stable on PyPI (verified live against
+# https://pypi.org/pypi/flash-attn/json — an earlier research subagent
+# claimed 2.8.4 existed; it does not). FA4 does NOT run on RTX 5090
+# — TMEM hardware missing on GB202. Source build (~25 min on this CPU).
+LA_FLASH_ATTN_VERSION="2.8.3"
 LA_FLASH_ATTN_ARCHS="120"     # only build sm_120 kernels — fast build, exact match
 
 # ===== Model code's mandated dependencies (Embodied/pyproject.toml + model card) =====
