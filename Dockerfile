@@ -15,13 +15,27 @@
 # ============================================================================
 
 # ----------------------------------------------------------------------------
-# Stage 1 — Rust builder
+# Global ARGs.
+#
+# Any ARG used in a FROM directive MUST be declared BEFORE the first
+# FROM in the Dockerfile so it lives in the global scope. ARGs
+# declared between FROM directives are stage-local to the preceding
+# stage and are NOT visible to subsequent FROMs — BuildKit refuses
+# the build with "base name should not be blank" in that case. We
+# learned this the hard way the first time the build actually ran.
+#
+# If the operator forgets to pass either of these as --build-arg, the
+# corresponding FROM below fails cleanly with an unambiguous error
+# naming the ARG. We don't add a separate `RUN test -n "${ARG}"`
+# guard because the FROM itself is already a strict-fail guard.
 # ----------------------------------------------------------------------------
 ARG LA_RUST_BUILDER_IMAGE
-FROM ${LA_RUST_BUILDER_IMAGE} AS rust_builder
+ARG LA_CUDA_BASE_IMAGE
 
-RUN test -n "${LA_RUST_BUILDER_IMAGE}" \
- || { echo "FAIL: LA_RUST_BUILDER_IMAGE arg is empty"; exit 1; }
+# ----------------------------------------------------------------------------
+# Stage 1 — Rust builder
+# ----------------------------------------------------------------------------
+FROM ${LA_RUST_BUILDER_IMAGE} AS rust_builder
 
 WORKDIR /work
 # Copy only the manifest first to leverage Docker's layer cache:
@@ -43,8 +57,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 # ----------------------------------------------------------------------------
 # Stage 2 — Runtime
+# (ARG LA_CUDA_BASE_IMAGE is declared globally at the top of this file.)
 # ----------------------------------------------------------------------------
-ARG LA_CUDA_BASE_IMAGE
 FROM ${LA_CUDA_BASE_IMAGE} AS runtime
 
 # ---- Build args (forwarded from versions.sh through docker compose) ------
