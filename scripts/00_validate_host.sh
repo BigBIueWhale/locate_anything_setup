@@ -107,8 +107,20 @@ fi
 log_ok "Docker: ${DOCKER_VER} reachable"
 
 # ---- nvidia-container-toolkit smoke ----
-if ! docker info 2>/dev/null | grep -q "Runtimes:.*nvidia"; then
-    die "Docker reports no 'nvidia' runtime — run §13 of personal_server."
+# Distinguish three conditions instead of treating them identically:
+#   (a) docker info itself fails (daemon hiccup, permission, etc.)
+#   (b) docker info succeeds but no 'nvidia' runtime is registered
+#   (c) docker info succeeds and the runtime is registered (the OK path)
+# Previously (a) and (b) emitted the same misleading "runtime not
+# registered" message, which on a transient daemon issue sent the
+# operator chasing a non-existent /etc/docker/daemon.json problem.
+DOCKER_INFO_OUT=$(docker info 2>&1) || die \
+"docker info failed (exit non-zero); cannot determine runtime registration. \
+Daemon may be restarting or unreachable. Re-run after a few seconds. \
+docker info stderr: ${DOCKER_INFO_OUT}"
+if ! grep -q "Runtimes:.*nvidia" <<< "${DOCKER_INFO_OUT}"; then
+    die "Docker reports no 'nvidia' runtime — run §13 of personal_server. \
+Actual 'Runtimes:' line: $(grep -E '^[[:space:]]*Runtimes:' <<< "${DOCKER_INFO_OUT}" || echo '(none found)')"
 fi
 # Pin enforcement: the daemon-registered runtime is one signal, but we also
 # verify the toolkit binary version matches the pin in versions.sh. A
