@@ -107,7 +107,12 @@ LA_LMDB_VERSION="1.7.5"
 
 # ===== Python sidecar deps (orthogonal to model correctness) =====
 # The model sidecar only talks Unix domain socket — no HTTP, no FastAPI.
-LA_HFHUB_VERSION="0.27.0"     # huggingface_hub for snapshot_download
+# huggingface_hub. The earlier pin of 0.27.0 was incompatible with the
+# transformers==4.57.1 pin: transformers 4.57.1 requires
+# huggingface_hub>=0.34.0,<1.0. 0.36.2 is the latest stable in that
+# range (Feb 2026). Verified by running pip install --dry-run with the
+# full pin set inside python:3.12-slim-bookworm — resolves cleanly.
+LA_HFHUB_VERSION="0.36.2"
 LA_HF_TRANSFER_VERSION="0.1.8"  # fast downloads
 LA_PSUTIL_VERSION="6.1.0"
 # `websockets` is installed only because the smoke client (run via
