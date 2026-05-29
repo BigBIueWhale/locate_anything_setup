@@ -257,6 +257,7 @@ def _patch_sdpa_to_mem_efficient(model) -> None:
           class: raises (the patch is functionally inert).
     """
     import sys
+    import inspect
     from torch.nn.attention import sdpa_kernel, SDPBackend
 
     # Find the trust_remote_code-loaded modeling_qwen2 module(s). The
@@ -277,6 +278,45 @@ def _patch_sdpa_to_mem_efficient(model) -> None:
             "to the math backend and OOMs at full LA_MAX_IMAGE_DIM. "
             "Refusing to start."
         )
+
+    # ---- STRICT PRE-PATCH SHAPE CHECK -----------------------------------
+    # Refuse to apply the patch unless the target class and its forward
+    # method look EXACTLY like what we developed against. The model file
+    # itself is already SHA-256 pinned in validate_startup.py, so this is
+    # defense-in-depth — but in case anyone ever forgets to update the
+    # pin alongside an upstream code change, the patch must NOT silently
+    # wrap a function it doesn't understand.
+    EXPECTED_QWEN2_FORWARD_PARAMS = (
+        "self", "hidden_states", "attention_mask", "position_ids",
+        "past_key_value", "output_attentions", "use_cache",
+    )
+    EXPECTED_QWEN2_BASE_NAME = "Qwen2Attention"
+    for mod in candidates:
+        cls = mod.Qwen2SdpaAttention
+        if getattr(cls, "_la_sdpa_patched", False):
+            continue
+        # Class identity: must inherit from Qwen2Attention.
+        base_names = tuple(b.__name__ for b in cls.__mro__)
+        if EXPECTED_QWEN2_BASE_NAME not in base_names:
+            raise RuntimeError(
+                f"SDPA mem-efficient patch ABORTED on strict pre-check: "
+                f"Qwen2SdpaAttention in module {mod.__name__!r} has MRO "
+                f"{base_names!r} — Qwen2Attention is not in the chain. "
+                "The class shape has drifted from what the patch was "
+                "developed against. Refusing to apply."
+            )
+        # Forward signature: must match exactly. positional / keyword,
+        # parameter names, parameter order.
+        sig = inspect.signature(cls.forward)
+        actual_params = tuple(sig.parameters)
+        if actual_params != EXPECTED_QWEN2_FORWARD_PARAMS:
+            raise RuntimeError(
+                f"SDPA mem-efficient patch ABORTED on strict pre-check: "
+                f"Qwen2SdpaAttention.forward signature has drifted. "
+                f"Expected parameters {EXPECTED_QWEN2_FORWARD_PARAMS!r}, "
+                f"observed {actual_params!r}. The wrapper would forward "
+                "the wrong kwargs. Refusing to apply."
+            )
 
     def _make_patched(orig_forward):
         def patched(self, hidden_states, attention_mask=None,
@@ -369,6 +409,7 @@ def _patch_vit_sdpa_to_mem_efficient() -> None:
     `_attn_implementation="sdpa"` (the dispatch dict at line 187-191).
     """
     import sys
+    import inspect
     import torch
     import torch.nn.functional as F
     from torch.nn.attention import sdpa_kernel, SDPBackend
@@ -389,6 +430,49 @@ def _patch_vit_sdpa_to_mem_efficient() -> None:
             "from materialising num_heads × N × N × bytes of attention "
             "probabilities at N=25,600). Refusing to start."
         )
+
+    # ---- STRICT PRE-PATCH SHAPE CHECK -----------------------------------
+    # The model file is SHA-256 pinned in validate_startup.py, but this
+    # patch must still refuse to apply to a `sdpa_attention` function
+    # whose signature has drifted in any way from what we developed
+    # against. The replacement function does NOT wrap the original —
+    # it reimplements it — so an unnoticed signature change would
+    # silently produce wrong outputs.
+    EXPECTED_VIT_SDPA_PARAMS = ("q", "k", "v", "q_cu_seqlens", "k_cu_seqlens")
+    EXPECTED_VIT_DISPATCH_KEYS = frozenset({"flash_attention_2", "sdpa", "eager"})
+    for mod in candidates:
+        if getattr(mod.sdpa_attention, "_la_sdpa_patched", False):
+            continue
+        # 1. Signature must match exactly.
+        sig = inspect.signature(mod.sdpa_attention)
+        actual_params = tuple(sig.parameters)
+        if actual_params != EXPECTED_VIT_SDPA_PARAMS:
+            raise RuntimeError(
+                f"MoonViT SDPA patch ABORTED on strict pre-check: "
+                f"modeling_vit.sdpa_attention signature has drifted. "
+                f"Expected parameters {EXPECTED_VIT_SDPA_PARAMS!r}, "
+                f"observed {actual_params!r}. The replacement function "
+                "would compute the wrong thing. Refusing to apply."
+            )
+        # 2. Dispatch dict must exist with exactly the expected key set.
+        # If a new attn impl appears (e.g. "magi") or the dict structure
+        # is reorganised, our swap might miss it.
+        if not hasattr(mod, "VL_VISION_ATTENTION_FUNCTIONS"):
+            raise RuntimeError(
+                f"MoonViT SDPA patch ABORTED: module {mod.__name__!r} has "
+                "no `VL_VISION_ATTENTION_FUNCTIONS` dict. The encoder "
+                "layer at modeling_vit.py:463 looks attention up from "
+                "this dict on every forward call — without it our patch "
+                "cannot affect the live forward path."
+            )
+        actual_keys = frozenset(mod.VL_VISION_ATTENTION_FUNCTIONS.keys())
+        if actual_keys != EXPECTED_VIT_DISPATCH_KEYS:
+            raise RuntimeError(
+                f"MoonViT SDPA patch ABORTED on strict pre-check: "
+                f"VL_VISION_ATTENTION_FUNCTIONS keys have drifted. "
+                f"Expected {sorted(EXPECTED_VIT_DISPATCH_KEYS)!r}, "
+                f"observed {sorted(actual_keys)!r}. Refusing to apply."
+            )
 
     def patched_sdpa_attention(q, k, v, q_cu_seqlens=None, k_cu_seqlens=None):
         seq_length = q.shape[0]
