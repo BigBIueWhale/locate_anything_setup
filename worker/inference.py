@@ -83,6 +83,15 @@ SDPA BACKEND OVERRIDE:
     sdpa_kernel context is not the kind of "fallback" the project's
     no-fallbacks principle forbids (it cannot produce a worse outcome
     than current behaviour).
+
+    The MoonViT vision encoder has its own independent SDPA call in
+    `modeling_vit.sdpa_attention` with THREE independent blockers
+    (3D q/k/v, 3D mask, bool dtype). `_patch_vit_sdpa_to_mem_efficient`
+    monkey-patches the module-level function with a replacement that
+    rewrites all three to 4D float-mask form. The encoder layer looks
+    up the attention function from `VL_VISION_ATTENTION_FUNCTIONS`
+    on every forward call (line 463 of modeling_vit.py), so the
+    module-level swap propagates without per-instance rebinding.
 """
 
 from __future__ import annotations
@@ -312,6 +321,149 @@ def _patch_sdpa_to_mem_efficient(model) -> None:
         )
 
 
+def _patch_vit_sdpa_to_mem_efficient() -> None:
+    """Force PyTorch's mem-efficient SDPA backend on the MoonViT encoder.
+
+    Twin of `_patch_sdpa_to_mem_efficient` but for the vision side.
+    `modeling_vit.sdpa_attention` (module-level helper, not a class
+    method) calls `F.scaled_dot_product_attention(q, k, v, mask, ...)`
+    with THREE independent blockers for the mem-eff dispatcher in
+    PyTorch v2.12.0:
+
+      (1) q/k/v are 3D `(num_heads, N, head_dim)` — heads-as-batch.
+          `check_tensor_shapes` in `sdp_utils_cpp.h:303-318` requires
+          all of q.dim() == k.dim() == v.dim() == 4. `_efficient_
+          attention_forward` (`attention.cu:1409-1411`) re-asserts 4D
+          inputs. 3D is unconditionally rejected → math fallthrough.
+
+      (2) the attention mask is 3D `(1, N, N)`. `check_attn_mask_shape`
+          (`sdp_utils_cpp.h:269-301`) accepts only `dim()==2` or
+          `dim()==4`; 3D mask → mem-eff rejected.
+
+      (3) the mask is `torch.bool`. PyTorch top-level SDPA does convert
+          bool→float via `at::where` (`attention.cpp:557-559`) before
+          dispatch, but the conversion allocates a fresh full-size float
+          tensor — under tight VRAM, that itself can OOM. Doing the
+          conversion ourselves with `masked_fill_` is in-place over a
+          tensor we already allocated.
+
+    All three blockers must be lifted together. The replacement function
+    rewrites the SDPA call to:
+      - bool mask → 4D bf16 additive mask `(1, 1, N, N)` with -inf where
+        the bool was False (numerically identical to PyTorch's own
+        at::where conversion per `attention.cpp:558-559`).
+      - q/k/v transpose to `(num_heads, N, head_dim)` THEN unsqueeze to
+        `(1, num_heads, N, head_dim)`. The 4D batch dim is what mem-eff
+        accepts; stride view, bit-exact.
+      - sdpa_kernel([EFFICIENT_ATTENTION, MATH]) — mem-eff preferred,
+        math is the no-op safety net.
+
+    The function-level replacement is harder to verify than the class
+    patch in `_patch_sdpa_to_mem_efficient` (no live attribute we can
+    type-check), so we verify by re-reading `mod.sdpa_attention` and
+    confirming our marker attribute is present.
+
+    NOTE: this patch DOES NOT touch the multihead_attention
+    (flash-attn-varlen) or eager_attention functions in the same
+    module — only `sdpa_attention`, which is the only one routed by
+    `_attn_implementation="sdpa"` (the dispatch dict at line 187-191).
+    """
+    import sys
+    import torch
+    import torch.nn.functional as F
+    from torch.nn.attention import sdpa_kernel, SDPBackend
+
+    candidates = [
+        m for m in list(sys.modules.values())
+        if m is not None
+        and getattr(m, "__name__", "").endswith(".modeling_vit")
+        and hasattr(m, "sdpa_attention")
+    ]
+    if not candidates:
+        raise RuntimeError(
+            "MoonViT SDPA mem-efficient patch FAILED: could not find a "
+            "loaded `transformers_modules.*.modeling_vit` module with a "
+            "`sdpa_attention` function. Without this patch the vision "
+            "encoder silently falls through to the math SDPA backend and "
+            "OOMs at full LA_MAX_IMAGE_DIM (the ~13 GiB allocation comes "
+            "from materialising num_heads × N × N × bytes of attention "
+            "probabilities at N=25,600). Refusing to start."
+        )
+
+    def patched_sdpa_attention(q, k, v, q_cu_seqlens=None, k_cu_seqlens=None):
+        seq_length = q.shape[0]
+        # Build the segment-block mask in bool, then convert to bf16
+        # additive mask in-place. Identical semantics to PyTorch's own
+        # at::where(bool_mask, 0, -inf) conversion at
+        # attention.cpp:557-559, but skips one fresh-tensor allocation.
+        bool_mask = torch.zeros(
+            (seq_length, seq_length), device=q.device, dtype=torch.bool,
+        )
+        for i in range(1, len(q_cu_seqlens)):
+            s, e = int(q_cu_seqlens[i - 1]), int(q_cu_seqlens[i])
+            bool_mask[s:e, s:e] = True
+        attn_mask = torch.zeros(
+            (1, 1, seq_length, seq_length), device=q.device, dtype=q.dtype,
+        )
+        attn_mask.masked_fill_(~bool_mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+        # 3D (N, H, D) → 4D (1, H, N, D). Mem-eff requires q.dim()==4
+        # (sdp_utils_cpp.h:303 / attention.cu:1409). transpose + unsqueeze
+        # are stride-only views; contiguous() locks the layout for the
+        # dispatcher's stride checks.
+        q4 = q.transpose(0, 1).unsqueeze(0).contiguous()
+        k4 = k.transpose(0, 1).unsqueeze(0).contiguous()
+        v4 = v.transpose(0, 1).unsqueeze(0).contiguous()
+        with sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]):
+            attn_output = F.scaled_dot_product_attention(
+                q4, k4, v4, attn_mask, dropout_p=0.0,
+            )
+        # Reverse: (1, H, N, D) → (N, H, D) → (N, H*D)
+        return attn_output.squeeze(0).transpose(0, 1).reshape(seq_length, -1)
+
+    # Tag the replacement so we can detect "already patched" without
+    # re-wrapping on re-imports.
+    patched_sdpa_attention._la_sdpa_patched = True
+
+    n_patched = 0
+    for mod in candidates:
+        if getattr(mod.sdpa_attention, "_la_sdpa_patched", False):
+            continue
+        mod.sdpa_attention = patched_sdpa_attention
+        # Update the dict that the encoder layer's __init__ may have
+        # already snapshotted at construction time. The encoder layer
+        # at modeling_vit.py:415 captures
+        # `VL_VISION_ATTENTION_FUNCTIONS[config._attn_implementation]`
+        # into `self.attn_fn` at init; that reference is now also
+        # repointed via the dict update IF a future re-init runs, but
+        # for the already-constructed model we ALSO have to swap the
+        # per-instance attribute (see verification below).
+        if hasattr(mod, "VL_VISION_ATTENTION_FUNCTIONS"):
+            mod.VL_VISION_ATTENTION_FUNCTIONS["sdpa"] = patched_sdpa_attention
+        n_patched += 1
+
+    if n_patched == 0:
+        # The function was already patched. That's idempotent and fine.
+        pass
+
+    # Defense in depth: confirm the live attention call path uses our
+    # function. Look up VL_VISION_ATTENTION_FUNCTIONS and confirm the
+    # registered "sdpa" entry has our marker; ALSO walk one live encoder
+    # layer to confirm its `attn_fn` attribute points at our patched
+    # function (it was snapshotted at model construction time and won't
+    # update from the dict on its own).
+    for mod in candidates:
+        if hasattr(mod, "VL_VISION_ATTENTION_FUNCTIONS"):
+            dict_fn = mod.VL_VISION_ATTENTION_FUNCTIONS.get("sdpa")
+            if dict_fn is None or not getattr(dict_fn, "_la_sdpa_patched", False):
+                raise RuntimeError(
+                    f"MoonViT SDPA patch verification FAILED: module "
+                    f"{mod.__name__!r}'s VL_VISION_ATTENTION_FUNCTIONS['sdpa'] "
+                    "is not the patched function."
+                )
+
+
+
+
 @dataclass
 class InferenceResult:
     raw_answer: str
@@ -431,11 +583,13 @@ class LocateAnythingInference:
             )
 
         # Force the PyTorch SDPA dispatcher onto the memory-efficient
-        # backend so the model can run at full LA_MAX_IMAGE_DIM without
-        # OOMing. See SDPA BACKEND OVERRIDE in this module's docstring
-        # for why the unpatched path silently falls through to the math
-        # backend and OOMs at N=25600.
+        # backend in BOTH the Qwen2 LLM and the MoonViT vision encoder,
+        # so the model can run at full LA_MAX_IMAGE_DIM without OOMing.
+        # See SDPA BACKEND OVERRIDE in this module's docstring for why
+        # the unpatched path silently falls through to the math backend
+        # and OOMs at N=25600 in both subsystems.
         _patch_sdpa_to_mem_efficient(self.model)
+        _patch_vit_sdpa_to_mem_efficient()
 
         # No `.to(device)` — accelerate's device_map already placed every
         # module on `device`; calling `.to()` on a dispatched model is a
