@@ -729,6 +729,51 @@ class LocateAnythingInference:
             # to what the client sees. exif_transpose normalizes to
             # display orientation (and strips the Orientation tag).
             raw = ImageOps.exif_transpose(raw)
+
+            # ICC profile-aware colour conversion to sRGB.
+            # PIL's bare `.convert("RGB")` discards any embedded ICC
+            # profile — Adobe-RGB / Display-P3 / ProPhoto-tagged JPEGs
+            # would then be interpreted as sRGB and silently shift in
+            # colour relative to NVIDIA's training distribution (which
+            # is sRGB-assumed). For drone detection this is mostly a
+            # boundary-confidence issue (sky and metal colours close
+            # to the perceptual edge of confident class), but for any
+            # colour-sensitive class boundary it's a real loss.
+            # PIL.ImageCms.profileToProfile does a real
+            # colour-managed transform when the source profile is
+            # tagged; we fall back to a plain `.convert("RGB")` only
+            # when there's no ICC tag at all (i.e. assume-sRGB, which
+            # matches both the training assumption and `.convert`'s
+            # documented behaviour). If the ICC transform itself errors
+            # for any reason (corrupt profile bytes, unsupported intent)
+            # we hard-fail rather than silently fall back to the colour
+            # shift — strict-trained-correct contract.
+            icc = raw.info.get("icc_profile")
+            if icc:
+                try:
+                    from PIL import ImageCms
+                    src_profile = ImageCms.ImageCmsProfile(io.BytesIO(icc))
+                    src_desc = ImageCms.getProfileDescription(src_profile).strip()
+                    if "sRGB" not in src_desc:
+                        # Truly non-sRGB tagged input — colour-manage to sRGB
+                        # via PCS-LAB so out-of-gamut colours are perceptually
+                        # mapped rather than clipped at the channel level.
+                        dst_profile = ImageCms.createProfile("sRGB")
+                        raw = ImageCms.profileToProfile(
+                            raw, src_profile, dst_profile,
+                            outputMode="RGB",
+                            renderingIntent=ImageCms.Intent.PERCEPTUAL,
+                        )
+                    # else: profile is already sRGB — skip the no-op
+                    # transform; convert() below will normalise mode.
+                except ValueError as e:
+                    raise ValueError(
+                        "ICC profile present but could not be converted to "
+                        f"sRGB: {type(e).__name__}: {e}. Strip or correct "
+                        "the profile client-side before sending — the model "
+                        "is trained on sRGB-assumed inputs and a wrong-tagged "
+                        "profile causes a silent colour shift."
+                    ) from e
             image = raw.convert("RGB")
         except _PIL_DECODE_EXCEPTIONS as e:
             # Narrowed catch: server-side errors (MemoryError, RuntimeError,
@@ -739,6 +784,29 @@ class LocateAnythingInference:
                 "header; if we got here PIL refused the data — check that "
                 "the encoder is producing baseline JPEG with mode L or RGB."
             ) from e
+
+        # Strict patch-budget check matching NVIDIA's training-time
+        # `in_token_limit=25600`. The Rust frontend's
+        # LA_MAX_IMAGE_DIM cap (2240 px per dim) means a square input
+        # tops out at (2240/28)² = 6400 LLM tokens, well under the
+        # budget — but the cap is configurable and this check is
+        # defense in depth: if anyone raises LA_MAX_IMAGE_DIM, this
+        # asserts the input still fits the trained spec rather than
+        # silently triggering the preprocessor's internal downscale.
+        # Token count is computed on the LLM-side grid (28 px per
+        # merged token = patch_size × merge_kernel_size).
+        w, h = image.width, image.height
+        n_tokens = ((w + 27) // 28) * ((h + 27) // 28)
+        if n_tokens > 25600:
+            raise ValueError(
+                f"image dimensions {w}x{h} require {n_tokens} LLM tokens, "
+                "exceeding the trained in_token_limit=25,600 "
+                "(image_processing_locateanything.py would internally downscale "
+                "to fit; the canonical training-correct path is for the "
+                "client to send within budget). Reduce dimensions so "
+                "ceil(W/28) × ceil(H/28) ≤ 25,600 — a square image at "
+                "2240 px per side uses 6,400 LLM tokens, well under cap."
+            )
 
         # Plan resize before model touches it — log for debug/audit.
         plan = plan_resize(image.width, image.height)

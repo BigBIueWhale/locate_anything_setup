@@ -310,6 +310,37 @@ async fn process_binary(
         )));
     }
 
+    // Strict trained-correct patch-budget gate. The model was trained with
+    // `in_token_limit = 25,600` LLM tokens at a 28-pixel-per-token grid
+    // (patch_size=14 × merge_kernel_size=2). Above this, the in-image
+    // preprocessor would silently downscale (BICUBIC) to fit — that's a
+    // documented behaviour but it means the model sees a different image
+    // than what the client sent. We refuse rather than let the downscale
+    // happen silently, so the client's frame_id correlates 1:1 with what
+    // the model actually saw at training-time spec.
+    //
+    // At the current LA_MAX_IMAGE_DIM=2240 cap this check is redundant —
+    // a square 2240×2240 image is only 6400 tokens. The check matters if
+    // the cap is ever raised, or if a non-square input pushes total
+    // tokens past 25,600 even with each side under cap.
+    const MERGED_TOKEN_PX: u64 = 28;          // patch_size × merge_kernel_size
+    const IN_TOKEN_LIMIT: u64  = 25_600;      // from preprocessor_config.json
+    let n_tokens = ((w as u64 + MERGED_TOKEN_PX - 1) / MERGED_TOKEN_PX)
+                 * ((h as u64 + MERGED_TOKEN_PX - 1) / MERGED_TOKEN_PX);
+    if n_tokens > IN_TOKEN_LIMIT {
+        return Err(ServerError::InvalidImage(format!(
+            "image dimensions {}x{} require {} LLM tokens, exceeding the \
+             trained `in_token_limit={}` (one merged token covers {}×{} px). \
+             The model's preprocessor would internally downscale to fit, \
+             producing detections relative to a smaller image than the one \
+             you sent — we refuse this rather than silently scale. Reduce \
+             dimensions so ceil(W/{}) × ceil(H/{}) ≤ {}.",
+            w, h, n_tokens, IN_TOKEN_LIMIT,
+            MERGED_TOKEN_PX, MERGED_TOKEN_PX,
+            MERGED_TOKEN_PX, MERGED_TOKEN_PX, IN_TOKEN_LIMIT
+        )));
+    }
+
     Ok(PendingFrame { header, jpeg })
 }
 

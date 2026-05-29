@@ -274,8 +274,69 @@ def validate_env() -> None:
        f"attn={os.environ['LA_ATTN_IMPL']}, dtype={os.environ['LA_MODEL_DTYPE']}")
 
 
+def validate_preprocessor_config(model_dir: str) -> None:
+    """Hard-fail on any drift in preprocessor_config.json from the canonical
+    LocateAnything-3B values.
+
+    The model card and NVIDIA's training pipeline pin these values; the
+    `image_processing_locateanything.py` default for `in_token_limit` is
+    *4096* — a 32× silent downgrade vs the trained value of 25,600 — so a
+    missing or wrong-typed config field would degrade detection quality
+    in a way that's invisible from the worker logs. Validate explicitly
+    so an upstream config drift hard-fails the boot.
+
+    Values verified against the cloned NVlabs/EAGLE Embodied training
+    pipeline (eaglevl/utils/locany/preprocessor_config.json carries the
+    same in_token_limit/patch_size/merge_kernel_size; the HF release adds
+    explicit image_mean/image_std/patch_size/processor_class to defend
+    against the code-side default footgun)."""
+    import json
+    cfg_path = Path(model_dir) / "preprocessor_config.json"
+    if not cfg_path.is_file():
+        fail(f"preprocessor_config.json missing at {cfg_path!s} — the model "
+             "directory is incomplete; re-run scripts/01_download_weights.sh.")
+    try:
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        fail(f"preprocessor_config.json could not be parsed: {type(e).__name__}: {e}")
+
+    EXPECTED = {
+        "image_processor_type":  "LocateAnythingImageProcessor",
+        "processor_class":       "LocateAnythingProcessor",
+        "in_token_limit":        25600,
+        "patch_size":            14,
+        "merge_kernel_size":     [2, 2],
+        "image_mean":            [0.5, 0.5, 0.5],
+        "image_std":             [0.5, 0.5, 0.5],
+    }
+    drift = []
+    for key, want in EXPECTED.items():
+        if key not in cfg:
+            drift.append(f"missing key {key!r} (expected {want!r})")
+            continue
+        got = cfg[key]
+        if got != want:
+            drift.append(f"{key}={got!r} (expected {want!r})")
+    if drift:
+        fail(
+            "preprocessor_config.json drift detected — refusing to start because "
+            "the model would be invoked with parameters different from how "
+            "NVIDIA trained it, silently degrading detection quality. "
+            "Drifted fields: " + "; ".join(drift)
+            + ". The canonical values are mirrored from the HF model card at "
+              "the pinned revision; if a real revision bump is intended, update "
+              "scripts/lib/versions.sh's content-SHA pin for "
+              "preprocessor_config.json AND update EXPECTED in "
+              "worker/validate_startup.py:validate_preprocessor_config — in "
+              "that order."
+        )
+    ok("preprocessor_config validated; in_token_limit=25600 patch_size=14 "
+       "merge_kernel_size=[2,2] image_mean=image_std=[0.5,0.5,0.5]")
+
+
 def run_all(model_dir: str) -> None:
     validate_env()
     validate_gpu()
     validate_model_dir(model_dir)
+    validate_preprocessor_config(model_dir)
     ok("all preflight checks passed")
