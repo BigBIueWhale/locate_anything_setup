@@ -289,6 +289,20 @@ RUN set -eux; \
     chown -R la:la /opt/locate_anything
 USER la
 
+# ---- Image content-hash stamp ------------------------------------------
+# scripts/02_build_image.sh computes a SHA-256 over the source files that
+# determine this image's content (Dockerfile, versions.sh, worker code,
+# Rust source, entrypoint) and forwards it as LA_CONFIG_HASH. We stamp
+# it onto the image as a LABEL so the next 02 invocation can detect when
+# the live source has drifted from what produced the existing image and
+# trigger a rebuild instead of incorrectly skipping with "tag exists".
+#
+# Declared as a late ARG so the cache invalidation is contained: only
+# this LABEL layer re-runs when the hash changes; all upstream layers
+# (apt, pip installs, flash-attn compile, COPYs) keep their cache.
+ARG LA_CONFIG_HASH
+LABEL org.locateanything.config-hash="${LA_CONFIG_HASH}"
+
 EXPOSE ${LA_INTERNAL_PORT}
 
 # tini supervises the entrypoint script, ensuring zombie reaping and

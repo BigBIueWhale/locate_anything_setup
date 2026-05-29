@@ -55,11 +55,62 @@ for arg in "$@"; do
     esac
 done
 
+# ---------------------------------------------------------------------
+# Source-hash gate.
+#
+# A pure tag-existence check is too coarse: it doesn't notice when the
+# source (Dockerfile / versions.sh / worker code / Rust source) has
+# drifted since the image was built. Editing a file, re-running setup,
+# would silently keep using the stale image — exactly the bug that
+# stranded the sdpa fix on the previous build.
+#
+# Fix: compute a SHA-256 over the set of files that determine the
+# image's content, stamp it onto the image as a LABEL at build time,
+# and compare against the live source on every subsequent invocation.
+# Match → skip; mismatch (or absent label) → rebuild.
+#
+# Files included in the hash:
+#   - Dockerfile                                  build instructions
+#   - scripts/lib/{versions.sh,common.sh,*.py}    build args + COPY'd
+#   - container/entrypoint.sh                     COPY'd into image
+#   - worker/*.py                                 COPY'd
+#   - rust_server/Cargo.{toml,lock}, src/**.rs    built into Rust stage
+#
+# Files explicitly NOT included (don't affect image content):
+#   - models/, cache/, test_data/                 bind-mounted at runtime
+#   - docs/, README.md                            informational only
+# ---------------------------------------------------------------------
+compute_config_hash() {
+    {
+        sha256sum Dockerfile
+        find scripts/lib -type f \( -name '*.sh' -o -name '*.py' \) -print0 \
+            | sort -z | xargs -0 sha256sum
+        sha256sum container/entrypoint.sh
+        find worker -type f -name '*.py' -print0 \
+            | sort -z | xargs -0 sha256sum
+        sha256sum rust_server/Cargo.toml rust_server/Cargo.lock
+        find rust_server/src -type f -name '*.rs' -print0 \
+            | sort -z | xargs -0 sha256sum
+    } | sha256sum | cut -d' ' -f1
+}
+
+EXPECTED_HASH=$(compute_config_hash)
+
 if [[ "${LA_REBUILD}" -eq 0 ]] && docker image inspect "${LA_IMAGE_TAG}" >/dev/null 2>&1; then
+    ACTUAL_HASH=$(docker image inspect "${LA_IMAGE_TAG}" \
+        --format '{{with .Config.Labels}}{{index . "org.locateanything.config-hash"}}{{end}}' \
+        2>/dev/null || echo "")
     LOCAL_ID=$(docker image inspect "${LA_IMAGE_TAG}" --format '{{.Id}}')
-    log_ok "Image '${LA_IMAGE_TAG}' already built (id=${LOCAL_ID:7:12}); skipping docker build."
-    log_info "Re-build with: bash scripts/02_build_image.sh --rebuild"
-    exit 0
+    if [[ "${EXPECTED_HASH}" == "${ACTUAL_HASH}" ]]; then
+        log_ok "Image '${LA_IMAGE_TAG}' already built (id=${LOCAL_ID:7:12}, config-hash=${EXPECTED_HASH:0:12}); skipping docker build."
+        log_info "Force a rebuild with: bash scripts/02_build_image.sh --rebuild"
+        exit 0
+    fi
+    if [[ -z "${ACTUAL_HASH}" ]]; then
+        log_info "Image '${LA_IMAGE_TAG}' (id=${LOCAL_ID:7:12}) exists but carries no config-hash label — it was built by an older revision of this script. Rebuilding so the new hash gets stamped."
+    else
+        log_info "Image '${LA_IMAGE_TAG}' (id=${LOCAL_ID:7:12}) was built from different source (image-hash=${ACTUAL_HASH:0:12}, current-source-hash=${EXPECTED_HASH:0:12}); rebuilding."
+    fi
 fi
 
 # ---------------------------------------------------------------------
@@ -167,6 +218,7 @@ docker build \
     --build-arg LA_MAX_INFLIGHT="${LA_MAX_INFLIGHT}" \
     --build-arg LA_UID="${UID_NUM}" \
     --build-arg LA_GID="${GID_NUM}" \
+    --build-arg LA_CONFIG_HASH="${EXPECTED_HASH}" \
     .
 
 log_ok "Image built: ${LA_IMAGE_TAG}"
