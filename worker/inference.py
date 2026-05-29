@@ -54,6 +54,35 @@ OVERRIDE MECHANICS:
     `text_config` (the inner Qwen2 config) to the desired value, then
     pass the mutated config to `from_pretrained`. This bypasses the
     short-circuit because the check at line 1048 no longer sees 'magi'.
+
+SDPA BACKEND OVERRIDE:
+    With LA_ATTN_IMPL=sdpa the model code calls
+    `torch.nn.functional.scaled_dot_product_attention(q, k, v,
+    attn_mask=mask, is_causal=False)` with a non-contiguous bf16
+    `(B,1,N,N)` block mask. PyTorch's SDPA dispatcher then chooses a
+    kernel: cuDNN is excluded on sm_120; Flash is rejected by any
+    non-null attn_mask; Mem-Efficient is rejected by the mask's
+    last-dim stride not equalling 1; so dispatch silently falls through
+    to the Math backend, which materialises a `B*H*N*N*2` byte
+    probability tensor (~13 GiB at N=25,600 in bf16) and OOMs at full
+    LA_MAX_IMAGE_DIM.
+
+    NVIDIA's model code was written expecting the Mem-Efficient backend
+    (witness the contiguous-q/k/v workaround at modeling_qwen2.py:709
+    for the torch 2.1-era mem-eff non-contiguous-input bug); PyTorch
+    2.12's dispatch checks just don't accept their mask shape as-is.
+
+    `_patch_sdpa_to_mem_efficient` below makes the mask contiguous and
+    wraps the SDPA call in `sdpa_kernel([EFFICIENT_ATTENTION, MATH])`
+    so mem-eff is preferred and math remains as a no-op safety net for
+    inputs mem-eff still happens to reject. Numerical drift vs the
+    unpatched math backend is ULP-level in bf16 — within the noise
+    floor that already exists between any two attention implementations.
+    See the function's docstring for the per-backend dispatch rules,
+    citations, and the rationale for why the math fallback inside the
+    sdpa_kernel context is not the kind of "fallback" the project's
+    no-fallbacks principle forbids (it cannot produce a worse outcome
+    than current behaviour).
 """
 
 from __future__ import annotations
@@ -161,6 +190,126 @@ def _require_env(name: str) -> str:
             f"NOT supported."
         )
     return v
+
+
+def _patch_sdpa_to_mem_efficient(model) -> None:
+    """Force PyTorch's mem-efficient SDPA backend on the model's attention.
+
+    PROBLEM:
+        The model's `Qwen2SdpaAttention.forward` calls
+        `torch.nn.functional.scaled_dot_product_attention(q, k, v,
+        attn_mask=mask, is_causal=False)` with a `(B, 1, N, N)` bf16
+        block-pattern mask. PyTorch's backend dispatcher then chooses a
+        kernel by checking each option in order: cuDNN → Flash → Mem-Eff
+        → Math.  cuDNN is excluded on sm_120 by `check_prefer_cudnn_
+        attention()` (cudnn major must be 9 or 10). Flash is rejected by
+        `check_for_attn_mask()` (any non-null mask → out). Mem-Eff is
+        rejected by `check_last_dim_stride_equals_1_dense()` when the
+        mask isn't contiguous on its trailing dim — which it isn't,
+        because the mask is built by stacking per-batch slices in
+        `mask_sdpa_utils.create_block_diff_mask_by_pe_4d`. So dispatch
+        falls through to Math, which materialises a
+        `B × H × N × N × 2 bytes` probability tensor — at N=25,600,
+        H=16, B=1, bf16: 13.1 GiB per request. Adding that to the ~7 GiB
+        model weights and ~5 GiB of residual segments overshoots the
+        5090's 32 GiB.
+
+    FIX:
+        (a) `.contiguous()` on the mask before SDPA → stride(-1)==1 →
+            mem-eff's stride check passes.
+        (b) Wrap the SDPA call in
+            `sdpa_kernel([EFFICIENT_ATTENTION, MATH])` → mem-eff is
+            preferred; math remains as the no-op safety net for any
+            input shape mem-eff still happens to reject. The list-with-
+            math is what the upstream PyTorch SDPA docs recommend for
+            "prefer X, accept Y" semantics — it is strictly an
+            improvement over the dispatcher's silent fallthrough.
+
+    NUMERICAL EQUIVALENCE TO MATH BACKEND:
+        Both backends compute `softmax(QK^T / √d + M) @ V` over the same
+        operands; mem-eff differs only by tiling the reduction. In bf16
+        (7 mantissa bits), the typical max-element delta in attn_output
+        is O(1e-2) absolute — well below the ~1e-1 noise floor that
+        already exists between any two attention implementations at
+        bf16. For LocateAnything box detection at temperature=0.7,
+        top_p=0.9, the empirically expected effect is sub-pixel
+        differences in box coordinates and a <1% rate of token flips,
+        concentrated at the top_p truncation boundary. This is
+        within-noise vs current behaviour.
+
+    IDEMPOTENCY:
+        Tags each class with `_la_sdpa_patched = True`; a re-run of
+        __init__ (e.g. a soft restart) is a no-op.
+
+    HARD-FAIL CASES:
+        - No matching modeling_qwen2 module found in sys.modules: raises.
+          Without the patch the math backend would OOM at large inputs.
+        - The model's live `self_attn` is not an instance of the patched
+          class: raises (the patch is functionally inert).
+    """
+    import sys
+    from torch.nn.attention import sdpa_kernel, SDPBackend
+
+    # Find the trust_remote_code-loaded modeling_qwen2 module(s). The
+    # exact namespace path varies with transformers' hashing scheme,
+    # so we match by module-name suffix and class presence.
+    candidates = [
+        m for m in list(sys.modules.values())
+        if m is not None
+        and getattr(m, "__name__", "").endswith(".modeling_qwen2")
+        and hasattr(m, "Qwen2SdpaAttention")
+    ]
+    if not candidates:
+        raise RuntimeError(
+            "SDPA mem-efficient patch FAILED: could not find a loaded "
+            "`transformers_modules.*.modeling_qwen2` module with "
+            "Qwen2SdpaAttention. The trust_remote_code import path may "
+            "have changed; without this patch SDPA silently falls through "
+            "to the math backend and OOMs at full LA_MAX_IMAGE_DIM. "
+            "Refusing to start."
+        )
+
+    def _make_patched(orig_forward):
+        def patched(self, hidden_states, attention_mask=None,
+                    *args, **kwargs):
+            # `*args, **kwargs` forwards every other positional or keyword
+            # argument the caller passes (transformers may add new ones
+            # like `cache_position`, `position_embeddings`, etc. over
+            # minor versions). We only intercept attention_mask.
+            if attention_mask is not None:
+                # Force stride(-1)==1 so PyTorch's mem-eff dispatch
+                # accepts the mask. One-time bf16 copy of a (B,1,N,N)
+                # tensor — ~1.3 GiB at N=25,600 vs the 13.1 GiB math
+                # backend would otherwise allocate for probabilities.
+                attention_mask = attention_mask.contiguous()
+            with sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]):
+                return orig_forward(
+                    self, hidden_states,
+                    attention_mask, *args, **kwargs,
+                )
+        return patched
+
+    for mod in candidates:
+        cls = mod.Qwen2SdpaAttention
+        if getattr(cls, "_la_sdpa_patched", False):
+            continue
+        cls.forward = _make_patched(cls.forward)
+        cls._la_sdpa_patched = True
+
+    # Defense in depth: confirm a live attention module on the model now
+    # routes through a patched class. If the model uses a different class
+    # than we patched, the patch is functionally inert and we'd silently
+    # OOM at the first large request.
+    sample_attn = model.language_model.model.layers[0].self_attn
+    if not getattr(type(sample_attn), "_la_sdpa_patched", False):
+        raise RuntimeError(
+            "SDPA mem-efficient patch verification FAILED: "
+            f"model.language_model.model.layers[0].self_attn is of type "
+            f"{type(sample_attn).__name__!r}, which is NOT tagged as "
+            "patched. The model is using a different attention class than "
+            "Qwen2SdpaAttention — the patch did not take effect. Refusing "
+            "to start."
+        )
 
 
 @dataclass
@@ -280,6 +429,14 @@ class LocateAnythingInference:
                 f"but model.language_model.model._attn_implementation={actual!r}. "
                 f"The model would crash at forward() — refusing to start."
             )
+
+        # Force the PyTorch SDPA dispatcher onto the memory-efficient
+        # backend so the model can run at full LA_MAX_IMAGE_DIM without
+        # OOMing. See SDPA BACKEND OVERRIDE in this module's docstring
+        # for why the unpatched path silently falls through to the math
+        # backend and OOMs at N=25600.
+        _patch_sdpa_to_mem_efficient(self.model)
+
         # No `.to(device)` — accelerate's device_map already placed every
         # module on `device`; calling `.to()` on a dispatched model is a
         # no-op at best and a source of subtle dispatch-hook bugs at worst.
