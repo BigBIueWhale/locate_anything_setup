@@ -270,14 +270,21 @@ docker logs -f --tail 200 locate-anything
 # inspect the published port mapping
 docker port locate-anything
 
-# trigger a model self-test from the host
+# trigger a model self-test from the host (single-client)
 docker exec locate-anything python /opt/locate_anything/scripts/lib/smoke_ws_client.py \
     --url "ws://127.0.0.1:8000/v1/stream" \
     --image /opt/locate_anything/test_data/calibration.jpg \
     --prompt 'Locate all the instances that matches the following description: person.' \
     --mode hybrid --timeout 60
 
+# concurrency probe: N parallel WebSocket clients sharing the same model
+# (validates FIFO time-share fairness across users — see script header
+# for which failure modes it catches)
+bash scripts/05_concurrency_smoke.sh                    # default: 2 clients × 4 frames
+bash scripts/05_concurrency_smoke.sh --num-clients 4    # heavier
+bash scripts/05_concurrency_smoke.sh --help             # all knobs
+
 # image and weight sizes on disk
-docker image inspect locate-anything:la3b-cu130-torch2.12-fa2.8.4 --format '{{.Size}}' | numfmt --to=iec
+docker image inspect locate-anything:la3b-cu130-torch2.12-fa2.8.3 --format '{{.Size}}' | numfmt --to=iec
 du -sh ./models ./cache ./rust_server/target 2>/dev/null
 ```
