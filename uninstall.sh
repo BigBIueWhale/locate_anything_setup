@@ -231,5 +231,13 @@ fi
 # Summary
 # ----------------------------------------------------------------------
 log_section "Uninstall complete"
-log_info "To set up again: bash setup.sh"
-log_info "To start the existing container (if --remove-image was NOT used): docker start ${LA_CONTAINER_NAME}"
+# Step 1 always removed the container, so `docker start ${LA_CONTAINER_NAME}`
+# would fail with "no such container" — never emit that hint. The correct
+# fast-path back to a running service is to recreate the container from
+# the preserved image (scripts/03_start_service.sh), but that only works
+# when the image AND the calibration JPEG are still on disk. Otherwise
+# the operator needs the full setup.sh.
+log_info "To set up from scratch (rebuilds anything removed): bash setup.sh"
+if [[ "${REMOVE_IMAGE}" -eq 0 && "${REMOVE_WEIGHTS}" -eq 0 ]]; then
+    log_info "To re-create the container from the preserved image: bash scripts/03_start_service.sh"
+fi
