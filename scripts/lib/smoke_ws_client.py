@@ -45,24 +45,34 @@ async def run(args):
         # Await the single response keyed by our frame_id. Only
         # result / error are valid on the WS in this protocol — any
         # other type is a real protocol bug, not something to skip.
+        # A WS Close from the server (1001/1008/1011) is a documented
+        # connection-fatal outcome — surface it as a clean FAIL line so
+        # CI logs aren't polluted by a Python stack trace.
         result = None
-        async with asyncio.timeout(args.timeout):
-            while True:
-                msg = await ws.recv()
-                obj = json.loads(msg)
-                t = obj.get("type")
-                fid = obj.get("frame_id")
-                if t == "result" and fid == "smoke-001":
-                    result = obj
-                    break
-                elif t == "error" and fid == "smoke-001":
-                    print(f"FAIL: server returned per-frame error: {obj}",
-                          file=sys.stderr)
-                    sys.exit(4)
-                else:
-                    print(f"FAIL: unexpected message (type={t!r}, "
-                          f"frame_id={fid!r}): {obj}", file=sys.stderr)
-                    sys.exit(5)
+        try:
+            async with asyncio.timeout(args.timeout):
+                while True:
+                    msg = await ws.recv()
+                    obj = json.loads(msg)
+                    t = obj.get("type")
+                    fid = obj.get("frame_id")
+                    if t == "result" and fid == "smoke-001":
+                        result = obj
+                        break
+                    elif t == "error" and fid == "smoke-001":
+                        print(f"FAIL: server returned per-frame error: {obj}",
+                              file=sys.stderr)
+                        sys.exit(4)
+                    else:
+                        print(f"FAIL: unexpected message (type={t!r}, "
+                              f"frame_id={fid!r}): {obj}", file=sys.stderr)
+                        sys.exit(5)
+        except websockets.exceptions.ConnectionClosed as e:
+            print(f"FAIL: server closed the WebSocket before responding: "
+                  f"code={getattr(e, 'code', None)} "
+                  f"reason={getattr(e, 'reason', None)!r}",
+                  file=sys.stderr)
+            sys.exit(10)
         # Structural assertions on the result.
         if result is None:
             print("FAIL: no result received", file=sys.stderr)

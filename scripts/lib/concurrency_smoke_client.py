@@ -173,6 +173,29 @@ async def _run_one_client(
                             "possible deadlock, starvation, or worker hang"
                         ),
                     )
+                except websockets.exceptions.ConnectionClosed as e:
+                    # The server's documented connection-fatal path is a WS
+                    # Close (1001/1008/1011) — surface the code+reason as a
+                    # structured per-frame record so the aggregate fairness
+                    # accounting sees it instead of a Python stack trace.
+                    rec = FrameRecord(
+                        client_id=client_id,
+                        frame_id=frame_id,
+                        sent_at=t_send,
+                        recv_at=time.perf_counter(),
+                        latency_ms=(time.perf_counter() - t_send) * 1000.0,
+                        resp_type="ws_closed",
+                        error=(
+                            f"server closed WS during this frame: "
+                            f"code={getattr(e, 'code', None)} "
+                            f"reason={getattr(e, 'reason', None)!r}"
+                        ),
+                    )
+                    result.frames.append(rec)
+                    # No further frames possible on this WS; exit the
+                    # per-client send loop so we don't try to recv on a
+                    # closed socket.
+                    return result
                 assert rec is not None
                 result.frames.append(rec)
     except Exception as e:
@@ -264,6 +287,14 @@ async def run(args) -> int:
             elif f.resp_type.startswith("unexpected"):
                 failures.append(
                     f"client {r.client_id} frame {f.frame_id}: {f.error}"
+                )
+            elif f.resp_type == "ws_closed":
+                failures.append(
+                    f"client {r.client_id} frame {f.frame_id}: {f.error} — "
+                    "all clients in this test use the same valid calibration "
+                    "image, so a Close here indicates the server is rejecting "
+                    "a frame that should have been accepted, or the worker "
+                    "transport desynced under load."
                 )
 
     # ---- per-client latency aggregates over successful frames ----
