@@ -133,14 +133,39 @@ Field rules:
 * `generation_mode` — exactly one of `"fast"`, `"hybrid"`, `"slow"`.
 * `jpeg_len` — equal to the number of payload bytes after the header.
 
-The JPEG payload itself must:
+The JPEG payload itself must satisfy the *trained-correct contract* —
+every constraint here is what NVIDIA's training pipeline assumed, and
+violations are rejected at the network edge with a Close 1008 so the
+client knows immediately that the model would have seen a different
+input than it sent:
 
-* Start with `FF D8 FF`.
-* Decode cleanly with libjpeg-turbo (header parse done in Rust before
-  the worker is hit; full decode done in Python).
-* Be RGB (not CMYK — PIL's CMYK→RGB transform is not ICC-aware).
-* Have both dimensions in `[32, max_image_dim=2240]`.
-* Be ≤ `LA_MAX_JPEG_BYTES` (4 MiB by default).
+* **Start with `FF D8 FF`** — JPEG SOI marker.
+* **Decode cleanly with libjpeg-turbo** (header parse done in Rust;
+  full decode done in Python).
+* **Be RGB**, not CMYK. PIL's CMYK→RGB transform isn't ICC-aware and
+  produces wrong colours; we reject CMYK rather than degrade.
+* **Both dimensions in `[32, max_image_dim=2240]`** px.
+* **Total LLM tokens ≤ 25,600**, where a token covers a `28 × 28` px
+  cell (`patch_size × merge_kernel_size`). Concretely:
+  `ceil(W / 28) × ceil(H / 28) ≤ 25600`. At the current 2240 px-per-side
+  cap a square input is only 6,400 tokens — the budget gate matters
+  only if the cap is ever raised or the aspect ratio is extreme.
+  Without this gate the model's preprocessor would *silently downscale*
+  oversized inputs to fit; we refuse rather than scale, so the client's
+  `frame_id` corresponds to the spatial frame the model actually saw.
+* **Be ≤ `LA_MAX_JPEG_BYTES`** (4 MiB by default).
+* **If the JPEG carries an ICC profile, it should be sRGB** — but you
+  do not have to strip it. The worker uses `PIL.ImageCms.profileToProfile`
+  with `PERCEPTUAL` rendering intent to colour-manage any non-sRGB
+  profile (Adobe-RGB, Display-P3, ProPhoto, etc.) into sRGB before the
+  model sees it. A genuinely corrupt or unsupported profile is rejected
+  rather than silently fall back to the colour shift.
+
+In short, **strict in, faithful out**. The client never has to ask
+"what did the model actually see?" — if the request reached the model,
+it saw exactly the pixels you sent, modulo BICUBIC padding to the next
+28-px multiple (which is the trained preprocessing path and is
+mathematically identical to what NVIDIA does at training time).
 
 ### Result (Text)
 
