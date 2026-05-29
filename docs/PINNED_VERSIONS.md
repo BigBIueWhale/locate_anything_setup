@@ -84,6 +84,33 @@ the mutated config to `from_pretrained`. A boot-time verification
 then re-reads the attribute on the constructed model and refuses to
 serve if the override did not stick.
 
+SDPA backend choice: PyTorch's `scaled_dot_product_attention` dispatches
+across cuDNN, Flash, Mem-Efficient, and Math kernels by checking each in
+priority order. With our `(B,1,N,N)` non-contiguous bf16 block mask
+the dispatcher rejects cuDNN (sm_120 isn't in the cuDNN-prefer list),
+Flash (any non-null mask → rejected), AND Mem-Efficient (mask's last-dim
+stride ≠ 1) — silently falling through to the Math backend, which
+materialises a `B × H × N × N × 2 bytes` probability tensor. At
+N=25,600 that's 13 GiB per request — enough to OOM the 32 GiB 5090.
+The same dispatch outcome and OOM pattern occurs in the MoonViT vision
+encoder for its own SDPA call, with three independent dispatch
+blockers (3D q/k/v, 3D bool mask, bool dtype).
+`worker/inference.py` therefore installs two boot-time monkey-patches:
+`_patch_sdpa_to_mem_efficient` wraps `Qwen2SdpaAttention.forward` to
+`.contiguous()` the mask and wrap the SDPA call in
+`sdpa_kernel([EFFICIENT_ATTENTION, MATH])`, and
+`_patch_vit_sdpa_to_mem_efficient` replaces MoonViT's
+`sdpa_attention` with a 4D-mask, 4D-tensor, additive-mask rewrite. Both
+patches refuse to install themselves if the upstream function
+signatures or dispatch-dict shape have drifted from what they were
+developed against. Empirical effect: calibration FPS ~1.83 → ~3.35
+(~2× speedup), single-frame latency 467 → 257 ms, post-calibration
+VRAM 24.3 → 9.2 GiB, full-resolution images (up to LA_MAX_IMAGE_DIM)
+stop OOMing. Detection box coordinates differ by < 1 unit in
+normalised [0,1000] space vs the math-backend baseline on the same
+input (within the bf16 reduction-order ULP noise floor that already
+exists between any two attention implementations).
+
 ## Model-mandated Python deps (pinned EXACTLY)
 
 These match the upstream `nvlabs/Eagle/Embodied/pyproject.toml` and
