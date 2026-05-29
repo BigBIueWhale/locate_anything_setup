@@ -253,9 +253,29 @@ RUN mkdir -p /opt/locate_anything/model \
  && mkdir -p /opt/locate_anything/hf_cache
 
 # ---- Non-root user (maps to host UID for bind-mount writability) --------
-RUN groupadd -g ${LA_GID} la \
- && useradd -m -u ${LA_UID} -g ${LA_GID} -s /bin/bash la \
- && chown -R la:la /opt/locate_anything
+# The Ubuntu 24.04 base image (which nvidia/cuda:...-ubuntu24.04
+# inherits from) ships with a default 'ubuntu' user already at
+# UID/GID 1000. A naive `groupadd -g 1000 la` collides with that
+# preexisting group and fails with "GID '1000' already exists".
+#
+# We handle both cases robustly:
+#   - If a user already exists at LA_UID, rename it to 'la' (and
+#     rename its primary group to 'la' too), moving the home
+#     directory to /home/la. This repurposes Ubuntu's default user.
+#   - Otherwise, create 'la' fresh.
+#
+# Then chown the project tree to the resulting `la` user.
+RUN set -eux; \
+    OLD_USER=$(getent passwd ${LA_UID} 2>/dev/null | cut -d: -f1); \
+    OLD_GROUP=$(getent group  ${LA_GID} 2>/dev/null | cut -d: -f1); \
+    if [ -z "${OLD_USER}" ]; then \
+        groupadd -g ${LA_GID} la; \
+        useradd  -m -u ${LA_UID} -g ${LA_GID} -s /bin/bash la; \
+    elif [ "${OLD_USER}" != "la" ]; then \
+        groupmod -n la "${OLD_GROUP}"; \
+        usermod  -l la -d /home/la -m -s /bin/bash "${OLD_USER}"; \
+    fi; \
+    chown -R la:la /opt/locate_anything
 USER la
 
 EXPOSE ${LA_INTERNAL_PORT}
