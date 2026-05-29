@@ -12,8 +12,8 @@ Failure modes this catches:
   - A response is delivered for the wrong frame_id (mux confusion).
   - A frame never receives a response (deadlock or worker hang).
   - The worker returns type:"error" for a normally-correct request under
-    concurrent load (e.g. asyncio.shield drain bug, mid-inference KV
-    cache collision from a missed lock).
+    concurrent load (mid-inference KV-cache collision from a missed lock,
+    cross-task state leak, etc.).
   - Median latency varies wildly across clients (de-facto starvation).
 
 Run via `docker exec` against the live container; NOT a reference for
@@ -55,7 +55,6 @@ class ClientResult:
     client_id: str
     frames: list = field(default_factory=list)
     connect_failed: Optional[str] = None
-    hello_failed: Optional[str] = None
 
 
 async def _run_one_client(
@@ -78,21 +77,6 @@ async def _run_one_client(
             max_size=8 * 1024 * 1024,
             open_timeout=15,
         ) as ws:
-            # ---- Hello / Capabilities handshake ----
-            await ws.send(json.dumps({
-                "type":             "hello",
-                "protocol_version": 1,
-                "client_id":        client_id,
-                "session_id":       client_id,
-            }))
-            caps_raw = await asyncio.wait_for(ws.recv(), timeout=15)
-            caps = json.loads(caps_raw)
-            if caps.get("type") != "capabilities":
-                result.hello_failed = (
-                    f"expected type:'capabilities', got: {caps_raw[:200]!r}"
-                )
-                return result
-
             # ---- Send K frames; await each result before next send ----
             # Sequential per-client (1 in-flight per WS) keeps the latency
             # measurement clean: each frame's latency is its own service time
@@ -102,24 +86,21 @@ async def _run_one_client(
                     await asyncio.sleep(send_interval)
                 frame_id = f"{client_id}-{i:03d}"
                 header = json.dumps({
-                    "type":              "frame",
-                    "frame_id":          frame_id,
-                    "session_id":        client_id,
-                    "prompt":            prompt,
-                    "generation_mode":   mode,
-                    "jpeg_len":          len(jpeg),
-                    "image_color_space": "RGB",
-                    "image_encoding":    "jpeg",
+                    "frame_id":        frame_id,
+                    "prompt":          prompt,
+                    "generation_mode": mode,
+                    "jpeg_len":        len(jpeg),
                 }).encode("utf-8")
                 payload = struct.pack(">I", len(header)) + header + jpeg
 
                 t_send = time.perf_counter()
                 await ws.send(payload)
 
-                # Drain WS frames until we see one tagged with our frame_id
-                # (skip beacons; other-client frames CANNOT appear on this
-                # WS — each WS is bound 1:1 to a single client task on the
-                # worker side, so any mismatch IS a server-side mux bug).
+                # Await the single response for this frame. The new
+                # protocol has no control / advisory messages on the WS,
+                # so any non-result / non-error reply IS a server bug.
+                # Other-client frames CANNOT appear on this WS — each WS
+                # is bound 1:1 to a single client task on the worker side.
                 rec: Optional[FrameRecord] = None
                 try:
                     async with asyncio.timeout(frame_timeout):
@@ -127,8 +108,6 @@ async def _run_one_client(
                             msg = await ws.recv()
                             obj = json.loads(msg)
                             t = obj.get("type")
-                            if t == "beacon":
-                                continue
                             obj_fid = obj.get("frame_id")
                             t_recv = time.perf_counter()
                             lat_ms = (t_recv - t_send) * 1000.0
@@ -263,11 +242,6 @@ async def run(args) -> int:
                 f"client {r.client_id}: WS connect failed: {r.connect_failed}"
             )
             continue
-        if r.hello_failed:
-            failures.append(
-                f"client {r.client_id}: handshake failed: {r.hello_failed}"
-            )
-            continue
         if len(r.frames) != args.frames_per_client:
             failures.append(
                 f"client {r.client_id}: expected {args.frames_per_client} "
@@ -284,8 +258,8 @@ async def run(args) -> int:
                 failures.append(
                     f"client {r.client_id} frame {f.frame_id}: "
                     f"server returned type:'error' (message={f.error!r}) — "
-                    "under concurrent load this usually means a lock-drain "
-                    "bug or KV-cache collision"
+                    "under concurrent load this usually means a KV-cache "
+                    "collision or cross-task state leak"
                 )
             elif f.resp_type.startswith("unexpected"):
                 failures.append(

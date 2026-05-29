@@ -7,10 +7,16 @@
 //! Python responds with:
 //!     [ length(4) ][ response JSON ]
 //!
-//! Sending a capability/info query: header `{"kind":"capabilities"}` or
-//! `{"kind":"info"}` followed by an empty-length payload frame. The Python
-//! worker keys off the JSON `kind` field rather than payload presence —
-//! see worker/la_worker.py.
+//! Frame inference: the header JSON carries `kind:"frame"` plus the
+//! fields from `InferHeader` (frame_id, prompt, generation_mode, jpeg_len).
+//! Control queries (`{"kind":"capabilities"}` / `{"kind":"info"}`) carry
+//! the kind only and follow with an empty-length JPEG frame so framing
+//! stays uniform.
+//!
+//! Worker response envelope: every body carries a top-level `ok:bool`
+//! discriminator the Rust side strips on the way out. `ok:true` → forward
+//! as `type:"result"`; `ok:false` → forward as `type:"error"`. The
+//! discriminator is internal to the UDS hop and never reaches the client.
 
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
@@ -25,6 +31,15 @@ pub struct WorkerConn {
     framed: Framed<UnixStream, LengthDelimitedCodec>,
 }
 
+/// Worker round-trip outcome. The `ok` discriminator has been stripped
+/// before the body reaches the caller — both variants carry the body
+/// the WS handler forwards verbatim to the client (after stamping
+/// type + frame_id).
+pub enum InferOutcome {
+    Success(serde_json::Value),
+    WorkerError(serde_json::Value),
+}
+
 impl WorkerConn {
     pub async fn connect(path: &Path) -> Result<Self, std::io::Error> {
         let stream = UnixStream::connect(path).await?;
@@ -36,13 +51,24 @@ impl WorkerConn {
         Ok(Self { framed: Framed::new(stream, codec) })
     }
 
-    /// Send (header, jpeg_bytes) and await one JSON response frame.
+    /// Send (header, jpeg_bytes) and await one JSON response frame from
+    /// the Python worker.
+    ///
+    /// The `Ok` variants both carry a body the WS handler forwards verbatim
+    /// (after stamping `type` + `frame_id`); only `Err` is a transport
+    /// failure that should close the WS — the framed UDS may have desynced.
     pub async fn infer(
         &mut self,
         header: &InferHeader,
         jpeg: Bytes,
-    ) -> Result<serde_json::Value, ServerError> {
-        let header_json = serde_json::to_string(header).map_err(|e| {
+    ) -> Result<InferOutcome, ServerError> {
+        let header_json = serde_json::to_string(&serde_json::json!({
+            "kind":            "frame",
+            "frame_id":        &header.frame_id,
+            "prompt":          &header.prompt,
+            "generation_mode": &header.generation_mode,
+            "jpeg_len":        header.jpeg_len,
+        })).map_err(|e| {
             ServerError::Internal(format!(
                 "could not serialize InferHeader to JSON for worker IPC: {e}"
             ))
@@ -68,8 +94,16 @@ impl WorkerConn {
                 "UDS read from Python worker failed: {e}"
             ))
         })?;
-        let v: serde_json::Value = serde_json::from_slice(&resp)?;
-        Ok(v)
+        let mut v: serde_json::Value = serde_json::from_slice(&resp)?;
+        match v.as_object_mut().and_then(|m| m.remove("ok")).and_then(|x| x.as_bool()) {
+            Some(true)  => Ok(InferOutcome::Success(v)),
+            Some(false) => Ok(InferOutcome::WorkerError(v)),
+            None => Err(ServerError::WorkerProtocol(format!(
+                "worker response missing required `ok` boolean field; \
+                 received keys: {:?}",
+                v.as_object().map(|m| m.keys().collect::<Vec<_>>())
+            ))),
+        }
     }
 
     /// Control-plane request: capabilities, info, or other no-payload kinds.

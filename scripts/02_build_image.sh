@@ -215,7 +215,6 @@ docker build \
     --build-arg LA_INTERNAL_PORT="${LA_INTERNAL_PORT}" \
     --build-arg LA_MAX_IMAGE_DIM="${LA_MAX_IMAGE_DIM}" \
     --build-arg LA_MAX_JPEG_BYTES="${LA_MAX_JPEG_BYTES}" \
-    --build-arg LA_MAX_INFLIGHT="${LA_MAX_INFLIGHT}" \
     --build-arg LA_UID="${UID_NUM}" \
     --build-arg LA_GID="${GID_NUM}" \
     --build-arg LA_CONFIG_HASH="${EXPECTED_HASH}" \

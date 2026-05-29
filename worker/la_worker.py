@@ -2,22 +2,23 @@
 """
 LocateAnything-3B inference sidecar.
 
-Listens on a Unix domain socket (LA_IPC_SOCKET). Each connection from the
-Rust frontend follows the protocol described in rust_server/src/protocol.rs:
-
-  Each request = TWO consecutive length-prefixed frames sent by the client:
+Listens on a Unix domain socket (LA_IPC_SOCKET). Each Rust→Python request
+is TWO consecutive length-prefixed frames sent by the Rust side:
     1) JSON header
-    2) JPEG bytes (may be zero-length for control messages)
-
-  Each response = ONE length-prefixed frame:
-    JSON response body
+    2) JPEG bytes (zero-length for control queries)
+The worker responds with ONE length-prefixed frame: a JSON body. The
+shape depends on the header.kind:
+    "frame"        → either a successful inference body or {code, message}
+                      on failure. The Rust frontend adds type+frame_id.
+    "capabilities" → /v1/capabilities payload (no `type` field).
+    "info"         → /v1/info payload.
 
 Length prefix: 4-byte big-endian unsigned int.
 
-The model is loaded ONCE at startup. Inference is serialized through an
-asyncio.Lock (PyTorch on CUDA is GIL-bound and can run at most one .generate
-at a time). Frame ordering is FIFO across all connections — earlier frames
-finish before later ones.
+The model is loaded once at startup. Inference is serialized through an
+asyncio.Lock — PyTorch on CUDA can only run one .generate() at a time.
+Multiple Rust→Python connections fan out concurrently; the lock turns
+that into a fair FIFO queue.
 
 This file does NOT contain a fallback for any error. If model load fails,
 GPU is missing, or weights are corrupt, we exit non-zero.
@@ -89,14 +90,6 @@ async def write_frame(writer: asyncio.StreamWriter, data: bytes) -> None:
 class WorkerApp:
     """The single inference engine + a lock that serializes GPU access."""
 
-    # Bound the total number of concurrent UDS connections. Each one
-    # spawns its own `handle_connection` Task; uncapped, anything in
-    # the container that can connect to /tmp/la.sock could fan out
-    # arbitrarily. The Rust frontend in steady state opens at most
-    # a few connections (one per WS client, plus control queries),
-    # so 16 is generous.
-    MAX_CONCURRENT_CONNS = 16
-
     def __init__(
         self,
         engine: LocateAnythingInference,
@@ -107,14 +100,11 @@ class WorkerApp:
         self.lock = asyncio.Lock()
         self.model_manifest_sha256 = model_manifest_sha256
         self.calibration = calibration
-        self._conn_sem = asyncio.Semaphore(self.MAX_CONCURRENT_CONNS)
 
     def capabilities(self) -> dict:
-        # Single canonical capabilities response. The Rust frontend
-        # forwards this verbatim to the client on Hello.
+        # Served verbatim by Rust on GET /v1/capabilities.
         gen = self.engine.gen_cfg
         return {
-            "protocol_version": 1,
             "model":                 "nvidia/LocateAnything-3B",
             "model_dir":             self.engine.model_dir,
             # Manifest hash = SHA-256 over a sorted list of (filename, size)
@@ -141,8 +131,6 @@ class WorkerApp:
                 "n_future_tokens":    gen.n_future_tokens,
             },
             "supported_generation_modes": ["fast", "hybrid", "slow"],
-            "supported_image_encodings":  ["jpeg"],
-            "supported_color_spaces":     ["RGB"],
             "calibration": self.calibration.to_json(),
             "preset_prompts": {
                 "drone_ranked": prompts.DRONE_PROMPTS_RANKED,
@@ -174,26 +162,6 @@ class WorkerApp:
         writer: asyncio.StreamWriter,
     ) -> None:
         peer = writer.get_extra_info("peername") or "<uds>"
-        if self._conn_sem.locked():
-            log.warning(
-                "concurrent connection cap %d reached; refusing peer %s",
-                self.MAX_CONCURRENT_CONNS, peer,
-            )
-            writer.close()
-            try:
-                await writer.wait_closed()
-            except Exception:
-                pass
-            return
-        async with self._conn_sem:
-            await self._handle_connection_inner(reader, writer, peer)
-
-    async def _handle_connection_inner(
-        self,
-        reader: asyncio.StreamReader,
-        writer: asyncio.StreamWriter,
-        peer,
-    ) -> None:
         log.info("connection open from %s", peer)
         try:
             while True:
@@ -230,32 +198,31 @@ class WorkerApp:
                     header = json.loads(header_bytes.decode("utf-8"))
                 except UnicodeDecodeError as e:
                     await write_frame(writer, _err_json(
-                        "worker_protocol",
+                        400,
                         f"header bytes are not valid UTF-8: {e!s}. "
                         "First 32 bytes (hex): "
                         + header_bytes[:32].hex(),
-                        code=400, retriable=False,
                     ))
                     continue
                 except json.JSONDecodeError as e:
                     await write_frame(writer, _err_json(
-                        "worker_protocol",
+                        400,
                         f"header JSON parse failed at line {e.lineno}, "
                         f"column {e.colno} (offset {e.pos}): {e.msg}",
-                        code=400, retriable=False,
                     ))
                     continue
                 if not isinstance(header, dict):
                     await write_frame(writer, _err_json(
-                        "worker_protocol",
+                        400,
                         f"header JSON must be an object; got "
                         f"{type(header).__name__}",
-                        code=400, retriable=False,
                     ))
                     continue
 
                 # ---- Route ----
-                kind = header.get("kind") or header.get("type")
+                # The Rust IPC layer always stamps `kind`; absent or wrong-
+                # cased = upstream contract violation, not a client mistake.
+                kind = header.get("kind")
                 try:
                     if kind == "capabilities":
                         await write_frame(writer, json.dumps(self.capabilities()).encode())
@@ -266,24 +233,16 @@ class WorkerApp:
                         await write_frame(writer, json.dumps(resp).encode())
                     else:
                         await write_frame(writer, _err_json(
-                            "worker_protocol",
-                            f"unknown header.kind: {kind!r}",
-                            code=400, retriable=False,
+                            400, f"unknown header.kind: {kind!r}",
                         ))
                 except ValueError as e:
-                    await write_frame(writer, _err_json(
-                        "invalid_image", str(e), code=400, retriable=False
-                    ))
+                    await write_frame(writer, _err_json(400, str(e)))
                 except RuntimeError as e:
                     log.exception("inference RuntimeError")
-                    await write_frame(writer, _err_json(
-                        "worker_error", str(e), code=500, retriable=True
-                    ))
+                    await write_frame(writer, _err_json(500, str(e)))
                 except Exception as e:
                     log.exception("inference unexpected error")
-                    await write_frame(writer, _err_json(
-                        "worker_error", repr(e), code=500, retriable=True
-                    ))
+                    await write_frame(writer, _err_json(500, repr(e)))
         finally:
             log.info("connection closed for %s", peer)
             try:
@@ -293,13 +252,11 @@ class WorkerApp:
                 pass
 
     async def _infer(self, header: dict, jpeg: bytes) -> dict:
-        # The Rust frontend has already enforced the header schema and
-        # the JPEG header validity. We re-validate here as a defense-in-
-        # depth measure: this worker is also reachable by anything inside
-        # the container that can touch /tmp/la.sock. There is no implicit
-        # trust of the upstream.
-
-        for key in ("prompt", "generation_mode", "frame_id", "session_id"):
+        # The Rust frontend has already enforced the header schema and JPEG
+        # SOI marker. We re-validate here as defense in depth: this worker is
+        # also reachable by anything inside the container that can touch
+        # /tmp/la.sock.
+        for key in ("prompt", "generation_mode", "frame_id"):
             if key not in header:
                 raise ValueError(
                     f"header.{key} missing. The Rust frontend should have "
@@ -330,53 +287,35 @@ class WorkerApp:
                 "rejected this Frame; receiving it here means the "
                 "upstream contract was violated."
             )
-
-        # PyTorch / CUDA cannot run two .generate() concurrently. Serialize.
-        async with self.lock:
-            # The blocking inference runs in a thread so the asyncio loop
-            # remains responsive for other connections (queueing). Each
-            # call holds the lock for its full duration so frames are
-            # processed strictly FIFO across all connections.
-            #
-            # IMPORTANT: asyncio.to_thread futures are NOT cancellable
-            # once the thread has started running (concurrent.futures
-            # contract). If our handle_connection Task is cancelled
-            # while this await is pending, naive code would release
-            # the lock immediately while the orphaned thread keeps
-            # using the GPU — a *second* _infer would then collide on
-            # the same model, scribbling the KV cache or hitting CUDA
-            # OOM. To preserve the invariant "lock held ⇔ GPU busy",
-            # we shield the inference Task and, on cancellation, DRAIN
-            # the thread synchronously before letting the lock release.
-            # The drain itself uses shield + a poll loop so a SECOND
-            # cancellation (e.g. asyncio.run finalizing during
-            # shutdown) doesn't interrupt the drain.
-            t0 = time.perf_counter()
-            inference_task = asyncio.ensure_future(
-                asyncio.to_thread(self.engine.run, jpeg, prompt, mode),
+        # Defense-in-depth JPEG SOI sniff. Rust already enforces this; we
+        # double-check here because /tmp/la.sock is also reachable by
+        # anything inside the container.
+        if jpeg[:3] != b"\xff\xd8\xff":
+            raise ValueError(
+                "JPEG payload missing SOI marker FF D8 FF — Rust frontend "
+                "should have rejected this Frame; defense-in-depth check "
+                "tripped here because /tmp/la.sock is internally reachable."
             )
-            try:
-                result = await asyncio.shield(inference_task)
-            except asyncio.CancelledError:
-                while not inference_task.done():
-                    try:
-                        await asyncio.shield(inference_task)
-                    except BaseException:
-                        # absorbs both CancelledError and any exception
-                        # the inference itself raised — we only care
-                        # about reaching done() before re-raising
-                        pass
-                raise
+
+        # PyTorch/CUDA cannot run two .generate() concurrently. Serialize.
+        # Once a frame enters _infer, the inference runs to completion
+        # regardless of client liveness: cancelling the asyncio.to_thread
+        # mid-flight would orphan a thread still holding the GPU. If the
+        # WS has closed by the time we go to write the response, the write
+        # fails into the closed UDS and the next frame proceeds.
+        async with self.lock:
+            t0 = time.perf_counter()
+            result = await asyncio.to_thread(self.engine.run, jpeg, prompt, mode)
             total_ms = (time.perf_counter() - t0) * 1000.0
+        # `ok` is an IPC-only discriminator the Rust frontend strips before
+        # stamping type+frame_id; it never appears in the client-facing body.
         return {
-            "ok": True,
-            "frame_id":      header["frame_id"],
-            "session_id":    header["session_id"],
+            "ok":            True,
             "raw_text":      result.raw_answer,
             "detections":    result.detections,
             "points":        result.points,
             "abstained":     result.abstained,
-            "image_size":    {"w": result.image_size[0], "h": result.image_size[1]},
+            "image_size":    [result.image_size[0], result.image_size[1]],
             "resize_plan":   result.resize_plan,
             "generation_mode_used": mode,
             "latency_ms":    round(result.latency_ms, 1),
@@ -388,14 +327,11 @@ class WorkerApp:
 # Helpers
 # -------------------------------------------------------------------------
 
-def _err_json(error_type: str, message: str, *, code: int, retriable: bool) -> bytes:
-    return json.dumps({
-        "ok":          False,
-        "code":        code,
-        "error_type":  error_type,
-        "message":     message,
-        "retriable":   retriable,
-    }).encode("utf-8")
+def _err_json(code: int, message: str) -> bytes:
+    """Worker-side error body. `ok:false` is the IPC discriminator the Rust
+    frontend uses to route to type:"error"; the client sees
+    `{type, frame_id, code, message}` after Rust strips `ok`."""
+    return json.dumps({"ok": False, "code": code, "message": message}).encode("utf-8")
 
 
 def _torch_arches() -> list:

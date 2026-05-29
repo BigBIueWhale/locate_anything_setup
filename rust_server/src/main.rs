@@ -33,8 +33,8 @@ use crate::state::AppState;
 /// Worker thread count for tokio's multi-thread runtime. The default
 /// (`num_cpus`) gives 24 on this host — wasteful for an I/O-bound
 /// server whose CPU work is ~JPEG header parsing + JSON ser/de.
-/// Four is plenty: listener + 3 spawned tasks per WS (reader,
-/// processor, writer) × a small number of concurrent connections.
+/// Four is plenty: the listener plus one stop-and-wait WS handler per
+/// concurrent connection.
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
@@ -45,7 +45,6 @@ async fn main() -> anyhow::Result<()> {
         bind = %args.bind,
         socket = %args.worker_socket.display(),
         max_jpeg_bytes = args.max_jpeg_bytes,
-        max_inflight = args.max_inflight,
         "la_server starting"
     );
 

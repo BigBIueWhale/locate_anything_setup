@@ -2,17 +2,12 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
 
-/// Top-level Rust-side server error. Maps to a JSON body with a stable
-/// `error_type` string and a numeric `code` matching the HTTP status.
-/// The same shape is reused for the WebSocket error frame, so clients
-/// have ONE schema to implement.
-///
-/// Note: errors REPORTED BY THE PYTHON WORKER do not go through this enum.
-/// They arrive as `{ok: false, error_type, code, message, retriable}` from
-/// the worker and are re-emitted verbatim by `ws::build_worker_error_body`,
-/// preserving the worker's own taxonomy (e.g. `error_type: "worker_error"`
-/// for tier-c failures like CUDA OOM). This enum covers only Rust-side
-/// validation and transport errors.
+/// Top-level Rust-side server error. Maps to an HTTP JSON body with a
+/// stable `error_type` string and a numeric `code` matching the HTTP
+/// status. Used only on HTTP status routes — on the WebSocket, framing
+/// errors close the connection with an RFC 6455 code + reason and worker
+/// error JSONs are forwarded verbatim (the worker emits the canonical
+/// shape directly).
 #[derive(thiserror::Error, Debug)]
 pub enum ServerError {
     #[error("invalid request: {0}")]

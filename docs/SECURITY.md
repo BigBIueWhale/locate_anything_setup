@@ -101,12 +101,13 @@ This project takes that seriously.
   it behind nginx with a `client_certificate` block or stick a
   small auth proxy in front.
 
-* **Rate limiting.** Bounded mpsc applies *backpressure* against
-  one connection at a time; there is no global limiter. Multiple
-  connections from the same client will serialize on the GPU's
-  asyncio.Lock in the Python sidecar; that is the only fairness
-  mechanism. If you publish this to multi-tenant traffic, add a
-  proper rate limiter upstream.
+* **Rate limiting.** Each WebSocket is strictly stop-and-wait, so
+  per-connection rate is bounded by the GPU's service time — TCP
+  flow control applies backpressure naturally. There is no global
+  connection limiter; multiple connections from the same client
+  serialize on the GPU's asyncio.Lock in the Python sidecar, which
+  is the only fairness mechanism. If you publish this to multi-tenant
+  traffic, add a proper rate limiter upstream.
 
 * **Audit logging of payloads.** The structured logs (JSON to
   stdout) log frame counts and latencies, not image contents or

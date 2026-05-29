@@ -3,16 +3,18 @@
 Reference client for the LocateAnything-3B WebSocket protocol.
 
 Demonstrates the correct way to:
-  1. Open WS, send Hello, receive Capabilities.
-  2. Read frames from a source (file, V4L2, or RTSP).
-  3. Send each frame with a correlated frame_id.
-  4. Receive results + beacons; correlate by frame_id.
-  5. Respect TCP backpressure (sender awaits, no drop).
-  6. Reconnect cleanly on close.
+  1. Fetch server limits once over HTTP (GET /v1/capabilities).
+  2. Open WS and start sending Frames immediately — no handshake.
+  3. Read frames from a source (file, V4L2, or RTSP).
+  4. Send each frame with a correlated frame_id.
+  5. Receive results / errors; correlate by frame_id.
+  6. Respect TCP backpressure (sender awaits, no drop).
+  7. Reconnect cleanly on close.
 
 Run:
-    pip install websockets opencv-python-headless
-    python reference_client.py --source path/to/video.mp4 --prompt "Point to: drone in the sky."
+    pip install websockets opencv-python-headless httpx
+    python reference_client.py --source path/to/video.mp4 \
+        --prompt "Point to: drone in the sky."
 
 Or against an RTSP stream:
     python reference_client.py --source rtsp://... --mode slow --prompt "..."
@@ -29,6 +31,10 @@ backpressure. If your use case requires "always process the most recent
 frame", that decision goes in the CAPTURE LAYER (a deliberate
 modulo-N decimation), not in the network layer — see
 docs/CLIENT_PROTOCOL.md for the rationale.
+
+The server is stateless across WebSockets: no per-session state lives
+on the server. On reconnect the client just opens a new WS and resumes
+sending Frames; frame_id namespacing is the client's prerogative.
 """
 
 from __future__ import annotations
@@ -39,12 +45,26 @@ import logging
 import struct
 import sys
 import threading
+import urllib.parse
+import urllib.request
 from queue import Queue
 
 import cv2
 import websockets
 
 log = logging.getLogger("client")
+
+
+def fetch_capabilities(ws_url: str, timeout: float = 10.0) -> dict:
+    """Synchronous one-shot HTTP GET for /v1/capabilities. Derives the
+    HTTP base from the WS URL (ws://host:port/path → http://host:port).
+    Done before opening the WS so caps are available to the capture
+    thread (which needs max_image_dim)."""
+    parsed = urllib.parse.urlparse(ws_url)
+    scheme = "https" if parsed.scheme == "wss" else "http"
+    url = f"{scheme}://{parsed.netloc}/v1/capabilities"
+    with urllib.request.urlopen(url, timeout=timeout) as resp:
+        return json.loads(resp.read())
 
 
 def encode_jpeg(frame_bgr, quality: int) -> bytes:
@@ -104,21 +124,17 @@ async def receiver(ws):
             for d in dets[:3]:
                 log.info("  %s @ px=%s", d.get("label") or "<unlabeled>", d.get("bbox_px"))
         elif t == "error":
-            log.error("error: code=%s type=%s msg=%s frame_id=%s retriable=%s",
-                      obj.get("code"), obj.get("error_type"),
-                      obj.get("message"), obj.get("frame_id"), obj.get("retriable"))
-        elif t == "beacon":
-            log.debug("beacon: queue=%s inflight=%s last=%s",
-                      obj.get("queue_depth"), obj.get("inflight"),
-                      obj.get("last_completed_frame_id"))
-        elif t == "capabilities":
-            log.info("capabilities: model=%s, calib_fps=%.2f",
-                     obj.get("model"),
-                     obj.get("calibration", {}).get("median_fps", 0.0))
+            log.error("error: code=%s msg=%s frame_id=%s",
+                      obj.get("code"), obj.get("message"), obj.get("frame_id"))
+        else:
+            # The protocol emits only result / error on the WS. Anything
+            # else is a server-side bug worth flagging loudly.
+            log.warning("unrecognised server message type=%r: %r", t, obj)
 
 
 async def sender(ws, q: Queue, prompt: str, generation_mode: str,
-                 jpeg_quality: int, stop_event: threading.Event):
+                 jpeg_quality: int, client_id: str,
+                 stop_event: threading.Event):
     """Pull frames from the queue and send them over WS, with backpressure."""
     loop = asyncio.get_running_loop()
     while True:
@@ -135,15 +151,13 @@ async def sender(ws, q: Queue, prompt: str, generation_mode: str,
         except Exception as e:
             log.error("encode failed: %s", e)
             continue
+        # client_id is namespaced into the frame_id locally; the wire
+        # header carries only {frame_id, prompt, generation_mode, jpeg_len}.
         header = json.dumps({
-            "type":              "frame",
-            "frame_id":          f"f-{idx:08d}",
-            "session_id":        "reference-client-session",
-            "prompt":            prompt,
-            "generation_mode":   generation_mode,
-            "jpeg_len":          len(jpeg),
-            "image_color_space": "RGB",
-            "image_encoding":    "jpeg",
+            "frame_id":        f"{client_id}-{idx:08d}",
+            "prompt":          prompt,
+            "generation_mode": generation_mode,
+            "jpeg_len":        len(jpeg),
         }).encode("utf-8")
         payload = struct.pack(">I", len(header)) + header + jpeg
         # This `await` is the network-side backpressure point — it will
@@ -151,29 +165,14 @@ async def sender(ws, q: Queue, prompt: str, generation_mode: str,
         await ws.send(payload)
 
 
-async def run_once(args):
-    log.info("connecting to %s", args.url)
+async def run_once(args, caps: dict):
+    log.info("connecting to %s (client_id=%s)", args.url, args.client_id)
     async with websockets.connect(
         args.url,
         max_size=args.max_jpeg_bytes + 64 * 1024,
         open_timeout=15,
         ping_interval=20,
     ) as ws:
-        await ws.send(json.dumps({
-            "type":             "hello",
-            "protocol_version": 1,
-            "client_id":        args.client_id,
-            "session_id":       args.session_id,
-        }))
-        caps_raw = await ws.recv()
-        caps = json.loads(caps_raw)
-        if caps.get("type") != "capabilities":
-            raise RuntimeError(f"expected capabilities, got: {caps}")
-        log.info("server caps: model=%s, fps=%.2f, max_image_dim=%s",
-                 caps.get("model"),
-                 caps.get("calibration", {}).get("median_fps", 0.0),
-                 caps.get("max_image_dim"))
-
         q: Queue = Queue(maxsize=args.queue_max)
         stop_event = threading.Event()
         t = threading.Thread(
@@ -184,7 +183,8 @@ async def run_once(args):
         t.start()
         try:
             await asyncio.gather(
-                sender(ws, q, args.prompt, args.mode, args.jpeg_quality, stop_event),
+                sender(ws, q, args.prompt, args.mode, args.jpeg_quality,
+                       args.client_id, stop_event),
                 receiver(ws),
             )
         finally:
@@ -196,12 +196,25 @@ async def main_async(args):
     """Reconnect with exponential backoff. A run of `max_consecutive_errors`
     failures aborts loudly — a persistent server-side problem must surface,
     not become silent log spam."""
+    # One-shot capabilities fetch over HTTP — the server is stateless
+    # across reconnects so caps don't need re-fetching on reconnect, but
+    # if the server returns a hard error on capabilities the operator
+    # needs to see that immediately.
+    try:
+        caps = await asyncio.to_thread(fetch_capabilities, args.url)
+        log.info("server caps: model=%s, fps=%.2f, max_image_dim=%s",
+                 caps.get("model"),
+                 caps.get("calibration", {}).get("median_fps", 0.0),
+                 caps.get("max_image_dim"))
+    except Exception as e:
+        log.error("fetch capabilities failed: %s: %s", type(e).__name__, e)
+        sys.exit(2)
     base_delay = float(args.reconnect_delay)
     max_delay = max(base_delay, 60.0)
     consecutive_errors = 0
     while True:
         try:
-            await run_once(args)
+            await run_once(args, caps)
             consecutive_errors = 0  # a clean run resets the counter
         except websockets.exceptions.ConnectionClosedOK as e:
             # Server initiated a normal close (code 1000) or going-away
@@ -245,8 +258,10 @@ def parse_args(argv=None):
     p.add_argument("--prompt", required=True,
                    help="Use one of the canonical prompt forms from /v1/capabilities.preset_prompts")
     p.add_argument("--mode", choices=("fast", "hybrid", "slow"), default="hybrid")
-    p.add_argument("--client-id",  default="reference-client-01")
-    p.add_argument("--session-id", default="reference-client-session")
+    p.add_argument("--client-id",  default="reference-client-01",
+                   help="local label; namespaces frame_ids and appears in "
+                        "this client's terminal output. NOT sent on the wire — "
+                        "the server is stateless and doesn't know about clients.")
     p.add_argument("--max-jpeg-bytes", type=int, default=4 * 1024 * 1024)
     p.add_argument("--queue-max", type=int, default=4)
     p.add_argument("--jpeg-quality", type=int, default=92)

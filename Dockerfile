@@ -86,7 +86,6 @@ ARG LA_WEBSOCKETS_PY_VERSION
 ARG LA_INTERNAL_PORT
 ARG LA_MAX_IMAGE_DIM
 ARG LA_MAX_JPEG_BYTES
-ARG LA_MAX_INFLIGHT
 ARG LA_UID=1000
 ARG LA_GID=1000
 
@@ -102,7 +101,7 @@ RUN test -n "${LA_PYTHON_PKG}"          -a -n "${LA_TORCH_VERSION}" \
      -a -n "${LA_HFHUB_VERSION}"         -a -n "${LA_HF_TRANSFER_VERSION}" \
      -a -n "${LA_PSUTIL_VERSION}"        -a -n "${LA_INTERNAL_PORT}" \
      -a -n "${LA_MAX_IMAGE_DIM}"         -a -n "${LA_MAX_JPEG_BYTES}" \
-     -a -n "${LA_MAX_INFLIGHT}"           -a -n "${LA_WEBSOCKETS_PY_VERSION}" \
+     -a -n "${LA_WEBSOCKETS_PY_VERSION}" \
      || { echo "FAIL: missing build arg — every pin must be set"; exit 1; }
 
 # ---- Build-time env -----------------------------------------------------
@@ -310,7 +309,6 @@ ENV HF_HOME=/opt/locate_anything/hf_cache \
     LA_IPC_SOCKET=/tmp/la.sock \
     LA_MAX_IMAGE_DIM=${LA_MAX_IMAGE_DIM} \
     LA_MAX_JPEG_BYTES=${LA_MAX_JPEG_BYTES} \
-    LA_MAX_INFLIGHT=${LA_MAX_INFLIGHT} \
     NVIDIA_VISIBLE_DEVICES=all \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility \
     MALLOC_ARENA_MAX=2 \

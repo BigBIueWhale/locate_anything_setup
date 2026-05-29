@@ -38,11 +38,6 @@ pub struct Args {
     #[arg(long, env = "LA_MAX_JPEG_BYTES")]
     pub max_jpeg_bytes: usize,
 
-    /// Maximum in-flight frames per WebSocket connection. REQUIRED via
-    /// env (entrypoint passes LA_MAX_INFLIGHT from versions.sh).
-    #[arg(long, env = "LA_MAX_INFLIGHT")]
-    pub max_inflight: usize,
-
     /// Hard upper bound on JPEG width or height in pixels. The model's
     /// native-resolution policy is governed by the 25600 ViT-patch cap;
     /// above ~2240 px square the preprocessor force-rescales (operating

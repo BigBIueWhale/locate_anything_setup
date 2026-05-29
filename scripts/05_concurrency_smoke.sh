@@ -12,8 +12,7 @@
 # What this catches that 04_smoke_test.sh CANNOT:
 #   - one user starving another (asyncio.Lock unfair across UDS conns)
 #   - WS multiplexing bug: response delivered for the wrong frame_id
-#   - asyncio.shield drain pattern failing to release the lock cleanly
-#     under back-to-back load
+#   - cross-task state leak under back-to-back load
 #   - silent worker hangs that pass the single-frame health probe
 #
 # NOT part of setup.sh — this script is the on-demand parallelism probe.

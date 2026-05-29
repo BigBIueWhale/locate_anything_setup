@@ -14,8 +14,9 @@ Two processes, two languages, one container. The split is deliberate:
 
 * **Rust frontend** handles all network ingress: HTTP, WebSocket
   framing, request validation (JPEG magic / dimensions / payload
-  size), structured error mapping, backpressure via bounded tokio
-  channels.
+  size), structured error mapping. Backpressure is plain TCP flow
+  control: each WS is strictly stop-and-wait, so the kernel send
+  buffer fills naturally when the GPU is the bottleneck.
 
 * **Python sidecar** holds the model and runs inference. It is the
   authoritative source for capabilities (model SHA, max image dims,
@@ -31,12 +32,12 @@ Two processes, two languages, one container. The split is deliberate:
   surfaces; both happen in Rust before a single byte reaches the
   model.
 
-* Backpressure semantics are explicit in the Rust side. A bounded
-  `tokio::sync::mpsc::channel` plus the
-  `axum::extract::ws::SplitStream` reader pauses on
-  `frame_tx.send().await` when the GPU is busy; that pause
-  propagates back to TCP flow control and ultimately to the client's
-  send buffer. The server never silently drops a frame.
+* Backpressure is structural, not bespoke. Each WebSocket is strictly
+  stop-and-wait — read one Frame, run inference, write one Result,
+  read again. When the GPU is busy on one connection's frame, the
+  other connections' reads simply block at the worker's
+  `asyncio.Lock`; the kernel-side TCP send buffers fill, and the
+  clients' `send()` blocks. The server never silently drops a frame.
 
 * The model is Python-only (the upstream `modeling_locateanything.py`
   is loaded via `trust_remote_code=True`); there is no Rust path for
@@ -46,13 +47,15 @@ Two processes, two languages, one container. The split is deliberate:
 ## Concurrency
 
 * Multiple WebSocket connections are accepted concurrently by Rust.
-  Each connection has its own bounded mpsc pair.
+  Each connection drives one dedicated UDS conn to the Python worker
+  and runs strictly stop-and-wait against it.
 * The Python sidecar serializes all `model.generate()` calls behind
   an `asyncio.Lock`. PyTorch on a single GPU cannot run two
   generations in parallel — the lock makes that an explicit FIFO
   queue rather than an undefined-behavior race.
-* Frame ordering inside one WebSocket connection is preserved by the
-  Rust mpsc; cross-connection ordering is FIFO at the Python lock.
+* Frame ordering inside one WebSocket connection is trivially
+  preserved (stop-and-wait); cross-connection ordering is FIFO at
+  the Python lock.
 
 ## Process supervision
 

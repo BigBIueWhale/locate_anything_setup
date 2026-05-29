@@ -135,7 +135,7 @@ locate_anything_setup/
 │       ├── config.rs               # CLI args
 │       ├── state.rs
 │       ├── error.rs                # structured error type → JSON body
-│       ├── protocol.rs             # wire-protocol types (Hello, Frame, …)
+│       ├── protocol.rs             # wire-protocol types (InferHeader + constants)
 │       ├── jpeg.rs                 # JPEG header validation
 │       ├── ipc.rs                  # Unix-socket client to Python
 │       └── ws.rs                   # /v1/stream WebSocket handler

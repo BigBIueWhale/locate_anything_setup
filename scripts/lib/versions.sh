@@ -154,12 +154,6 @@ LA_MAX_IMAGE_DIM="2240"
 # slack — clients sending more are almost certainly misconfigured.
 LA_MAX_JPEG_BYTES="4194304"
 
-# Bounded mpsc capacity per WebSocket connection. Higher → more pipelining
-# pressure on the GPU; lower → tighter backpressure (the GPU never has
-# more than this many frames queued behind a connection). 2 keeps the
-# GPU saturated without unbounded queueing.
-LA_MAX_INFLIGHT="2"
-
 # ===== Container resource limits =====
 # Host RAM cap. The 3B+0.4B bf16 weights live in VRAM, not RAM; host RAM
 # carries the Python interpreter, transformers/torch shared libs, CPU

@@ -321,15 +321,16 @@ class LocateAnythingInference:
             raise ValueError("jpeg_bytes must be non-empty bytes")
         try:
             raw = Image.open(io.BytesIO(jpeg_bytes))
-            # Reject CMYK explicitly. The Rust frontend's header asserts
-            # image_color_space="RGB"; CMYK pixels with a wrong-claim header
-            # are out of contract. PIL's CMYK→RGB transform is not ICC-aware
-            # and produces incorrect colors for Adobe-tagged CMYK JPEGs,
-            # which would silently degrade detection quality.
+            # Reject CMYK explicitly. PIL's CMYK→RGB transform is not
+            # ICC-aware and produces incorrect colors for Adobe-tagged CMYK
+            # JPEGs, which would silently degrade detection quality. The
+            # model itself only consumes RGB; converting to RGB client-side
+            # is the contract.
             if raw.mode == "CMYK":
                 raise ValueError(
-                    "CMYK JPEG rejected — header asserts RGB but pixels are "
-                    "CMYK. Convert to RGB client-side before sending."
+                    "CMYK JPEG rejected — the model consumes RGB only and "
+                    "PIL's CMYK→RGB is not ICC-aware. Convert to RGB "
+                    "client-side before sending."
                 )
             # EXIF Orientation tag handling. PIL does NOT auto-rotate;
             # phone-camera JPEGs with Orientation=6 (rotate 90 CW) would

@@ -2,10 +2,9 @@
 """
 Minimal WebSocket smoke client for 04_smoke_test.sh.
 
-Connects, exchanges Hello/Capabilities, sends one Frame, awaits one Result,
-exits non-zero on any structural anomaly. Used only by the smoke-test
-orchestrator — NOT a reference for clients (see examples/reference_client.py
-for that).
+Connects, sends one Frame, awaits one Result, exits non-zero on any
+structural anomaly. Used only by the smoke-test orchestrator — NOT a
+reference for clients (see examples/reference_client.py for that).
 """
 
 from __future__ import annotations
@@ -32,59 +31,38 @@ async def run(args):
         max_size=8 * 1024 * 1024,
         open_timeout=15,
     ) as ws:
-        await ws.send(json.dumps({
-            "type":             "hello",
-            "protocol_version": 1,
-            "client_id":        "smoke-test",
-            "session_id":       "smoke",
-        }))
-        caps_raw = await ws.recv()
-        caps = json.loads(caps_raw)
-        if caps.get("type") != "capabilities":
-            print(f"FAIL: expected capabilities, got: {caps_raw[:200]}",
-                  file=sys.stderr)
-            sys.exit(3)
-        print(f"caps: model={caps.get('model')!r}, "
-              f"calib_fps={caps.get('calibration', {}).get('median_fps', 0)}",
-              flush=True)
-
         header = json.dumps({
-            "type":             "frame",
-            "frame_id":         "smoke-001",
-            "session_id":       "smoke",
-            "prompt":           args.prompt,
-            "generation_mode":  args.mode,
-            "jpeg_len":         len(jpeg),
-            "image_color_space":"RGB",
-            "image_encoding":   "jpeg",
+            "frame_id":        "smoke-001",
+            "prompt":          args.prompt,
+            "generation_mode": args.mode,
+            "jpeg_len":        len(jpeg),
         }).encode("utf-8")
         payload = struct.pack(">I", len(header)) + header + jpeg
         await ws.send(payload)
         print(f"sent frame (header={len(header)} bytes, jpeg={len(jpeg)} bytes)",
               flush=True)
 
-        # Drain until we get a result for our frame_id (skip beacons).
+        # Await the single response keyed by our frame_id. Only
+        # result / error are valid on the WS in this protocol — any
+        # other type is a real protocol bug, not something to skip.
         result = None
         async with asyncio.timeout(args.timeout):
             while True:
                 msg = await ws.recv()
                 obj = json.loads(msg)
                 t = obj.get("type")
-                if t == "result" and obj.get("frame_id") == "smoke-001":
+                fid = obj.get("frame_id")
+                if t == "result" and fid == "smoke-001":
                     result = obj
                     break
-                elif t == "error" and obj.get("frame_id") == "smoke-001":
+                elif t == "error" and fid == "smoke-001":
                     print(f"FAIL: server returned per-frame error: {obj}",
                           file=sys.stderr)
                     sys.exit(4)
-                elif t == "error" and obj.get("frame_id") is None:
-                    print(f"FAIL: server returned tier-c error: {obj}",
-                          file=sys.stderr)
-                    sys.exit(5)
-                elif t == "beacon":
-                    continue
                 else:
-                    print(f"WARN: unexpected message: {obj}", file=sys.stderr)
+                    print(f"FAIL: unexpected message (type={t!r}, "
+                          f"frame_id={fid!r}): {obj}", file=sys.stderr)
+                    sys.exit(5)
         # Structural assertions on the result.
         if result is None:
             print("FAIL: no result received", file=sys.stderr)
