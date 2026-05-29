@@ -180,4 +180,4 @@ LA_LOG_MAX_FILES="5"
 
 # ===== Container name =====
 LA_CONTAINER_NAME="locate-anything"
-LA_IMAGE_TAG="locate-anything:la3b-cu130-torch2.12-fa2.8.4"
+LA_IMAGE_TAG="locate-anything:la3b-cu130-torch2.12-fa2.8.3"

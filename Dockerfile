@@ -10,7 +10,8 @@
 # The Rust binary is the only network ingress. The Python sidecar is internal,
 # reachable only over /tmp/la.sock (Unix domain socket).
 #
-# Build time: dominated by flash-attn 2.8.4 source build (~20–30 min).
+# Build time: dominated by flash-attn 2.8.3 source build (~8–15 min on
+# an 8-job 24-core/62-GiB host with FLASH_ATTN_CUDA_ARCHS=120).
 # Image size: ~12 GiB (mostly torch+cu130 wheels + flash-attn).
 # ============================================================================
 
@@ -211,7 +212,7 @@ RUN python -m pip install \
         "psutil==${LA_PSUTIL_VERSION}" \
         "websockets==${LA_WEBSOCKETS_PY_VERSION}"
 
-# ---- flash-attn 2.8.4 source build (sm_120 only) -------------------------
+# ---- flash-attn 2.8.3 source build (sm_120 only) -------------------------
 # This layer is the longest in the build (15–25 min). It is intentionally
 # placed after stable model deps so that day-to-day server code edits
 # (which only touch the COPY layers below) do NOT trigger a re-build.
@@ -244,13 +245,23 @@ COPY worker/        /opt/locate_anything/worker/
 # container, no network. Other files in scripts/lib (common.sh,
 # versions.sh) are also harmless to ship for diagnostics.
 COPY scripts/lib/   /opt/locate_anything/scripts/lib/
-COPY test_data/     /opt/locate_anything/test_data/
+# NOTE: test_data/ is intentionally NOT baked into the image. It is
+# bind-mounted read-only at container start (see 03_start_service.sh).
+# Reason: the calibration JPEG is synthesised by 01_download_weights.sh
+# AFTER 02_build_image.sh runs (build is pure-from-source for
+# reproducibility), so at build time the host's test_data/ is empty.
+# A baked-in empty test_data/ would only ever shadow the bind mount
+# anyway; cleaner to delete the source of confusion.
 COPY container/entrypoint.sh /opt/locate_anything/entrypoint.sh
 RUN chmod 0755 /opt/locate_anything/entrypoint.sh
 
-# Bind-mount target for the model weights. Created empty at build time.
+# Bind-mount targets, created empty at build time.
+#   model/     — model weights, populated by scripts/01_download_weights.sh
+#   hf_cache/  — RW cache for hub state and CUDA JIT
+#   test_data/ — host-generated calibration JPEG (see note above)
 RUN mkdir -p /opt/locate_anything/model \
- && mkdir -p /opt/locate_anything/hf_cache
+ && mkdir -p /opt/locate_anything/hf_cache \
+ && mkdir -p /opt/locate_anything/test_data
 
 # ---- Non-root user (maps to host UID for bind-mount writability) --------
 # The Ubuntu 24.04 base image (which nvidia/cuda:...-ubuntu24.04

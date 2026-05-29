@@ -33,8 +33,14 @@ Concrete actions:
        fail loud (240 s start_period + 10 retries × 15 s interval).
 
 Bind mounts:
-    ./models/LocateAnything-3B  →  /opt/locate_anything/model    (RO)
-    ./cache/huggingface         →  /opt/locate_anything/hf_cache (RW)
+    ./models/LocateAnything-3B  →  /opt/locate_anything/model     (RO)
+    ./cache/huggingface         →  /opt/locate_anything/hf_cache  (RW)
+    ./test_data                 →  /opt/locate_anything/test_data (RO)
+
+The test_data/ mount carries the synthetic calibration JPEG generated
+by 01_download_weights.sh — it is not baked into the image because
+the image is built before that script runs (so test_data/ is empty
+at build time).
 
 Idempotent: re-running while the service is healthy stops the old
 container, starts a fresh one off the same image, and re-verifies.
@@ -59,6 +65,8 @@ done
 PROJECT_ROOT="$(project_root)"
 LOCAL_MODEL_DIR="${PROJECT_ROOT}/models/LocateAnything-3B"
 HF_CACHE_DIR="${PROJECT_ROOT}/cache/huggingface"
+TEST_DATA_DIR="${PROJECT_ROOT}/test_data"
+CALIB_IMG="${TEST_DATA_DIR}/calibration.jpg"
 
 mkdir -p "${HF_CACHE_DIR}"
 
@@ -75,6 +83,17 @@ if [[ ! -d "${LOCAL_MODEL_DIR}" ]]; then
     die "Model directory ${LOCAL_MODEL_DIR} missing — run scripts/01_download_weights.sh first."
 fi
 
+# Verify the calibration JPEG exists on the host before we bind-mount its
+# parent directory into the container read-only. Without this check, an
+# empty test_data/ would silently mount and the worker would die mid-boot
+# with the file-not-found error reported by worker/calibration.py — clearer
+# to fail here, before the container is even started, with a single-line
+# fix-it pointer.
+if [[ ! -f "${CALIB_IMG}" ]]; then
+    die "Calibration image ${CALIB_IMG} missing on host — run scripts/01_download_weights.sh first.
+The container reads it at /opt/locate_anything/test_data/calibration.jpg via the test_data bind mount."
+fi
+
 docker run -d \
     --name "${LA_CONTAINER_NAME}" \
     --gpus all \
@@ -83,6 +102,7 @@ docker run -d \
     --tmpfs /tmp:rw,size=512m,noexec,nosuid,nodev \
     -v "${LOCAL_MODEL_DIR}":/opt/locate_anything/model:ro \
     -v "${HF_CACHE_DIR}":/opt/locate_anything/hf_cache:rw \
+    -v "${TEST_DATA_DIR}":/opt/locate_anything/test_data:ro \
     -p "${LA_HOST_BIND_IP}:${LA_HOST_PORT}:${LA_INTERNAL_PORT}/tcp" \
     --cap-drop=ALL \
     --security-opt=no-new-privileges \

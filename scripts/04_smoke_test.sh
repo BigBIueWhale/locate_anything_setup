@@ -91,7 +91,13 @@ if ! docker ps --format '{{.Names}}' | grep -qx "${LA_CONTAINER_NAME}"; then
     die "container ${LA_CONTAINER_NAME} is not running — start it with scripts/03_start_service.sh."
 fi
 if ! docker exec "${LA_CONTAINER_NAME}" test -f /opt/locate_anything/test_data/calibration.jpg; then
-    die "calibration image /opt/locate_anything/test_data/calibration.jpg is missing INSIDE the container — rebuild the image."
+    die "calibration image /opt/locate_anything/test_data/calibration.jpg is missing INSIDE the container.
+The container reads it via a read-only bind mount of the host's ./test_data/.
+Fix order:
+    1. Confirm host file:     ls -l test_data/calibration.jpg
+       (if missing, regenerate with: bash scripts/01_download_weights.sh)
+    2. Confirm bind mount:    docker inspect ${LA_CONTAINER_NAME} --format '{{range .Mounts}}{{.Source}} -> {{.Destination}}{{println}}{{end}}'
+       (test_data should appear; if not, restart with: bash scripts/03_start_service.sh)"
 fi
 if ! docker exec "${LA_CONTAINER_NAME}" test -f /opt/locate_anything/scripts/lib/smoke_ws_client.py; then
     die "smoke client /opt/locate_anything/scripts/lib/smoke_ws_client.py is missing INSIDE the container — rebuild the image."
