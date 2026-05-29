@@ -105,55 +105,15 @@ RUN test -n "${LA_PYTHON_PKG}"          -a -n "${LA_TORCH_VERSION}" \
      -a -n "${LA_MAX_INFLIGHT}"           -a -n "${LA_WEBSOCKETS_PY_VERSION}" \
      || { echo "FAIL: missing build arg — every pin must be set"; exit 1; }
 
+# ---- Build-time env -----------------------------------------------------
+# Read by the apt and pip install layers below. Runtime env (model + worker
+# config, GPU contract, allocator tuning) lives in its own ENV block at the
+# end of this stage so a tweak there leaves these build layers untouched.
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    HF_HOME=/opt/locate_anything/hf_cache \
-    HF_HUB_DISABLE_TELEMETRY=1 \
-    HF_HUB_ENABLE_HF_TRANSFER=1 \
-    LA_MODEL_DTYPE=bfloat16 \
-    LA_ATTN_IMPL=sdpa \
-    LA_GEN_TEMPERATURE=0.7 \
-    LA_GEN_TOP_P=0.9 \
-    LA_GEN_DO_SAMPLE=1 \
-    LA_GEN_REP_PEN=1.1 \
-    LA_GEN_MAX_NEW_TOKENS=8192 \
-    LA_GEN_MODE=hybrid \
-    LA_GEN_N_FUTURE_TOKENS=6 \
-    LA_INTERNAL_PORT=${LA_INTERNAL_PORT} \
-    LA_IPC_SOCKET=/tmp/la.sock \
-    LA_MAX_IMAGE_DIM=${LA_MAX_IMAGE_DIM} \
-    LA_MAX_JPEG_BYTES=${LA_MAX_JPEG_BYTES} \
-    LA_MAX_INFLIGHT=${LA_MAX_INFLIGHT}
-
-# NVIDIA_VISIBLE_DEVICES / NVIDIA_DRIVER_CAPABILITIES: pin the GPU
-#   contract into the image rather than relying on the base image's
-#   defaults. compute = bf16 inference kernels (CUDA core compute);
-#   utility = nvidia-smi, libnvidia-ml. We deliberately do NOT request
-#   `video` (NVDEC/NVENC) or `graphics` (Vulkan/OpenGL) — they're not
-#   used and excluding them shrinks the surface area injected by
-#   nvidia-container-runtime.
-# MALLOC_ARENA_MAX: glibc malloc arena fragmentation cap. Default is
-#   8×CPU cores which can grow to multi-GB of resident-but-unused address
-#   space over a long run. 2 arenas is enough for our single-process
-#   worker and bounds fragmentation tightly.
-# CUDA_CACHE_PATH: default $HOME/.nv/ComputeCache is on the read-only
-#   rootfs; without redirecting here, CUDA JIT silently fails and the
-#   autotune cost is paid on every restart. hf_cache is read-write and
-#   persists across container lifetimes.
-# PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True : the PyTorch CUDA
-#   caching allocator grows existing segments rather than allocating new
-#   ones on shape variation. With per-frame image-dim variation under a
-#   live stream, this bounds fragmentation that would otherwise creep
-#   into multi-GB over a 24h run. Supported on PyTorch 2.1+ on Linux;
-#   we run 2.12.
-ENV NVIDIA_VISIBLE_DEVICES=all \
-    NVIDIA_DRIVER_CAPABILITIES=compute,utility \
-    MALLOC_ARENA_MAX=2 \
-    CUDA_CACHE_PATH=/opt/locate_anything/hf_cache/.nv-cache \
-    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    PIP_DISABLE_PIP_VERSION_CHECK=1
 
 # ---- System packages -----------------------------------------------------
 # tini : reliable PID 1, forwards SIGTERM correctly. We use it to supervise
@@ -288,6 +248,74 @@ RUN set -eux; \
     fi; \
     chown -R la:la /opt/locate_anything
 USER la
+
+# ---- Runtime env --------------------------------------------------------
+# Read by the Python worker and the Rust frontend at container start; none
+# of this affects the image build itself. Declared as the last user-visible
+# config block of the stage so tuning any knob here (sampling kwargs, attn
+# impl, IPC topology, GPU contract, allocator behaviour) leaves the upstream
+# apt / pip / flash-attn cache intact.
+#
+# HF_*: redirect HuggingFace cache onto the writable bind-mounted hf_cache
+#   volume (the rootfs is read-only); disable usage telemetry; enable the
+#   parallel hf_transfer backend for weight pulls.
+#
+# LA_*: the model + worker config the worker reads at boot. Every value is
+#   re-validated in worker/validate_startup.py against the canonical
+#   training-time kwargs (Embodied/evaluation/inference_compat.py); drift
+#   hard-fails before the model loads.
+#     LA_MODEL_DTYPE / LA_ATTN_IMPL  — model load knobs. sdpa is the only
+#                                      valid attn impl on sm_120 (see
+#                                      worker/inference.py docstring).
+#     LA_GEN_*                       — sampling + MTP/PBD generation kwargs.
+#     LA_INTERNAL_PORT               — Rust frontend bind port.
+#     LA_IPC_SOCKET                  — Rust↔Python UDS path.
+#     LA_MAX_*                       — ingress hard caps enforced by Rust.
+#
+# NVIDIA_VISIBLE_DEVICES / NVIDIA_DRIVER_CAPABILITIES: pin the GPU contract
+#   injected by nvidia-container-runtime rather than relying on its defaults.
+#   compute = CUDA core inference; utility = nvidia-smi / libnvidia-ml. We
+#   deliberately do NOT request `video` (NVDEC/NVENC) or `graphics`
+#   (Vulkan/OpenGL) — they're not used, and excluding them shrinks the
+#   injected surface area.
+#
+# MALLOC_ARENA_MAX: glibc malloc arena fragmentation cap. Default is 8×CPU
+#   cores, which can grow to multi-GB of resident-but-unused address space
+#   over a long run. 2 arenas is enough for our single-process worker and
+#   bounds fragmentation tightly.
+#
+# CUDA_CACHE_PATH: default $HOME/.nv/ComputeCache lives on the read-only
+#   rootfs; without redirecting here, CUDA JIT silently fails and the
+#   autotune cost is paid on every restart. hf_cache is RW and persists
+#   across container lifetimes.
+#
+# PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True: the PyTorch CUDA caching
+#   allocator grows existing segments rather than allocating new ones on
+#   shape variation. With per-frame image-dim variation under a live stream,
+#   this bounds fragmentation that would otherwise creep into multi-GB over
+#   a 24 h run. Supported on PyTorch 2.1+ on Linux; we run 2.12.
+ENV HF_HOME=/opt/locate_anything/hf_cache \
+    HF_HUB_DISABLE_TELEMETRY=1 \
+    HF_HUB_ENABLE_HF_TRANSFER=1 \
+    LA_MODEL_DTYPE=bfloat16 \
+    LA_ATTN_IMPL=sdpa \
+    LA_GEN_TEMPERATURE=0.7 \
+    LA_GEN_TOP_P=0.9 \
+    LA_GEN_DO_SAMPLE=1 \
+    LA_GEN_REP_PEN=1.1 \
+    LA_GEN_MAX_NEW_TOKENS=8192 \
+    LA_GEN_MODE=hybrid \
+    LA_GEN_N_FUTURE_TOKENS=6 \
+    LA_INTERNAL_PORT=${LA_INTERNAL_PORT} \
+    LA_IPC_SOCKET=/tmp/la.sock \
+    LA_MAX_IMAGE_DIM=${LA_MAX_IMAGE_DIM} \
+    LA_MAX_JPEG_BYTES=${LA_MAX_JPEG_BYTES} \
+    LA_MAX_INFLIGHT=${LA_MAX_INFLIGHT} \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+    MALLOC_ARENA_MAX=2 \
+    CUDA_CACHE_PATH=/opt/locate_anything/hf_cache/.nv-cache \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # ---- Image content-hash stamp ------------------------------------------
 # scripts/02_build_image.sh computes a SHA-256 over the source files that
