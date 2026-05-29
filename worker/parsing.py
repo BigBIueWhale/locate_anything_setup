@@ -4,9 +4,13 @@ Parse LocateAnything-3B output text into structured detections.
 The model emits 6-token blocks like:
     <box><x1><y1><x2><y2></box>            — box, 4 integer coords in [0,1000]
     <box><x><y></box>                       — point, 2 integer coords in [0,1000]
-    <box>none</box>                         — explicit abstention
+    <box>None</box>                         — explicit abstention
     <ref>category</ref><box>...</box>       — labeled box
-The 'none' subword inside the box is treated as 'no detection'.
+The literal `None` (capitalized, mirroring the Python `None` literal — observed
+in NVIDIA's own training outputs) inside a box is the abstention marker. We
+also accept lowercase `none` as a documentation safety net in case a later
+release flips the case; both forms route through the same detection-skipped
+path.
 
 Verified against /tmp/nvlabs_eagle/Embodied/locateanything_worker.py
 (LocateAnythingWorker.parse_boxes) and the model's generate_utils.py.
@@ -26,8 +30,9 @@ _LABELED_BOX_RE = re.compile(
 _BOX_RE = re.compile(r"<box><(\d+)><(\d+)><(\d+)><(\d+)></box>")
 # Regex for a point.
 _POINT_RE = re.compile(r"<box><(\d+)><(\d+)></box>")
-# Regex for explicit 'none' abstention.
-_NONE_RE = re.compile(r"<box>none</box>")
+# Regex for explicit None abstention. The model emits capital-N `None` (mirroring
+# the Python literal); we also accept lowercase as a forward-compat safety net.
+_NONE_RE = re.compile(r"<box>[Nn]one</box>")
 
 
 @dataclass(frozen=True)
