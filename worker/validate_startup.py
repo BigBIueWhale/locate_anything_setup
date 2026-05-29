@@ -232,6 +232,17 @@ def validate_env() -> None:
     # (Embodied/evaluation/inference_compat.py:42-68). The model was not
     # trained on any other combination; running with different values
     # = not using the model as trained = forbidden.
+    #
+    # LA_ATTN_IMPL exception: config.json's `_attn_implementation='magi'`
+    # is the train-time value, but MagiAttention does not support sm_120
+    # (RTX 5090). The model's custom Qwen2Model.forward() accepts exactly
+    # two paths — 'magi' and 'sdpa' — and the sdpa path reconstructs the
+    # same block-mask attention pattern (via
+    # mask_sdpa_utils.update_causal_mask_for_one_gen_window_2d) that the
+    # model was trained with under magi. So sdpa preserves the train-time
+    # attention pattern within bf16 precision, just at lower throughput.
+    # See worker/inference.py module docstring "ATTENTION" for the full
+    # provenance.
     canonical = {
         "LA_GEN_TEMPERATURE":      "0.7",
         "LA_GEN_TOP_P":            "0.9",
@@ -241,7 +252,7 @@ def validate_env() -> None:
         "LA_GEN_N_FUTURE_TOKENS":  "6",
         "LA_GEN_MAX_NEW_TOKENS":   "8192",
         "LA_MODEL_DTYPE":          "bfloat16",
-        "LA_ATTN_IMPL":            "flash_attention_2",
+        "LA_ATTN_IMPL":            "sdpa",
     }
     drift = []
     for k, expected in canonical.items():
@@ -263,24 +274,8 @@ def validate_env() -> None:
        f"attn={os.environ['LA_ATTN_IMPL']}, dtype={os.environ['LA_MODEL_DTYPE']}")
 
 
-def validate_flash_attn() -> None:
-    """Confirm flash_attention_2 is importable. The model load will silently
-    fall through to sdpa if we don't catch this — and our config explicitly
-    requires fa2 (LA_ATTN_IMPL)."""
-    try:
-        import flash_attn  # noqa: F401
-    except ImportError as e:
-        fail(
-            f"flash_attn is not importable: {e}. The container is configured "
-            "with LA_ATTN_IMPL=flash_attention_2 — no fallback to sdpa is "
-            "permitted at runtime. Rebuild the image."
-        )
-    ok(f"flash_attn {flash_attn.__version__} importable")
-
-
 def run_all(model_dir: str) -> None:
     validate_env()
     validate_gpu()
-    validate_flash_attn()
     validate_model_dir(model_dir)
     ok("all preflight checks passed")

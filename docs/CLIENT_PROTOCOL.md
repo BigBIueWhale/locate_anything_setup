@@ -60,7 +60,7 @@ Full capability descriptor. Fields:
 | `model_dir`               | string | Path inside the container. |
 | `model_manifest_sha256`   | string | SHA-256 over `(file_name, file_size)` lines — a fingerprint for the bind-mounted model directory, NOT a full content hash. For real content verification, see the per-file SHA-256 enforced at boot in `worker/validate_startup.py`. |
 | `dtype`                   | string | `"bfloat16"` — the only supported dtype. |
-| `attn_impl`               | string | `"flash_attention_2"`. |
+| `attn_impl`               | string | `"sdpa"` — see `docs/PINNED_VERSIONS.md` for why this is the only viable option on sm_120 and why it preserves the train-time attention pattern. |
 | `max_image_dim`           | int    | 2240 — verified ceiling from `preprocessor_config.json`. |
 | `in_token_limit`          | int    | 25600 — max ViT patches per image. |
 | `max_llm_tokens_per_image`| int    | 6400. |

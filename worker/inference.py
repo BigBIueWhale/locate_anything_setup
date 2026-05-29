@@ -7,14 +7,53 @@ This module wraps the upstream `LocateAnythingWorker` pattern from
   • All generation kwargs sourced from env vars (the trained values from
     `Embodied/evaluation/inference_compat.py:build_generate_kwargs`).
   • Explicit `attn_implementation` override (config.json says 'magi',
-    but MagiAttention has no sm_120 kernels — we force flash_attention_2).
+    but MagiAttention does not support sm_120 — we force 'sdpa' here,
+    which is the only valid path in Qwen2Model.forward() on RTX 5090.
+    See ATTENTION below).
   • bf16 enforcement.
   • Strict per-request validation (no fallbacks).
 
-NO source file in this project changes the model's behavior away from how
-it was trained. The only override is the attention backend (config.json
-default 'magi' → 'flash_attention_2'), which is the documented fallback
-path in modeling_qwen2.py.
+ATTENTION:
+    NVIDIA trained LocateAnything-3B with `_attn_implementation='magi'`
+    (custom block-mask attention from SandAI MagiAttention). The model's
+    custom modeling_qwen2.py defines THREE attention classes (eager,
+    flash_attention_2, sdpa, magi) but its Qwen2Model.forward() only
+    builds masks for `magi` and `sdpa` paths — any other value raises
+    NotImplementedError at line 1335. So in practice this model accepts
+    exactly two attn impls at inference: 'magi' and 'sdpa'.
+
+    On RTX 5090 (Blackwell GB202, sm_120), MagiAttention's FFA_FA4
+    cutlass kernels require sm_100a (Blackwell datacenter B200)
+    architecture-specific instructions (TMEM, tcgen05/UMMA) that do
+    not exist on sm_120 consumer Blackwell. Per NVIDIA's own Blackwell
+    Compatibility Guide, sm_100a kernels are not forward-compatible to
+    sm_120 — there is no PTX-JIT rescue path. The maintainer confirms
+    sm_120 is on the roadmap, not yet shipped (SandAI/MagiAttention#184,
+    open as of 2026-05-29). So magi is structurally unavailable.
+
+    That leaves 'sdpa'. The model's sdpa path in Qwen2Model.forward()
+    reconstructs the same block-mask attention PATTERN via
+    `mask_sdpa_utils.update_causal_mask_for_one_gen_window_2d`:
+    bidirectional-within-window + blocked-just-emitted-token + causal
+    prefix — i.e. it faithfully reproduces the magi range mask used
+    at training time, via PyTorch SDPA + a hand-constructed 4D
+    attention mask. The result is mathematically equivalent to
+    magi+hybrid within bf16 precision; only execution speed differs
+    (no fused FA-style kernel). This means `LA_ATTN_IMPL=sdpa` +
+    `LA_GEN_MODE=hybrid` preserves the train-time attention pattern,
+    train-time MTP/PBD generation behaviour, and train-time generation
+    kwargs simultaneously. It is the correct configuration, not a
+    fallback.
+
+OVERRIDE MECHANICS:
+    The model's custom `_autoset_attn_implementation` (modeling_qwen2.py
+    line 1048) short-circuits when `config._attn_implementation == 'magi'`
+    and silently drops any user-provided `attn_implementation=...` kwarg
+    on `from_pretrained`. To force the override we load the AutoConfig
+    explicitly, mutate `_attn_implementation` on the outer config AND
+    `text_config` (the inner Qwen2 config) to the desired value, then
+    pass the mutated config to `from_pretrained`. This bypasses the
+    short-circuit because the check at line 1048 no longer sees 'magi'.
 """
 
 from __future__ import annotations
@@ -25,7 +64,7 @@ import time
 
 import torch
 from PIL import Image, ImageFile, ImageOps
-from transformers import AutoModel, AutoTokenizer, AutoProcessor
+from transformers import AutoConfig, AutoModel, AutoTokenizer, AutoProcessor
 
 from .parsing import parse_boxes, parse_points, has_abstention
 from .pixel_token_math import plan_resize
@@ -195,15 +234,52 @@ class LocateAnythingInference:
             trust_remote_code=True,
             local_files_only=True,
         )
+
+        # Load AutoConfig and mutate `_attn_implementation` on the top-level
+        # config AND the inner text_config (Qwen2). See "OVERRIDE MECHANICS"
+        # in this module's docstring for why we cannot rely on the
+        # `attn_implementation=` kwarg on from_pretrained — the model's
+        # custom `_autoset_attn_implementation` short-circuits and drops
+        # the kwarg whenever config.json's `_attn_implementation` is
+        # 'magi' (which it always is in this model). vision_config is
+        # left alone — MoonViT does not have a magi/sdpa branch.
+        config = AutoConfig.from_pretrained(
+            model_dir,
+            trust_remote_code=True,
+            local_files_only=True,
+        )
+        config._attn_implementation = self.attn_impl
+        if not hasattr(config, "text_config"):
+            raise RuntimeError(
+                "LocateAnything config is missing `text_config`; the model "
+                "loader cannot redirect the inner Qwen2 attn implementation. "
+                "This is a structural mismatch with the pinned HF revision."
+            )
+        config.text_config._attn_implementation = self.attn_impl
+
         self.model = AutoModel.from_pretrained(
             model_dir,
+            config=config,
             torch_dtype=self.dtype,
             trust_remote_code=True,
-            attn_implementation=self.attn_impl,
             local_files_only=True,
             use_safetensors=True,
             device_map={"": device},
         ).eval()
+
+        # Verify the override actually stuck. The model's custom
+        # `_autoset_attn_implementation` can rewrite `_attn_implementation`
+        # back to 'magi' (or fall back to FA2) in some corner cases;
+        # we refuse to operate if the resulting model object disagrees
+        # with the configured impl.
+        actual = getattr(self.model.language_model.model, "_attn_implementation", None)
+        if actual != self.attn_impl:
+            raise RuntimeError(
+                f"attn_implementation override did not take effect: "
+                f"requested LA_ATTN_IMPL={self.attn_impl!r}, "
+                f"but model.language_model.model._attn_implementation={actual!r}. "
+                f"The model would crash at forward() — refusing to start."
+            )
         # No `.to(device)` — accelerate's device_map already placed every
         # module on `device`; calling `.to()` on a dispatched model is a
         # no-op at best and a source of subtle dispatch-hook bugs at worst.

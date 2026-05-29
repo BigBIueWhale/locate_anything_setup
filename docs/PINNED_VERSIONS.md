@@ -48,15 +48,41 @@ and re-run `setup.sh`.
 
 | Var | Value | Why |
 |---|---|---|
-| `LA_FLASH_ATTN_VERSION` | `2.8.4` | Latest 2.x; setup.py default arches include `120`. FA4 (the new generation) does NOT run on RTX 5090 — sm_120 lacks the TMEM hardware FA4 requires. |
+| `LA_FLASH_ATTN_VERSION` | `2.8.3` | Latest 2.x on PyPI; source-built with sm_120 kernels. The model's modeling_qwen2.py conditionally imports flash_attn at module load (`if is_flash_attn_2_available(): from flash_attn import ...`), so we keep it installed even though the active attn path is sdpa (see below) — letting the conditional import succeed avoids module-load surprises. FA4 (next generation) does NOT run on RTX 5090: sm_120 lacks the TMEM hardware FA4 requires. |
 | `LA_FLASH_ATTN_ARCHS`   | `120`   | Build only sm_120 kernels. Shortens build time ~5× vs. the default `80;90;100;110;120` sweep. |
 
-`magi_attention` is **omitted**. v1.0.5 (which the model's `config.json`
-references) is sm_90-only; v1.1.x (released later) added sm_100 but
-NOT sm_120. The model's `_attn_implementation='magi'` config would
-fall through to `flash_attention_2` automatically — but we make the
-override explicit (`LA_ATTN_IMPL=flash_attention_2`) so behavior is
-deterministic.
+`magi_attention` is **omitted**. The model's `config.json` declares
+`_attn_implementation='magi'` (SandAI MagiAttention), but the FFA_FA4
+cutlass kernels target `sm_100a` (Blackwell datacenter B200) using
+architecture-specific instructions (TMEM, tcgen05/UMMA) that do **not**
+exist on sm_120 consumer Blackwell. Per NVIDIA's own Blackwell
+Compatibility Guide, sm_100a binaries are not forward-compatible to
+sm_120 — there is no PTX-JIT rescue path. The MagiAttention maintainer
+confirms sm_120 is on the roadmap, not yet shipped
+(SandAI/MagiAttention#184).
+
+We override the model's attention to **sdpa** via `LA_ATTN_IMPL=sdpa`.
+This is **not** a "fallback" in the degraded-quality sense — it is the
+only viable path on sm_120 that preserves the train-time attention
+pattern. The model's custom `modeling_qwen2.py:Qwen2Model.forward()`
+has exactly two valid branches: `magi` and `sdpa`. Any other value
+(including `flash_attention_2`) raises `NotImplementedError` at
+line 1335. The `sdpa` branch reconstructs the same block-mask
+attention pattern (bidirectional-within-window + blocked-just-emitted-
+token + causal prefix) via
+`mask_sdpa_utils.update_causal_mask_for_one_gen_window_2d`, then runs
+it through PyTorch SDPA. The result is mathematically equivalent to
+`magi+hybrid` within bf16 precision; only execution speed differs.
+
+Override mechanics: NVIDIA's model code defines a custom
+`_autoset_attn_implementation` that silently drops user-provided
+`attn_implementation=` kwargs on `from_pretrained` whenever
+config.json says `'magi'`. To force the override, `worker/inference.py`
+loads the AutoConfig explicitly, mutates `_attn_implementation` on
+both the top-level config and the inner `text_config`, then passes
+the mutated config to `from_pretrained`. A boot-time verification
+then re-reads the attribute on the constructed model and refuses to
+serve if the override did not stick.
 
 ## Model-mandated Python deps (pinned EXACTLY)
 
@@ -105,7 +131,7 @@ for all benchmark runs in the paper.
 | ENV var                    | Value             | Source |
 |---|---|---|
 | `LA_MODEL_DTYPE`           | `bfloat16`        | `config.json:torch_dtype`. |
-| `LA_ATTN_IMPL`             | `flash_attention_2` | Override of `config.json:_attn_implementation='magi'` — magi unsupported on sm_120. |
+| `LA_ATTN_IMPL`             | `sdpa`              | Override of `config.json:_attn_implementation='magi'` — magi unbuildable on sm_120, sdpa is the only other valid branch in `Qwen2Model.forward()` and reconstructs the same block-mask pattern. See `## magi_attention` section above. |
 | `LA_GEN_TEMPERATURE`       | `0.7`             | `inference_compat.py:55`. |
 | `LA_GEN_TOP_P`             | `0.9`             | `inference_compat.py:56`. |
 | `LA_GEN_DO_SAMPLE`         | `1`               | `inference_compat.py:54`. |
