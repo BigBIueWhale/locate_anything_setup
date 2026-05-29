@@ -750,11 +750,14 @@ class LocateAnythingInference:
             # shift — strict-trained-correct contract.
             icc = raw.info.get("icc_profile")
             if icc:
+                from PIL import ImageCms
                 try:
-                    from PIL import ImageCms
                     src_profile = ImageCms.ImageCmsProfile(io.BytesIO(icc))
                     src_desc = ImageCms.getProfileDescription(src_profile).strip()
-                    if "sRGB" not in src_desc:
+                    # Case-insensitive match — common variants include
+                    # "sRGB IEC61966-2.1", "sRGB Color Space Profile",
+                    # "srgb" (some older LCMS-emitted profiles).
+                    if "srgb" not in src_desc.lower():
                         # Truly non-sRGB tagged input — colour-manage to sRGB
                         # via PCS-LAB so out-of-gamut colours are perceptually
                         # mapped rather than clipped at the channel level.
@@ -766,7 +769,13 @@ class LocateAnythingInference:
                         )
                     # else: profile is already sRGB — skip the no-op
                     # transform; convert() below will normalise mode.
-                except ValueError as e:
+                except (ValueError, OSError, ImageCms.PyCMSError) as e:
+                    # PyCMSError = corrupt/unparseable ICC bytes,
+                    # OSError   = profile object construction failed,
+                    # ValueError = profileToProfile rejected the intent
+                    # or mode. All three are client-fault, all three get
+                    # a clean 400 with provenance — never a silent
+                    # colour shift.
                     raise ValueError(
                         "ICC profile present but could not be converted to "
                         f"sRGB: {type(e).__name__}: {e}. Strip or correct "
@@ -785,27 +794,42 @@ class LocateAnythingInference:
                 "the encoder is producing baseline JPEG with mode L or RGB."
             ) from e
 
-        # Strict patch-budget check matching NVIDIA's training-time
-        # `in_token_limit=25600`. The Rust frontend's
-        # LA_MAX_IMAGE_DIM cap (2240 px per dim) means a square input
-        # tops out at (2240/28)² = 6400 LLM tokens, well under the
-        # budget — but the cap is configurable and this check is
-        # defense in depth: if anyone raises LA_MAX_IMAGE_DIM, this
-        # asserts the input still fits the trained spec rather than
-        # silently triggering the preprocessor's internal downscale.
-        # Token count is computed on the LLM-side grid (28 px per
-        # merged token = patch_size × merge_kernel_size).
+        # Strict trained-correct preprocessor gates — defense in depth
+        # for the Rust front-end's checks. The model's
+        # image_processing_locateanything.py:rescale() enforces:
+        #   (a) `(W // 14) * (H // 14) <= in_token_limit (=25,600)`
+        #       (line 52). FLOOR-div on the raw 14-px patch grid, NOT
+        #       ceil-div on the merged 28-px grid (a prior revision of
+        #       this gate had it wrong).
+        #   (b) `W // 14 < 512` AND `H // 14 < 512` (line 68 — "Exceed
+        #       pos emb"). The MoonViT base learned positional embedding
+        #       is 64×64, bicubic-interpolated to the runtime grid;
+        #       512 patches per side is the documented hard cap.
+        # Both are dormant at the current LA_MAX_IMAGE_DIM=2240 (each
+        # check needs W or H ≥ 2254 / ≥ 7168 respectively to trip) but
+        # enforce the trained-correct contract regardless of cap.
         w, h = image.width, image.height
-        n_tokens = ((w + 27) // 28) * ((h + 27) // 28)
-        if n_tokens > 25600:
+        PATCH_PX, IN_TOKEN_LIMIT, POS_EMB_CAP = 14, 25600, 512
+        w_patches = w // PATCH_PX
+        h_patches = h // PATCH_PX
+        n_patches = w_patches * h_patches
+        if n_patches > IN_TOKEN_LIMIT:
             raise ValueError(
-                f"image dimensions {w}x{h} require {n_tokens} LLM tokens, "
-                "exceeding the trained in_token_limit=25,600 "
-                "(image_processing_locateanything.py would internally downscale "
-                "to fit; the canonical training-correct path is for the "
-                "client to send within budget). Reduce dimensions so "
-                "ceil(W/28) × ceil(H/28) ≤ 25,600 — a square image at "
-                "2240 px per side uses 6,400 LLM tokens, well under cap."
+                f"image dimensions {w}x{h} produce {n_patches} ViT patches "
+                f"((W // {PATCH_PX}) × (H // {PATCH_PX})), exceeding the "
+                f"trained `in_token_limit = {IN_TOKEN_LIMIT}`. The model's "
+                "preprocessor would internally downscale (BICUBIC) to fit "
+                "— the canonical training-correct path is for the client "
+                f"to send within budget. Reduce dimensions so "
+                f"(W // {PATCH_PX}) × (H // {PATCH_PX}) ≤ {IN_TOKEN_LIMIT}."
+            )
+        if w_patches >= POS_EMB_CAP or h_patches >= POS_EMB_CAP:
+            raise ValueError(
+                f"image dimensions {w}x{h} would map to a "
+                f"{w_patches}×{h_patches} patch grid, exceeding MoonViT's "
+                f"positional-embedding cap of {POS_EMB_CAP} patches per "
+                f"side (= {POS_EMB_CAP * PATCH_PX} px). Reduce each "
+                f"dimension to < {POS_EMB_CAP * PATCH_PX} px."
             )
 
         # Plan resize before model touches it — log for debug/audit.

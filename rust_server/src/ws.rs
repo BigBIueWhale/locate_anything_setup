@@ -310,34 +310,62 @@ async fn process_binary(
         )));
     }
 
-    // Strict trained-correct patch-budget gate. The model was trained with
-    // `in_token_limit = 25,600` LLM tokens at a 28-pixel-per-token grid
-    // (patch_size=14 × merge_kernel_size=2). Above this, the in-image
-    // preprocessor would silently downscale (BICUBIC) to fit — that's a
-    // documented behaviour but it means the model sees a different image
-    // than what the client sent. We refuse rather than let the downscale
-    // happen silently, so the client's frame_id correlates 1:1 with what
-    // the model actually saw at training-time spec.
+    // Strict trained-correct preprocessor gates. The model's
+    // image_processing_locateanything.py:rescale() enforces THREE constraints;
+    // we mirror them bit-for-bit at the network edge so the client never
+    // gets a result for a silently-modified image.
     //
-    // At the current LA_MAX_IMAGE_DIM=2240 cap this check is redundant —
-    // a square 2240×2240 image is only 6400 tokens. The check matters if
-    // the cap is ever raised, or if a non-square input pushes total
-    // tokens past 25,600 even with each side under cap.
-    const MERGED_TOKEN_PX: u64 = 28;          // patch_size × merge_kernel_size
+    //   (a) `(W // 14) * (H // 14) <= in_token_limit (=25,600)` — line 52
+    //       of the model's rescale(). Above this, the preprocessor would
+    //       internally BICUBIC-rescale to fit; the client's frame_id would
+    //       then refer to a different spatial frame than the one returned.
+    //
+    //   (b) `W // 14 < 512` AND `H // 14 < 512` — line 68 of rescale().
+    //       The MoonViT positional embedding is a 64×64 base learnable
+    //       embedding bicubic-interpolated up to the runtime grid; 512
+    //       patches per side is the documented "Exceed pos emb" hard cap
+    //       (image_processing_locateanything.py line 68-69). Beyond this
+    //       the preprocessor raises a Python ValueError — we want a clean
+    //       client-side rejection at the WS edge instead.
+    //
+    //   (NB: the formula uses FLOOR-DIV on the raw 14-px patch grid, NOT
+    //   ceil-div on the merged 28-px grid. We had this wrong in a prior
+    //   revision — verified against NVIDIA's code at the SHA pin.)
+    //
+    // At the current LA_MAX_IMAGE_DIM=2240, both checks are dormant
+    // (2240/14 = 160 per side → 25,600 patches square / 160 < 512), so
+    // these gates protect future cap raises and unusual aspect ratios.
+    const PATCH_PX: u64        = 14;          // from preprocessor_config.json
     const IN_TOKEN_LIMIT: u64  = 25_600;      // from preprocessor_config.json
-    let n_tokens = ((w as u64 + MERGED_TOKEN_PX - 1) / MERGED_TOKEN_PX)
-                 * ((h as u64 + MERGED_TOKEN_PX - 1) / MERGED_TOKEN_PX);
-    if n_tokens > IN_TOKEN_LIMIT {
+    const POS_EMB_PATCH_CAP: u64 = 512;       // from model's rescale() line 68
+    let w_patches = w as u64 / PATCH_PX;
+    let h_patches = h as u64 / PATCH_PX;
+    let n_patches = w_patches * h_patches;
+    if n_patches > IN_TOKEN_LIMIT {
         return Err(ServerError::InvalidImage(format!(
-            "image dimensions {}x{} require {} LLM tokens, exceeding the \
-             trained `in_token_limit={}` (one merged token covers {}×{} px). \
-             The model's preprocessor would internally downscale to fit, \
-             producing detections relative to a smaller image than the one \
-             you sent — we refuse this rather than silently scale. Reduce \
-             dimensions so ceil(W/{}) × ceil(H/{}) ≤ {}.",
-            w, h, n_tokens, IN_TOKEN_LIMIT,
-            MERGED_TOKEN_PX, MERGED_TOKEN_PX,
-            MERGED_TOKEN_PX, MERGED_TOKEN_PX, IN_TOKEN_LIMIT
+            "image dimensions {}x{} produce {} ViT patches \
+             ((W // {}) × (H // {})), exceeding the trained \
+             `in_token_limit = {}`. The model's preprocessor would \
+             internally BICUBIC-downscale to fit, producing detections \
+             relative to a smaller image than the one you sent — we \
+             refuse this rather than silently scale. Reduce dimensions \
+             so (W // {}) × (H // {}) ≤ {}.",
+            w, h, n_patches,
+            PATCH_PX, PATCH_PX,
+            IN_TOKEN_LIMIT,
+            PATCH_PX, PATCH_PX, IN_TOKEN_LIMIT
+        )));
+    }
+    if w_patches >= POS_EMB_PATCH_CAP || h_patches >= POS_EMB_PATCH_CAP {
+        return Err(ServerError::InvalidImage(format!(
+            "image dimensions {}x{} would map to a {}×{} patch grid; the \
+             MoonViT positional embedding's bicubic-interpolation cap is \
+             {} patches per side (= {} px), per the model's preprocessor \
+             at image_processing_locateanything.py line 68 (\"Exceed pos \
+             emb\"). Reduce each dimension to < {} px.",
+            w, h, w_patches, h_patches,
+            POS_EMB_PATCH_CAP, POS_EMB_PATCH_CAP * PATCH_PX,
+            POS_EMB_PATCH_CAP * PATCH_PX
         )));
     }
 

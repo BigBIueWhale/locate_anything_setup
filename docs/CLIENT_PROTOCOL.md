@@ -145,14 +145,19 @@ input than it sent:
 * **Be RGB**, not CMYK. PIL's CMYK→RGB transform isn't ICC-aware and
   produces wrong colours; we reject CMYK rather than degrade.
 * **Both dimensions in `[32, max_image_dim=2240]`** px.
-* **Total LLM tokens ≤ 25,600**, where a token covers a `28 × 28` px
-  cell (`patch_size × merge_kernel_size`). Concretely:
-  `ceil(W / 28) × ceil(H / 28) ≤ 25600`. At the current 2240 px-per-side
-  cap a square input is only 6,400 tokens — the budget gate matters
-  only if the cap is ever raised or the aspect ratio is extreme.
-  Without this gate the model's preprocessor would *silently downscale*
-  oversized inputs to fit; we refuse rather than scale, so the client's
-  `frame_id` corresponds to the spatial frame the model actually saw.
+* **`(W // 14) × (H // 14) ≤ 25,600`** ViT patches (the exact formula
+  the model's `image_processing_locateanything.py:52` checks against
+  `in_token_limit=25,600`). At the 2240 px-per-side cap a square input
+  has 160 × 160 = 25,600 patches — right at the budget — so any input
+  meaningfully larger than 2240×2240 *(or non-square with one dim ≥ 2254)*
+  would trigger the preprocessor's internal BICUBIC downscale. We refuse
+  rather than scale, so the client's `frame_id` corresponds to the
+  spatial frame the model actually saw.
+* **`(W // 14) < 512` AND `(H // 14) < 512`** patches per side — the
+  MoonViT positional embedding is a 64×64 base learnable embedding
+  bicubic-interpolated to the runtime grid; 512 patches per side is
+  the documented "Exceed pos emb" hard cap (line 68 of the same file).
+  Equivalently each dim < 7168 px.
 * **Be ≤ `LA_MAX_JPEG_BYTES`** (4 MiB by default).
 * **If the JPEG carries an ICC profile, it should be sRGB** — but you
   do not have to strip it. The worker uses `PIL.ImageCms.profileToProfile`
@@ -163,9 +168,10 @@ input than it sent:
 
 In short, **strict in, faithful out**. The client never has to ask
 "what did the model actually see?" — if the request reached the model,
-it saw exactly the pixels you sent, modulo BICUBIC padding to the next
-28-px multiple (which is the trained preprocessing path and is
-mathematically identical to what NVIDIA does at training time).
+it saw exactly the pixels you sent, modulo a BICUBIC resize to the next
+`merge_kernel_size × patch_size` = 28-px multiple on each axis (which
+is the trained preprocessing path and is mathematically identical to
+what NVIDIA does at training time).
 
 ### Result (Text)
 
