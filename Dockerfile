@@ -182,9 +182,16 @@ RUN python -m pip install \
 # --no-build-isolation — the build script imports the installed torch
 #   wheel to query CUDA version; with isolation it would install a stale
 #   torch into the build env.
+# --use-pep517 — pip 25.3 (Oct 2025) removed the legacy `setup.py
+#   bdist_wheel` path entirely; flash-attn 2.8.3 still ships no
+#   pyproject.toml (upstream issue Dao-AILab/flash-attention#1746, open),
+#   so without this flag a future pip bump above our 25.2 pin hard-fails
+#   the build with no warning. Forward-compatible with 25.3+ and harmless
+#   on 25.2; combines with --no-build-isolation per pip's documented
+#   contract (build deps must be pre-installed, and torch is).
 RUN FLASH_ATTN_CUDA_ARCHS="${LA_FLASH_ATTN_ARCHS}" \
     MAX_JOBS=8 \
-    python -m pip install --no-build-isolation \
+    python -m pip install --no-build-isolation --use-pep517 \
         "flash-attn==${LA_FLASH_ATTN_VERSION}" \
  && python -c "import flash_attn; \
 import sys; \
