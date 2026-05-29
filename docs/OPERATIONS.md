@@ -42,6 +42,48 @@ For first-time setup, see [`../README.md`](../README.md).
 
 ---
 
+## Concurrency — supports **one** concurrent user
+
+This deployment is designed for **one concurrent user at a time**. The
+server accepts and time-shares any number of WebSocket connections
+(see `scripts/05_concurrency_smoke.sh` for the FIFO-fairness invariant
+empirically), but it gives you **no aggregate throughput speedup** as
+you add concurrent users — each additional active user proportionally
+divides the single GPU's per-frame service time. Two users → each gets
+roughly half the FPS of one user. Five users → each gets a fifth.
+
+Why: we run the model under bare `transformers` with the upstream
+custom `.generate()` (`modeling_locateanything.py`), not under a
+batching/serving framework. Batch-1 autoregressive decoding on the
+RTX 5090 is **GDDR7-bandwidth-bound** (~1.79 TB/s, ~6 GiB weight
+stream per forward pass → ~3.4 ms per decode step lower bound).
+Running N concurrent forward passes splits the same bandwidth N ways
+— net aggregate throughput stays at one stream's worth.
+
+To get real throughput parallelism on this single GPU you would need
+to switch to a continuous-batching server (vLLM, SGLang, TensorRT-LLM)
+and port the model's PBD/MTP `.generate()` to its executor. That is
+**weeks of engineering plus a quality-revalidation programme** (the
+training-correct `hybrid + n_future_tokens=6` path would need to be
+re-implemented inside the new framework). We deliberately did not go
+that direction because the project's correctness bar — "only use the
+model how it was trained" — outweighs the throughput gain for the
+single-stream live-detection use case this server is built for.
+
+**What this means operationally:**
+
+| Situation | What to do |
+|---|---|
+| One human / one camera feed | Works as designed. Steady ~3 FPS, ~250-1100 ms per-frame latency depending on input resolution. |
+| Two users sharing the GPU briefly | Fine; each sees ~½ FPS, all responses correct, no errors. |
+| More than 2-3 sustained concurrent users | Deploy more GPUs (one container per GPU, each fronted by its own port; load-balance externally), or invest in the vLLM/SGLang port. |
+
+The `--restart unless-stopped` and healthcheck behaviour described
+below are completely orthogonal to concurrency — they are about
+**process supervision**, not user concurrency.
+
+---
+
 ## Restart policy semantics — read this once
 
 The container runs with `--restart unless-stopped`. **Important
