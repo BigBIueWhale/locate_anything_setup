@@ -62,6 +62,72 @@ if [[ "${LA_REBUILD}" -eq 0 ]] && docker image inspect "${LA_IMAGE_TAG}" >/dev/n
     exit 0
 fi
 
+# ---------------------------------------------------------------------
+# RAM-capacity gate before the flash-attn compile.
+#
+# The Dockerfile invokes the flash-attn 2.8.3 source build with
+# MAX_JOBS=8. Eight parallel nvcc processes compiling cutlass kernel
+# templates can peak at roughly 30-50 GiB of host RAM in flight. If
+# the host can't supply that, the kernel OOM-killer terminates one
+# of the nvcc processes mid-compile and ninja aborts the build half
+# done — wasting ~15 minutes of compute.
+#
+# Two independent checks:
+#
+#   (1) MemTotal >= 56 GiB. This is the STRUCTURAL check — does the
+#       machine itself have enough RAM to ever run MAX_JOBS=8 safely?
+#       A "64 GiB-class" workstation on Linux typically reports
+#       58-62 GiB MemTotal after BIOS reservations; 56 is the floor
+#       we accept. Below 56, the operator MUST change MAX_JOBS in
+#       the Dockerfile — closing apps won't help on a too-small box.
+#
+#   (2) MemAvailable >= 35 GiB. This is the RUNTIME check — even on
+#       a 64 GiB-class machine, if some other process is currently
+#       hogging 30+ GiB the parallel compile will still get OOM-
+#       killed. 35 GiB gives ~5 GiB headroom above the realistic
+#       median nvcc peak (~30 GiB for sm_120-only with 8 jobs).
+#       Below 35, the operator can either close those apps or drop
+#       MAX_JOBS.
+# ---------------------------------------------------------------------
+LA_MIN_TOTAL_RAM_GIB=56
+LA_MIN_AVAILABLE_RAM_GIB=35
+MEMTOTAL_KIB=$(awk '/^MemTotal:/     {print $2}' /proc/meminfo)
+AVAILABLE_KIB=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)
+if [[ -z "${MEMTOTAL_KIB}" || -z "${AVAILABLE_KIB}" ]]; then
+    die "could not read MemTotal / MemAvailable from /proc/meminfo — host environment is non-standard."
+fi
+MEMTOTAL_GIB=$(( MEMTOTAL_KIB / 1024 / 1024 ))
+AVAILABLE_GIB=$(( AVAILABLE_KIB / 1024 / 1024 ))
+
+if (( MEMTOTAL_GIB < LA_MIN_TOTAL_RAM_GIB )); then
+    die "Host machine has only ${MEMTOTAL_GIB} GiB MemTotal (< ${LA_MIN_TOTAL_RAM_GIB} GiB required for MAX_JOBS=8). Refusing to start the build because the flash-attn nvcc compile would OOM-kill itself.
+
+This is a STRUCTURAL machine-capacity issue. Closing applications won't help — the machine itself is too small for parallel nvcc at MAX_JOBS=8.
+
+Required: edit MAX_JOBS in Dockerfile (currently 8) to a lower value, then re-run:
+    MAX_JOBS=4  → ~30-40 min build, peak ~15-25 GiB
+    MAX_JOBS=2  → ~60 min build,    peak ~8-12 GiB
+    MAX_JOBS=1  → ~90-120 min build, peak ~4-6 GiB (fully serial; works on any host)
+
+If you'll be rebuilding on this hardware more than once, consider promoting
+MAX_JOBS to scripts/lib/versions.sh as LA_FLASH_ATTN_MAX_JOBS so it's a one-line
+edit instead of a Dockerfile change."
+fi
+
+if (( AVAILABLE_GIB < LA_MIN_AVAILABLE_RAM_GIB )); then
+    die "Host has only ${AVAILABLE_GIB} GiB MemAvailable right now (of ${MEMTOTAL_GIB} GiB total); refusing because the flash-attn nvcc compile with MAX_JOBS=8 needs at least ${LA_MIN_AVAILABLE_RAM_GIB} GiB of free RAM.
+
+This is a RUNTIME availability issue — the machine itself is big enough, but something is currently using too much RAM.
+
+Options:
+    (a) Inspect what's consuming RAM and close it:
+            ps -eo pid,rss,comm --sort=-rss | head
+        Then re-run.
+
+    (b) Edit MAX_JOBS in Dockerfile to a lower value (see options above)."
+fi
+log_ok "Host RAM: ${MEMTOTAL_GIB} GiB total, ${AVAILABLE_GIB} GiB available (passes ${LA_MIN_TOTAL_RAM_GIB}/${LA_MIN_AVAILABLE_RAM_GIB} thresholds for MAX_JOBS=8)"
+
 log_section "Docker build: ${LA_IMAGE_TAG}"
 
 # Use BuildKit for cache mounts in the Dockerfile.
