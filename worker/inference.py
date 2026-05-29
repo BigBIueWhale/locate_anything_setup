@@ -319,23 +319,27 @@ def _patch_sdpa_to_mem_efficient(model) -> None:
             )
 
     def _make_patched(orig_forward):
-        def patched(self, hidden_states, attention_mask=None,
-                    *args, **kwargs):
-            # `*args, **kwargs` forwards every other positional or keyword
-            # argument the caller passes (transformers may add new ones
-            # like `cache_position`, `position_embeddings`, etc. over
-            # minor versions). We only intercept attention_mask.
-            if attention_mask is not None:
+        def patched(self, *args, **kwargs):
+            # We accept ANY positional/keyword pattern the caller uses and
+            # only look up `attention_mask` by name. This is more robust
+            # than binding it ourselves: a caller that ever passes it
+            # positionally (i.e. as args[1]) would slot-mis-align if we
+            # tried to declare it as a named parameter here. The strict
+            # pre-check above already asserts the upstream forward's
+            # parameter NAMES are exactly what we expect, so `kwargs.get
+            # ("attention_mask")` finds the right tensor; if it was
+            # passed positionally we just leave it alone (not contiguous-
+            # ified), which falls through to the math backend in the
+            # safety-net branch of sdpa_kernel below — strictly never
+            # worse than the unpatched behaviour.
+            if "attention_mask" in kwargs and kwargs["attention_mask"] is not None:
                 # Force stride(-1)==1 so PyTorch's mem-eff dispatch
                 # accepts the mask. One-time bf16 copy of a (B,1,N,N)
                 # tensor — ~1.3 GiB at N=25,600 vs the 13.1 GiB math
                 # backend would otherwise allocate for probabilities.
-                attention_mask = attention_mask.contiguous()
+                kwargs["attention_mask"] = kwargs["attention_mask"].contiguous()
             with sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]):
-                return orig_forward(
-                    self, hidden_states,
-                    attention_mask, *args, **kwargs,
-                )
+                return orig_forward(self, *args, **kwargs)
         return patched
 
     for mod in candidates:
@@ -508,33 +512,24 @@ def _patch_vit_sdpa_to_mem_efficient() -> None:
     # re-wrapping on re-imports.
     patched_sdpa_attention._la_sdpa_patched = True
 
-    n_patched = 0
     for mod in candidates:
         if getattr(mod.sdpa_attention, "_la_sdpa_patched", False):
             continue
         mod.sdpa_attention = patched_sdpa_attention
-        # Update the dict that the encoder layer's __init__ may have
-        # already snapshotted at construction time. The encoder layer
-        # at modeling_vit.py:415 captures
-        # `VL_VISION_ATTENTION_FUNCTIONS[config._attn_implementation]`
-        # into `self.attn_fn` at init; that reference is now also
-        # repointed via the dict update IF a future re-init runs, but
-        # for the already-constructed model we ALSO have to swap the
-        # per-instance attribute (see verification below).
+        # The encoder layer at MoonVitEncoderLayer.attention_qkvpacked
+        # (modeling_vit.py:463) does a fresh
+        # `VL_VISION_ATTENTION_FUNCTIONS[self.attn_implementation]`
+        # lookup on EVERY forward call — it does not snapshot the
+        # function into a per-instance attribute at __init__. So
+        # updating this dict propagates to every live encoder layer
+        # automatically; no per-instance rebinding is required.
         if hasattr(mod, "VL_VISION_ATTENTION_FUNCTIONS"):
             mod.VL_VISION_ATTENTION_FUNCTIONS["sdpa"] = patched_sdpa_attention
-        n_patched += 1
 
-    if n_patched == 0:
-        # The function was already patched. That's idempotent and fine.
-        pass
-
-    # Defense in depth: confirm the live attention call path uses our
-    # function. Look up VL_VISION_ATTENTION_FUNCTIONS and confirm the
-    # registered "sdpa" entry has our marker; ALSO walk one live encoder
-    # layer to confirm its `attn_fn` attribute points at our patched
-    # function (it was snapshotted at model construction time and won't
-    # update from the dict on its own).
+    # Defense in depth: confirm `VL_VISION_ATTENTION_FUNCTIONS["sdpa"]`
+    # now points at the patched function with our marker attribute.
+    # Without this, a future upstream reshuffle of the dispatch dict
+    # could leave the patch functionally inert.
     for mod in candidates:
         if hasattr(mod, "VL_VISION_ATTENTION_FUNCTIONS"):
             dict_fn = mod.VL_VISION_ATTENTION_FUNCTIONS.get("sdpa")
