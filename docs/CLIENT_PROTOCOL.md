@@ -63,6 +63,7 @@ Model capability descriptor. Returned verbatim from the worker; fields:
 | `trained_generation_params` | obj    | Canonical sampling params, never changed by this server. |
 | `supported_generation_modes`| list   | `["fast", "hybrid", "slow"]`. |
 | `calibration`               | obj    | `{n_runs, median_latency_ms, p95_latency_ms, median_fps, ...}` measured at container boot. |
+| `prompt_templates_reference_url` | string | URL of the single source of truth for allowed prompt templates (currently [`worker/prompts.py`](../worker/prompts.py) on GitHub). Also embedded verbatim in every per-frame prompt-validation rejection diagnostic so the client always knows where to look. |
 | `preset_prompts`            | obj    | Useful starting prompts (drone, household, etc.). |
 
 Clients SHOULD pull this at startup and refuse to operate if a required
@@ -202,6 +203,24 @@ what NVIDIA does at training time).
   "total_ms":    821.0
 }
 ```
+
+`raw_text` carries the full decoded model output including structural
+tokens (`<box>`, `<ref>`, `<0>`..`<1000>`) and the trailing
+`<|im_end|>` end-of-turn marker. If `raw_text` does NOT end with
+`<|im_end|>`, the `max_new_tokens` budget was exhausted mid-emission
+and the response is truncated — `detections` / `points` will be
+missing any block whose closing `</box>` did not fit. The model's
+custom `.generate()` loop at
+`models/LocateAnything-3B/modeling_locateanything.py:464,500-501`
+terminates exclusively on `<|im_end|>` OR budget exhaustion, so the
+two cases are distinguishable from the trailing token alone. Partial
+blocks are silently dropped at the parser layer — this matches
+NVIDIA's own evaluation behaviour
+(`Embodied/evaluation/inference_grounding_ddp.py:282-300` requires
+the full 4-coord shape; partials never enter their metrics either).
+Truncation is empirically rare on the trained-budget
+`max_new_tokens=8192` (max observed output in the live drone domain:
+~50 tokens, 99.4 % headroom).
 
 ### Error (Text)
 

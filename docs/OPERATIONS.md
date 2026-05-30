@@ -42,7 +42,7 @@ For first-time setup, see [`../README.md`](../README.md).
 
 ---
 
-## Concurrency — supports **one** concurrent user
+## Concurrency
 
 This deployment is designed for **one concurrent user at a time**. The
 server accepts and time-shares any number of WebSocket connections
@@ -182,7 +182,7 @@ the workflow is:
 # On the box that has internet:
 ./setup.sh                              # build + download
 docker save -o /tmp/locate-anything.tar \
-    locate-anything:la3b-cu130-torch2.12-fa2.8.4 \
+    locate-anything:la3b-cu130-torch2.12-fa2.8.3 \
     nvidia/cuda:13.0.3-base-ubuntu24.04 \
     nvidia/cuda:13.0.3-cudnn-devel-ubuntu24.04 \
     rust:1.95-bookworm

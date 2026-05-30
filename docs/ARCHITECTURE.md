@@ -79,7 +79,7 @@ Multi-stage:
   --release --locked`. Produces `la_server` (~10 MiB stripped binary).
 * **Stage 2 (`runtime`)**: `nvidia/cuda:13.0.3-cudnn-devel-ubuntu24.04`.
   Installs Python 3.12, the model-mandated Python deps, builds
-  `flash-attn==2.8.4` from source with `FLASH_ATTN_CUDA_ARCHS=120`,
+  `flash-attn==2.8.3` from source with `FLASH_ATTN_CUDA_ARCHS=120`,
   copies in the Rust binary, copies the Python worker code.
 
 The image is **read-only at runtime** (`docker run --read-only`).

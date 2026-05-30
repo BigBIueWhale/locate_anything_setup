@@ -41,7 +41,9 @@ The actual inference surface is **WebSocket only**
 and [`docs/CLIENT_PROTOCOL.md`](./docs/CLIENT_PROTOCOL.md). The
 project-internal smoke test
 ([`scripts/04_smoke_test.sh`](./scripts/04_smoke_test.sh)) drives it
-via a minimal Python WS client in a one-off Docker container.
+via `docker exec` against the live container — the Python WS client
+script (`scripts/lib/smoke_ws_client.py`) runs in the container's
+own venv, so no helper container is spun up.
 
 To stop / restart:
 
@@ -77,9 +79,9 @@ support.
 |---|---|---|
 | 0 | [`scripts/00_validate_host.sh`](./scripts/00_validate_host.sh) | Verify OS = Ubuntu 24.04 LTS, driver ≥ 595.45.04, GPU is sm_120 (Blackwell), ≥ 24 GiB VRAM, Docker 29.x, the `nvidia` Docker runtime is registered and GPU passthrough works, free disk ≥ 30 GiB, host port 8765 is free, and that you are *not* running as root. |
 | 1 | [`scripts/01_download_weights.sh`](./scripts/01_download_weights.sh) | Pull the pinned HF revision of `nvidia/LocateAnything-3B` into `./models/LocateAnything-3B/` using `huggingface_hub` in a one-off `python:3.12-slim-bookworm` container (no host-side Python). Generates a synthetic calibration image used by the boot self-test. Regenerates `rust_server/Cargo.lock` if missing. |
-| 2 | [`scripts/02_build_image.sh`](./scripts/02_build_image.sh) | Builds the [Dockerfile](./Dockerfile). Multi-stage: Rust 1.95 builder → CUDA 13.0.3 runtime. Long step: ~20 min `flash-attn==2.8.4` source build with `FLASH_ATTN_CUDA_ARCHS=120`. Every package pin comes through as `--build-arg` from [`scripts/lib/versions.sh`](./scripts/lib/versions.sh). |
+| 2 | [`scripts/02_build_image.sh`](./scripts/02_build_image.sh) | Builds the [Dockerfile](./Dockerfile). Multi-stage: Rust 1.95 builder → CUDA 13.0.3 runtime. Long step: ~20 min `flash-attn==2.8.3` source build with `FLASH_ATTN_CUDA_ARCHS=120`. Every package pin comes through as `--build-arg` from [`scripts/lib/versions.sh`](./scripts/lib/versions.sh). |
 | 3 | [`scripts/03_start_service.sh`](./scripts/03_start_service.sh) | Starts the container with `--gpus all`, mounts the weights read-only, publishes to **`127.0.0.1:8765`** only, drops all Linux capabilities, runs read-only root with a 512 MiB tmpfs on `/tmp`, and waits up to 4 minutes for `/v1/health` to flip to `healthy`. |
-| 4 | [`scripts/04_smoke_test.sh`](./scripts/04_smoke_test.sh) | Hits `/v1/health`, `/v1/capabilities`, `/v1/info` with `curl`, then drives one round-trip through `WS /v1/stream` via a minimal Python WebSocket client in a one-off `python:3.12-slim` container. Asserts the model loaded, calibration ran, and a JPEG → JSON round-trip works. |
+| 4 | [`scripts/04_smoke_test.sh`](./scripts/04_smoke_test.sh) | Hits `/v1/health`, `/v1/capabilities`, `/v1/info` with `curl`, then drives one round-trip through `WS /v1/stream` by `docker exec`-ing `scripts/lib/smoke_ws_client.py` inside the live container. Asserts the model loaded, calibration ran, and a JPEG → JSON round-trip works. |
 
 The full pin table — every version of every package, every base image
 tag, every model commit SHA — lives in

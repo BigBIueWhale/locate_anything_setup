@@ -130,6 +130,25 @@ The server's `LA_GEN_MODE=hybrid` default reflects "what to use when
 you don't know" — but every Frame's `generation_mode` field is
 required per request, so clients should select based on the task.
 
+### A note on the attention backend
+
+The F1 numbers above were measured by NVIDIA on H100 with the trained
+`attn_implementation='magi'` path. This server runs `sdpa` + the
+PyTorch memory-efficient backend on sm_120 because MagiAttention's
+FA4-class cutlass kernels are not buildable on consumer Blackwell —
+see [`docs/PINNED_VERSIONS.md`](./PINNED_VERSIONS.md) §`flash-attn
+(source build, sm_120 only)` for the structural reason and
+[`worker/inference.py`](../worker/inference.py) lines 16-46 for the
+mask-equivalence argument. The two paths construct identical
+block-causal masks (verified by branch at `modeling_qwen2.py:1321-1335`
+on `_attn_implementation`) and apply them to the same
+`softmax(QK^T/√d + mask)V`; the per-call delta is bf16
+reduction-order ULP noise (verified in-container: ~1e-3 abs per
+attention call). The mathematical audit bound: < 1 % of generated
+coord tokens shift by ≤ 1 quantization step (≤ 2.24 px at the
+2240 px image cap). Treat the table as accurate to ≈ ±0.2 F1; do
+not treat it as attention-backend-identical to your measurements.
+
 ## Generation parameters (used by every benchmark in the paper)
 
 From `/tmp/nvlabs_eagle/Embodied/evaluation/inference_compat.py:42-68`:
