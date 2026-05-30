@@ -74,8 +74,8 @@ single-stream live-detection use case this server is built for.
 
 | Situation | What to do |
 |---|---|
-| One human / one camera feed | Works as designed. Steady ~3 FPS, ~250-1100 ms per-frame latency depending on input resolution. |
-| Two users sharing the GPU briefly | Fine; each sees ~½ FPS, all responses correct, no errors. |
+| One human / one camera feed | Works as designed. Per-frame latency depends on input resolution and `generation_mode`; see [`docs/DRONE_DETECTION.md`](./DRONE_DETECTION.md) §Throughput on RTX 5090 for measured per-mode numbers (~785 ms `hybrid` / ~937 ms `slow` on 1080p drone content; ~250-300 ms on the smaller synthetic smoke-test image). |
+| Two users sharing the GPU briefly | Fine; each sees roughly half the single-user throughput, all responses correct, no errors. |
 | More than 2-3 sustained concurrent users | Deploy more GPUs (one container per GPU, each fronted by its own port; load-balance externally), or invest in the vLLM/SGLang port. |
 
 The `--restart unless-stopped` and healthcheck behaviour described

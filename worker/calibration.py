@@ -84,9 +84,11 @@ def calibrate(
     # Warm-up: first inference triggers extra JIT / cuDNN autotune overhead.
     print(f"[calibrate] warmup run on {p}", flush=True)
     warm = engine.run(jpeg, test_prompt, generation_mode="hybrid")
-    # The synthetic calibration image is four polygons drawn with PIL;
-    # the model probably won't recognize them as the prompted categories.
-    # That is fine — what we DO require is evidence that the model emitted
+    # The default calibration target is a real drone JPEG + `point_to`
+    # drone prompt (see `worker/la_worker.py` argparse defaults) so the
+    # published `median_fps` is workload-representative. Whether the
+    # model actually detects the drone in the warm-up frame is
+    # incidental — what we DO require is evidence that the model emitted
     # SOME structured output that the parser was able to consume. One of:
     # (a) at least one parsed box, (b) at least one parsed point,
     # (c) the trained explicit abstention literal `<box>None</box>`

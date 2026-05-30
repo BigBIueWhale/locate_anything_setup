@@ -103,13 +103,19 @@ blockers (3D q/k/v, 3D bool mask, bool dtype).
 `sdpa_attention` with a 4D-mask, 4D-tensor, additive-mask rewrite. Both
 patches refuse to install themselves if the upstream function
 signatures or dispatch-dict shape have drifted from what they were
-developed against. Empirical effect: calibration FPS ~1.83 → ~3.35
-(~2× speedup), single-frame latency 467 → 257 ms, post-calibration
-VRAM 24.3 → 9.2 GiB, full-resolution images (up to LA_MAX_IMAGE_DIM)
-stop OOMing. Detection box coordinates differ by < 1 unit in
-normalised [0,1000] space vs the math-backend baseline on the same
-input (within the bf16 reduction-order ULP noise floor that already
-exists between any two attention implementations).
+developed against. Empirical effect (measured on the historical
+synthetic 1024×768 calibration target before the calibration
+default was re-pointed to drone_sirius.jpg; the proportional
+speedup is the load-bearing fact and reproduces on any input):
+calibration FPS ~2× speedup, single-frame latency roughly halved,
+post-calibration VRAM 24.3 → 9.2 GiB, full-resolution images
+(up to LA_MAX_IMAGE_DIM) stop OOMing. Detection box coordinates
+differ by < 1 unit in normalised [0,1000] space vs the math-
+backend baseline on the same input (within the bf16 reduction-
+order ULP noise floor that already exists between any two
+attention implementations). For current workload-representative
+absolute numbers see `docs/DRONE_DETECTION.md` §Throughput on
+RTX 5090.
 
 ## Model-mandated Python deps (pinned EXACTLY)
 

@@ -126,15 +126,19 @@ print(\"snapshot at\", path)
     log_ok "Snapshot complete: ${final_bytes} bytes of safetensors."
 fi
 
-# --- Calibration test image (required for boot self-test) ---
+# --- Synthetic smoke-test image (required by scripts/04_smoke_test.sh
+#     and scripts/05_concurrency_smoke.sh; the worker's boot calibration
+#     uses test_data/drone_sirius.jpg by default, which is committed to
+#     the repo rather than synthesized) ---
 CAL_IMG="${TEST_DATA_DIR}/calibration.jpg"
 if [[ -f "${CAL_IMG}" && -s "${CAL_IMG}" ]]; then
-    log_ok "Calibration image already present: ${CAL_IMG}"
+    log_ok "Smoke-test image already present: ${CAL_IMG}"
 else
-    log_info "Generating synthetic calibration image"
-    # Synthesize a 1024x768 RGB image with three simple objects so the model
-    # can produce a parseable output during boot calibration. This avoids
-    # fetching a third-party image and keeps the build hermetic.
+    log_info "Generating synthetic smoke-test image"
+    # Synthesize a 1024x768 RGB image with three simple objects so the
+    # smoke test ("we know what categories to expect") has a predictable
+    # target. This avoids fetching a third-party image and keeps the
+    # build hermetic.
     # Same main-image-as-helper pattern as the snapshot block above —
     # Pillow is already installed there.
     if ! docker image inspect "${LA_IMAGE_TAG}" >/dev/null 2>&1; then

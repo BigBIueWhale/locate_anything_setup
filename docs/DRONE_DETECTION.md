@@ -164,9 +164,19 @@ The worker serializes tile inference (single-concurrent-user design
 — see [`docs/OPERATIONS.md`](./OPERATIONS.md#concurrency)).
 
 The `calibration` block returned by `GET /v1/capabilities` reports a
-single boot-time inference cycle on the synthetic calibration JPEG;
-that is a per-boot health signal, not a workload-representative
-throughput number.
+6-run inference cycle on `test_data/drone_sirius.jpg` with
+`prompts.point_to("drone in the sky")`. That specific prompt is the
+structurally cleanest of the seven canonical drone prompts (mean
+`switch_to_ar=0.07`, ~10 output tokens), so the per-boot
+`median_fps` (~4.8 FPS, ~210 ms on this hardware) characterises the
+**best-case** drone workload — not the aggregate. Expect proportionally
+lower throughput for prompts that emit more output tokens (the
+throughput table above shows `hybrid: 785 ms` averaged across all 7
+canonical drone prompts and 3 drone JPEGs, including multi-category
+detection which is ~3-4× slower than `point_to`). The default
+calibration target is overridable via `LA_CALIBRATION_IMAGE` /
+`--calibration-image` (and `--calibration-prompt`) if you want a
+different boot-time characterisation.
 
 ## Recommendation
 
