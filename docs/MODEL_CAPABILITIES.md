@@ -43,38 +43,24 @@ Verified in
 
 ## What it does well (in order)
 
-These are the **seven canonical trained prompt templates** verbatim
-from Table 9 of the paper (Table 9 splits GUI-grounding into a
-box-output form and a point-output form; we expose both via the
-`ground_gui` and `point_to` helpers). Use them exactly as written; per-word
-deviations (e.g., "match" → "matches") move you off the training
-distribution. The asymmetry between *matches* (templates 1, 2, 6, 7)
-and *match* (template 3) is intentional and trained.
+The model supports seven canonical task templates (detection, single /
+multi phrase grounding, text grounding, scene-text detection, GUI box,
+GUI point / pointing). **The single source of truth for those templates
+is [`worker/prompts.py`](../worker/prompts.py)** — verbatim NVIDIA forms
+with the trained `matches` / `match` asymmetry and the `</c>` category
+separator. The Rust validator at
+[`rust_server/src/prompt_validator.rs`](../rust_server/src/prompt_validator.rs)
+mirrors those constants byte-for-byte and enforces them at the WebSocket
+edge; a boot-time check fails the container if the two ever drift.
 
-| # | Task                          | Prompt (verbatim, fill in the bracketed slot) | Output |
-|---|-------------------------------|-----------------------------------------------|--------|
-| 1 | **Closed-class detection**    | `Locate all the instances that matches the following description: [CATS].` (join with `</c>`) | `<ref>cat</ref><box>...</box>` × N |
-| 2 | **Phrase grounding — single** | `Locate a single instance that matches the following description: [PHRASE].` | One `<box>...</box>` |
-| 3 | **Phrase grounding — multi**  | `Locate all the instances that match the following description: [PHRASE].` | `<box>...</box>` × N |
-| 4 | **Text grounding**            | `Please locate the text referred as [PHRASE].` | One `<box>...</box>` |
-| 5 | **Scene-text detection (OCR)**| `Detect all the text in box format.` | `<ref>text</ref><box>...</box>` × N |
-| 6 | **GUI grounding (box)**       | `Locate the region that matches the following description: [PHRASE].` | One `<box>...</box>` |
-| 7 | **GUI grounding (point)** / **Pointing**     | `Point to: [PHRASE].` | One `<box><x><y></box>` (2-coord point) |
-
-These are exposed in [`worker/prompts.py`](../worker/prompts.py) as
-`detect_categories`, `ground_single`, `ground_multi`, `ground_text`,
-`detect_text`, `ground_gui`, and `point_to` respectively. Available to
-clients as `preset_prompts.*` via `/v1/capabilities`.
-
-### Multi-category pointing — call N×1, not 1×N
-
-NVIDIA's evaluation code for COCO/LVIS/VisDrone pointing
-(`Embodied/evaluation/inference_grounding_ddp.py:765-789`) makes **one
-separate `Point to: <single_category>.` call per category** and
-merges the points client-side. The single-prompt comma/`,`-joined
-form is off-distribution for pointing — performance drops. A client
-that wants to point at multiple categories must loop. The server's
-`Point to:` helper takes a single phrase by design.
+Clients should either call the `detect_categories`, `ground_single`,
+`ground_multi`, `ground_text`, `detect_text`, `ground_gui`, or `point_to`
+helpers from `worker/prompts.py`, or pull pre-built well-formed prompts
+from `/v1/capabilities.preset_prompts`. The same `/v1/capabilities`
+response also carries `prompt_templates_reference_url` pointing at
+`worker/prompts.py`, and every per-frame rejection diagnostic includes
+that URL so the client always knows where to look. **Do not paraphrase**
+— per-word deviations move you off the training distribution.
 
 ## What it does NOT do well
 

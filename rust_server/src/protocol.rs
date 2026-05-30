@@ -38,9 +38,10 @@ pub struct InferHeader {
     /// 1..=256 chars.
     pub frame_id: String,
 
-    /// One of the LocateAnything prompts (e.g. `Locate all the instances
-    /// that matches the following description: drone.`). 1..=MAX_PROMPT_CHARS
-    /// chars; the actual tokenizer cap is enforced inside the worker.
+    /// One of the seven canonical LocateAnything-3B prompts. The
+    /// single-source-of-truth catalog of allowed templates lives in
+    /// `worker/prompts.py`; this Rust crate enforces them at the WS edge
+    /// via `prompt_validator::validate`. 1..=MAX_PROMPT_CHARS chars.
     pub prompt: String,
 
     /// Exactly one of "fast", "hybrid", "slow". No server default — every

@@ -126,10 +126,22 @@ Field rules:
 
 * `frame_id` — non-empty string, length 1..=256. The sole correlation
   primitive between this Frame and its Result/Error.
-* `prompt` — non-empty string, length 1..=16384 characters. Should be
-  one of the canonical forms in
-  [`docs/MODEL_CAPABILITIES.md`](./MODEL_CAPABILITIES.md) or
-  `/v1/capabilities.preset_prompts`.
+* `prompt` — non-empty string, length 1..=16384 characters. **MUST**
+  exactly conform to one of the seven canonical LocateAnything-3B
+  prompt templates. The single source of truth for those templates is
+  [`worker/prompts.py`](../worker/prompts.py); the same URL is carried
+  in `/v1/capabilities.prompt_templates_reference_url` and is echoed in
+  every rejection diagnostic. Strict enforcement happens at the
+  WebSocket edge by the Rust validator
+  [`rust_server/src/prompt_validator.rs`](../rust_server/src/prompt_validator.rs)
+  — no regex, byte-exact, per-word strict (including the `matches` /
+  `match` asymmetry, the literal `</c>` category separator, and the
+  trailing `.`). Anything that does not exactly match a canonical
+  template is rejected with a per-frame `type:"error"` describing
+  what failed, the closest canonical template, optional English-language
+  heuristic hints (e.g. `Point at:` → suggest `Point to:`), and the
+  reference URL. The connection stays open after a rejection; the
+  client can correct and send the next Frame normally.
 * `generation_mode` — exactly one of `"fast"`, `"hybrid"`, `"slow"`.
 * `jpeg_len` — equal to the number of payload bytes after the header.
 

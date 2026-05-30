@@ -10,12 +10,6 @@ use serde_json::json;
 /// shape directly).
 #[derive(thiserror::Error, Debug)]
 pub enum ServerError {
-    #[error("invalid request: {0}")]
-    InvalidRequest(String),
-
-    #[error("invalid image: {0}")]
-    InvalidImage(String),
-
     #[error("worker unavailable: {0}")]
     WorkerUnavailable(String),
 
@@ -29,8 +23,6 @@ pub enum ServerError {
 impl ServerError {
     pub fn status(&self) -> StatusCode {
         match self {
-            ServerError::InvalidRequest(_)    => StatusCode::BAD_REQUEST,
-            ServerError::InvalidImage(_)      => StatusCode::BAD_REQUEST,
             ServerError::WorkerUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             ServerError::WorkerProtocol(_)    => StatusCode::BAD_GATEWAY,
             ServerError::Internal(_)          => StatusCode::INTERNAL_SERVER_ERROR,
@@ -39,8 +31,6 @@ impl ServerError {
 
     pub fn error_type(&self) -> &'static str {
         match self {
-            ServerError::InvalidRequest(_)    => "invalid_request",
-            ServerError::InvalidImage(_)      => "invalid_image",
             ServerError::WorkerUnavailable(_) => "worker_unavailable",
             ServerError::WorkerProtocol(_)    => "worker_protocol",
             ServerError::Internal(_)          => "internal_error",

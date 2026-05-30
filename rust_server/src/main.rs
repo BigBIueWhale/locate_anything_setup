@@ -13,7 +13,8 @@
 mod config;
 mod error;
 mod ipc;
-mod jpeg;        // header validator, used by ws::process_binary
+mod jpeg;              // header validator, used by ws::process_binary
+mod prompt_validator;  // strict trained-correct prompt-template validator
 mod protocol;
 mod state;
 mod ws;
@@ -37,6 +38,18 @@ use crate::state::AppState;
 /// concurrent connection.
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> anyhow::Result<()> {
+    // Special-purpose CLI mode: print the validator's embedded prompt
+    // template constants as JSON, then exit. Used by
+    // worker/validate_startup.py::validate_prompt_template_drift to verify
+    // the Rust binary's constants match worker/prompts.py. We handle this
+    // BEFORE clap because clap requires the runtime env vars (LA_BIND,
+    // LA_IPC_SOCKET, etc.) which are not needed for this mode.
+    if std::env::args().any(|a| a == "--print-canonical-templates") {
+        let json = prompt_validator::canonical_templates_json();
+        println!("{}", serde_json::to_string_pretty(&json)?);
+        return Ok(());
+    }
+
     let args = Args::parse();
     init_tracing(&args.log_format);
     install_panic_hook();

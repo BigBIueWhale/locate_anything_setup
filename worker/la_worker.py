@@ -132,6 +132,15 @@ class WorkerApp:
             },
             "supported_generation_modes": ["fast", "hybrid", "slow"],
             "calibration": self.calibration.to_json(),
+            # The single-source-of-truth file for the seven canonical
+            # LocateAnything-3B prompt templates. Every prompt the server
+            # accepts MUST conform to one of those templates — strictly
+            # enforced at the WebSocket edge by the Rust validator
+            # (rust_server/src/prompt_validator.rs), with the same URL
+            # included in every rejection diagnostic so the client knows
+            # where to look. Per the project policy "only use the model
+            # how it was trained".
+            "prompt_templates_reference_url": prompts.CANONICAL_REFERENCE_URL,
             "preset_prompts": {
                 "drone_ranked": prompts.DRONE_PROMPTS_RANKED,
                 "household":    prompts.HOUSEHOLD_PROMPTS,
@@ -267,7 +276,8 @@ class WorkerApp:
         if not isinstance(prompt, str) or not prompt:
             raise ValueError(
                 "header.prompt must be a non-empty string (see "
-                "docs/MODEL_CAPABILITIES.md for the canonical prompt forms)"
+                "worker/prompts.py for the seven canonical prompt forms — "
+                "that file is the single source of truth)"
             )
         if len(prompt) > 16384:
             raise ValueError(

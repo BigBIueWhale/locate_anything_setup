@@ -334,9 +334,114 @@ def validate_preprocessor_config(model_dir: str) -> None:
        "merge_kernel_size=[2,2] image_mean=image_std=[0.5,0.5,0.5]")
 
 
+def validate_prompt_template_drift() -> None:
+    """Hard-fail on any drift between the Rust binary's embedded prompt
+    template constants and worker/prompts.py.
+
+    worker/prompts.py is THE single source of truth for the seven canonical
+    LocateAnything-3B templates (file-level banner declares this; the Rust
+    validator at rust_server/src/prompt_validator.rs mirrors those constants
+    byte-for-byte for fast per-frame WebSocket-edge validation). If the two
+    sides ever drift, the WS frontend would accept or reject prompts
+    inconsistently with what the Python worker considers canonical —
+    silently changing the contract the client must satisfy.
+
+    This check runs `la_server --print-canonical-templates`, parses the
+    JSON output, and dict-equals it against prompts.CANONICAL_TEMPLATES.
+    Any difference is a hard boot failure naming the drifted key(s)."""
+    import json as _json
+    import subprocess
+    from . import prompts
+
+    binary = os.environ.get("LA_SERVER_BIN", "/usr/local/bin/la_server")
+    if not Path(binary).is_file():
+        fail(
+            f"la_server binary not found at {binary}; set LA_SERVER_BIN to "
+            "the correct path or rebuild the container. The Rust↔Python "
+            "prompt-template drift check cannot run without it."
+        )
+    try:
+        result = subprocess.run(
+            [binary, "--print-canonical-templates"],
+            capture_output=True, timeout=5, check=False,
+        )
+    except (subprocess.TimeoutExpired, OSError) as e:
+        fail(
+            f"failed to run `{binary} --print-canonical-templates`: "
+            f"{type(e).__name__}: {e}"
+        )
+    if result.returncode != 0:
+        fail(
+            f"`{binary} --print-canonical-templates` exited "
+            f"{result.returncode}; stderr first 1000 chars: "
+            + result.stderr.decode("utf-8", errors="replace")[:1000]
+        )
+    try:
+        rust_constants = _json.loads(result.stdout.decode("utf-8"))
+    except (UnicodeDecodeError, _json.JSONDecodeError) as e:
+        fail(
+            f"could not parse `{binary} --print-canonical-templates` "
+            f"output as JSON: {type(e).__name__}: {e}. Output first "
+            "1000 chars: "
+            + result.stdout[:1000].decode("utf-8", errors="replace")
+        )
+    if not isinstance(rust_constants, dict):
+        fail(
+            f"Rust drift-check output is not a JSON object; got "
+            f"{type(rust_constants).__name__}"
+        )
+
+    py_constants = prompts.CANONICAL_TEMPLATES
+    py_keys, rust_keys = set(py_constants.keys()), set(rust_constants.keys())
+    if py_keys != rust_keys:
+        missing_in_rust = sorted(py_keys - rust_keys)
+        extra_in_rust   = sorted(rust_keys - py_keys)
+        parts = ["prompt template constant key DRIFT between Rust and Python:"]
+        if missing_in_rust:
+            parts.append(
+                f"  Keys in worker/prompts.py.CANONICAL_TEMPLATES "
+                f"but missing in Rust output: {missing_in_rust}"
+            )
+        if extra_in_rust:
+            parts.append(
+                f"  Keys in Rust output but missing in "
+                f"worker/prompts.py.CANONICAL_TEMPLATES: {extra_in_rust}"
+            )
+        parts.append(
+            "Reconcile both sides. worker/prompts.py is the single source "
+            "of truth per its file-level banner; update "
+            "rust_server/src/prompt_validator.rs to match and rebuild."
+        )
+        fail("\n".join(parts))
+
+    drift = []
+    for key in sorted(py_keys):
+        py_val   = py_constants[key]
+        rust_val = rust_constants[key]
+        if py_val != rust_val:
+            drift.append(f"  {key}: Python={py_val!r}, Rust={rust_val!r}")
+    if drift:
+        fail(
+            "prompt template constant DRIFT between Rust binary at "
+            + binary
+            + " and worker/prompts.py — the values disagree:\n"
+            + "\n".join(drift)
+            + "\nUpdate rust_server/src/prompt_validator.rs to match "
+              "worker/prompts.py byte-for-byte and rebuild the container. "
+              "NVIDIA's training code uses these exact strings; any drift "
+              "moves inference off-distribution."
+        )
+    ok(
+        f"prompt template constants verified in lockstep between Rust "
+        f"binary ({binary}) and worker/prompts.py "
+        f"({len(py_constants)} entries)"
+    )
+
+
 def run_all(model_dir: str) -> None:
     validate_env()
     validate_gpu()
     validate_model_dir(model_dir)
     validate_preprocessor_config(model_dir)
+    validate_prompt_template_drift()
     ok("all preflight checks passed")

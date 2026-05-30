@@ -50,14 +50,13 @@ version follows.
 * **Detecting a drone that subtends ≥ 60 px in the source image,
   against a clean sky, in good light, with no motion blur.**
   E.g., a quadcopter at 10–30 m through a 50 mm lens on a 1080p
-  camera in daylight. Use `Point to: drone in the sky.` in `slow`
-  mode.
+  camera in daylight. Use `prompts.point_to("drone in the sky")`
+  (see [`worker/prompts.py`](../worker/prompts.py)) in `slow` mode.
 
 * **Verifying / classifying ROIs already cropped by another
   detector.** When the drone occupies a significant fraction of
   the crop, LocateAnything's open-vocab strength kicks in.
-  Prompt: `Locate a single instance that matches the following
-  description: a quadcopter drone.` on the ROI.
+  Use `prompts.ground_single("a quadcopter drone")` on the ROI.
 
 * **Demonstrating the model on household / consumer objects.**
   The HF Space's default prompts (`book`, `sweet`, `person`,
@@ -84,8 +83,8 @@ Recommended client-side approach for a 4K camera:
 * Chop the source frame into a **4 × 3** grid of ~1,300×850 tiles with
   **15 %** overlap.
 * Per tile, JPEG-encode, send a Frame with `generation_mode = "slow"`
-  and prompt `Locate all the instances that match the following
-  description: a small drone in the sky.`
+  and prompt built via `prompts.ground_multi("a small drone in the sky")`
+  (see [`worker/prompts.py`](../worker/prompts.py)).
 * Parse each Result's `detections[].bbox_px` and translate back into
   source-image coords using the tile's offset.
 * Apply NMS across all tiles to merge duplicates from the overlap

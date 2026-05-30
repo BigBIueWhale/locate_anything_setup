@@ -10,6 +10,18 @@
 //!   4. Repeat from step 2 until the client closes (or the server
 //!      shuts down, in which case we send a clean Close 1001).
 //!
+//! Error surfaces — exactly two, per docs/CLIENT_PROTOCOL.md:
+//!   * **Framing-fatal → Close(1008)**: the binary framing is unparseable
+//!     so the next Frame cannot be located in the bytestream. Header
+//!     length-prefix wrong, header JSON unparseable, frame_id missing —
+//!     all collapse the connection because there is no way to send a
+//!     correlated error.
+//!   * **Per-frame → Text(`{type:"error", frame_id, code, message}`)**:
+//!     framing is intact but the content of THIS Frame is rejected
+//!     (bad prompt template, generation_mode invalid, JPEG malformed,
+//!     image dims off, etc.). The WebSocket stays open and the next
+//!     Frame proceeds normally — the client can correct and retry.
+//!
 //! The model is stateless across calls; many WebSockets handle many
 //! clients concurrently via asyncio inside the worker, but each individual
 //! WS is strictly sequential — one Frame in, one Result out, repeat.
@@ -24,9 +36,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, instrument, warn};
 
-use crate::error::ServerError;
 use crate::ipc::{self, InferOutcome};
 use crate::jpeg;
+use crate::prompt_validator;
 use crate::protocol::{InferHeader, MAX_PROMPT_CHARS, MIN_IMAGE_DIM};
 use crate::state::AppState;
 
@@ -127,15 +139,27 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
             }
         };
 
-        // Parse + validate the Frame header and JPEG. On any structural
-        // failure we close the WS — there is no per-frame error path for
-        // framing-level errors because once framing is wrong, this WS's
-        // bytestream is no longer meaningfully a Frame stream.
+        // Parse + validate the Frame. Three outcomes:
+        //   Pending → forward to worker
+        //   FatalFraming → Close(1008), connection cannot continue
+        //   PerFrame    → emit `type:"error"` Text, keep WS open
         let pending = match process_binary(bytes, max_jpeg_bytes, max_image_dim).await {
-            Ok(p) => p,
-            Err(err) => {
-                send_close(&mut ws_tx, CLOSE_POLICY_VIOLATION, &err.to_string()).await;
+            BinaryOutcome::Pending(p) => p,
+            BinaryOutcome::FatalFraming(reason) => {
+                send_close(&mut ws_tx, CLOSE_POLICY_VIOLATION, &reason).await;
                 return;
+            }
+            BinaryOutcome::PerFrame { frame_id, code, message } => {
+                let payload = serde_json::json!({
+                    "type":     "error",
+                    "frame_id": frame_id,
+                    "code":     code,
+                    "message":  message,
+                }).to_string();
+                if ws_tx.send(Message::Text(payload.into())).await.is_err() {
+                    return;
+                }
+                continue;
             }
         };
 
@@ -167,117 +191,175 @@ struct PendingFrame {
     jpeg: Bytes,
 }
 
-/// Validate a single WebSocket binary message and produce a PendingFrame
-/// ready for the worker. Returns the failing ServerError on any rejection
-/// — these are all WS-closing conditions because the binary framing was
-/// wrong (we can't tell where the next frame would start).
+/// The three possible outcomes of binary-frame parsing/validation.
+enum BinaryOutcome {
+    /// Ready to forward to the worker.
+    Pending(PendingFrame),
+    /// Framing is unparseable — close the WebSocket with reason text.
+    /// Used when there is no recoverable frame_id to correlate against
+    /// (length prefix bad, header JSON unparseable, frame_id missing).
+    FatalFraming(String),
+    /// Framing is intact but the content of this Frame is rejected.
+    /// The Frame is dropped; the WS stays open for the next Frame.
+    PerFrame { frame_id: String, code: u16, message: String },
+}
+
+/// Validate a single WebSocket binary message and produce a BinaryOutcome.
+///
+/// Failures BEFORE we successfully parse a usable `frame_id` are
+/// `FatalFraming` (we have no correlation key for a per-frame error).
+/// Failures AFTER `frame_id` is in hand are `PerFrame` — the client gets
+/// a typed error message and the next Frame proceeds normally.
 async fn process_binary(
     bytes: Bytes,
     max_jpeg_bytes: usize,
     max_image_dim: u16,
-) -> Result<PendingFrame, ServerError> {
-    // ---- 1. Length-prefix sanity --------------------------------------
+) -> BinaryOutcome {
+    // ---- 1. Length-prefix sanity (fatal — can't locate next frame) ----
     if bytes.len() < 4 {
-        return Err(ServerError::InvalidRequest(format!(
+        return BinaryOutcome::FatalFraming(format!(
             "WS binary frame is {} bytes but a 4-byte BE u32 length-prefix \
              header is required (see docs/CLIENT_PROTOCOL.md)",
             bytes.len()
-        )));
+        ));
     }
     let header_len = u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize;
     if header_len == 0 {
-        return Err(ServerError::InvalidRequest(
+        return BinaryOutcome::FatalFraming(
             "header_len prefix is 0; the JSON header is mandatory".into(),
-        ));
+        );
     }
     if 4 + header_len > bytes.len() {
-        return Err(ServerError::InvalidRequest(format!(
+        return BinaryOutcome::FatalFraming(format!(
             "declared header_len={} extends past total binary frame size {} \
              (header_len must fit AND leave room for the JPEG payload)",
             header_len, bytes.len()
-        )));
+        ));
     }
     let header_slice = &bytes[4..4 + header_len];
 
-    // ---- 2. JSON header parse (deny_unknown_fields enforced by serde) -
-    let header: InferHeader = serde_json::from_slice(header_slice).map_err(|e| {
-        ServerError::InvalidRequest(format!(
-            "header JSON parse failed: {e}. Required keys: frame_id, prompt, \
-             generation_mode, jpeg_len. Extra keys rejected. See \
-             docs/CLIENT_PROTOCOL.md.",
-        ))
-    })?;
+    // ---- 2. JSON header parse (fatal — no frame_id yet) ---------------
+    let header: InferHeader = match serde_json::from_slice(header_slice) {
+        Ok(h) => h,
+        Err(e) => {
+            return BinaryOutcome::FatalFraming(format!(
+                "header JSON parse failed: {e}. Required keys: frame_id, prompt, \
+                 generation_mode, jpeg_len. Extra keys rejected. See \
+                 docs/CLIENT_PROTOCOL.md.",
+            ));
+        }
+    };
 
-    // ---- 3. Field-by-field validation ----------------------------------
+    // ---- 3. frame_id (fatal — we need it to correlate per-frame errors) -
     if header.frame_id.is_empty() {
-        return Err(ServerError::InvalidRequest(
+        return BinaryOutcome::FatalFraming(
             "header.frame_id is empty; frame_id is required as the response \
-             correlation primitive".into(),
-        ));
+             correlation primitive — without it we cannot send a per-frame \
+             error".into(),
+        );
     }
     if header.frame_id.len() > 256 {
-        return Err(ServerError::InvalidRequest(format!(
+        return BinaryOutcome::FatalFraming(format!(
             "header.frame_id length {} > 256 chars (bounded to keep log \
              lines manageable)",
             header.frame_id.len()
-        )));
-    }
-    if header.prompt.is_empty() {
-        return Err(ServerError::InvalidRequest(
-            "header.prompt is empty; the model requires a non-empty prompt. \
-             See /v1/capabilities.preset_prompts for valid prompt forms.".into(),
         ));
     }
-    if header.prompt.chars().count() > MAX_PROMPT_CHARS {
-        return Err(ServerError::InvalidRequest(format!(
-            "header.prompt length {} chars > MAX_PROMPT_CHARS={} (the model's \
-             tokenizer.model_max_length is 16384 tokens — even on ASCII this \
-             cap is generous). See docs/MODEL_CAPABILITIES.md.",
-            header.prompt.chars().count(),
-            MAX_PROMPT_CHARS,
-        )));
+    let frame_id = header.frame_id.clone();
+
+    // From here on we have a usable frame_id — every error becomes a
+    // per-frame `type:"error"` message and the WS stays open.
+
+    // ---- 4. Strict trained-correct prompt-template validation. The
+    //         validator itself handles empty / length / template / slot
+    //         checks and produces an English diagnostic that points the
+    //         client at the canonical-reference URL. -------------------
+    if let Err(e) = prompt_validator::validate(&header.prompt) {
+        return BinaryOutcome::PerFrame {
+            frame_id,
+            code: 400,
+            message: format!("header.prompt rejected: {}", e.message()),
+        };
     }
-    if !matches!(header.generation_mode.as_str(), "fast" | "hybrid" | "slow") {
-        return Err(ServerError::InvalidRequest(format!(
-            "header.generation_mode={:?} is not one of \"fast\" | \"hybrid\" \
-             | \"slow\". No default — every Frame must commit to a mode. \
-             See docs/MODEL_CAPABILITIES.md#generation-modes.",
-            header.generation_mode
-        )));
+    // Defense-in-depth: even though prompt_validator already enforces a
+    // character cap matching MAX_PROMPT_CHARS, keep the explicit check
+    // here in case the validator's cap ever loosens — these are two
+    // independent gates on the same invariant.
+    if header.prompt.chars().count() > MAX_PROMPT_CHARS {
+        return BinaryOutcome::PerFrame {
+            frame_id,
+            code: 400,
+            message: format!(
+                "header.prompt length {} chars > MAX_PROMPT_CHARS={} (the model's \
+                 tokenizer.model_max_length is 16384 tokens — even on ASCII this \
+                 cap is generous). See docs/MODEL_CAPABILITIES.md.",
+                header.prompt.chars().count(),
+                MAX_PROMPT_CHARS,
+            ),
+        };
     }
 
-    // ---- 4. Payload size + JPEG header validation ---------------------
+    // ---- 5. generation_mode --------------------------------------------
+    if !matches!(header.generation_mode.as_str(), "fast" | "hybrid" | "slow") {
+        return BinaryOutcome::PerFrame {
+            frame_id,
+            code: 400,
+            message: format!(
+                "header.generation_mode={:?} is not one of \"fast\" | \"hybrid\" \
+                 | \"slow\". No default — every Frame must commit to a mode. \
+                 See docs/MODEL_CAPABILITIES.md#generation-modes.",
+                header.generation_mode
+            ),
+        };
+    }
+
+    // ---- 6. JPEG payload size + signature ------------------------------
     let jpeg = bytes.slice(4 + header_len..);
     if jpeg.len() != header.jpeg_len {
-        return Err(ServerError::InvalidImage(format!(
-            "header.jpeg_len={} != actual payload length {} (these must \
-             match exactly — mismatch indicates a framing bug)",
-            header.jpeg_len, jpeg.len()
-        )));
+        return BinaryOutcome::PerFrame {
+            frame_id,
+            code: 400,
+            message: format!(
+                "header.jpeg_len={} != actual payload length {} (these must \
+                 match exactly — mismatch indicates a framing bug)",
+                header.jpeg_len, jpeg.len()
+            ),
+        };
     }
     if jpeg.is_empty() {
-        return Err(ServerError::InvalidImage(
-            "JPEG payload is zero bytes (a Frame must carry a JPEG image)".into(),
-        ));
+        return BinaryOutcome::PerFrame {
+            frame_id,
+            code: 400,
+            message: "JPEG payload is zero bytes (a Frame must carry a JPEG image)".into(),
+        };
     }
     if jpeg.len() > max_jpeg_bytes {
-        return Err(ServerError::InvalidImage(format!(
-            "JPEG payload {} bytes exceeds server cap LA_MAX_JPEG_BYTES={} \
-             (configurable in scripts/lib/versions.sh)",
-            jpeg.len(), max_jpeg_bytes
-        )));
+        return BinaryOutcome::PerFrame {
+            frame_id,
+            code: 400,
+            message: format!(
+                "JPEG payload {} bytes exceeds server cap LA_MAX_JPEG_BYTES={} \
+                 (configurable in scripts/lib/versions.sh)",
+                jpeg.len(), max_jpeg_bytes
+            ),
+        };
     }
     if !jpeg::is_jpeg(&jpeg) {
-        return Err(ServerError::InvalidImage(format!(
-            "payload first bytes [{:02X}, {:02X}, {:02X}] are not the JPEG \
-             SOI marker FF D8 FF; we accept only baseline JPEG with the \
-             standard signature",
-            jpeg.first().copied().unwrap_or(0),
-            jpeg.get(1).copied().unwrap_or(0),
-            jpeg.get(2).copied().unwrap_or(0),
-        )));
+        return BinaryOutcome::PerFrame {
+            frame_id,
+            code: 400,
+            message: format!(
+                "payload first bytes [{:02X}, {:02X}, {:02X}] are not the JPEG \
+                 SOI marker FF D8 FF; we accept only baseline JPEG with the \
+                 standard signature",
+                jpeg.first().copied().unwrap_or(0),
+                jpeg.get(1).copied().unwrap_or(0),
+                jpeg.get(2).copied().unwrap_or(0),
+            ),
+        };
     }
 
+    // ---- 7. JPEG dimensions (off-thread; jpeg_decoder is sync) ---------
     let jpeg_for_check = jpeg.clone();
     let dims = tokio::task::spawn_blocking(move || {
         jpeg::read_dimensions_blocking(&jpeg_for_check)
@@ -285,29 +367,45 @@ async fn process_binary(
     .await;
     let (w, h) = match dims {
         Ok(Ok(d)) => d,
-        Ok(Err(s)) => return Err(ServerError::InvalidImage(format!(
-            "JPEG header parse failed: {s} (the SOI marker matched but the \
-             JPEG structure is malformed — check the encoder output)"
-        ))),
-        Err(e) => return Err(ServerError::Internal(format!(
-            "spawn_blocking for jpeg_decoder join error: {e} (this is a \
-             tokio runtime issue, not a client error)"
-        ))),
+        Ok(Err(s)) => return BinaryOutcome::PerFrame {
+            frame_id,
+            code: 400,
+            message: format!(
+                "JPEG header parse failed: {s} (the SOI marker matched but the \
+                 JPEG structure is malformed — check the encoder output)"
+            ),
+        },
+        Err(e) => return BinaryOutcome::PerFrame {
+            frame_id,
+            code: 500,
+            message: format!(
+                "spawn_blocking for jpeg_decoder join error: {e} (this is a \
+                 tokio runtime issue, not a client error)"
+            ),
+        },
     };
     if w < MIN_IMAGE_DIM || h < MIN_IMAGE_DIM {
-        return Err(ServerError::InvalidImage(format!(
-            "image dimensions {}x{} below MIN_IMAGE_DIM={} (a useful input \
-             must occupy at least one LLM token in the model's 28px grid)",
-            w, h, MIN_IMAGE_DIM
-        )));
+        return BinaryOutcome::PerFrame {
+            frame_id,
+            code: 400,
+            message: format!(
+                "image dimensions {}x{} below MIN_IMAGE_DIM={} (a useful input \
+                 must occupy at least one LLM token in the model's 28px grid)",
+                w, h, MIN_IMAGE_DIM
+            ),
+        };
     }
     if w > max_image_dim || h > max_image_dim {
-        return Err(ServerError::InvalidImage(format!(
-            "image dimensions {}x{} exceed LA_MAX_IMAGE_DIM={} \
-             (configurable in scripts/lib/versions.sh; the model's preprocessor \
-             rescales anything above ~2240px square to fit its 25600-patch cap)",
-            w, h, max_image_dim
-        )));
+        return BinaryOutcome::PerFrame {
+            frame_id,
+            code: 400,
+            message: format!(
+                "image dimensions {}x{} exceed LA_MAX_IMAGE_DIM={} \
+                 (configurable in scripts/lib/versions.sh; the model's preprocessor \
+                 rescales anything above ~2240px square to fit its 25600-patch cap)",
+                w, h, max_image_dim
+            ),
+        };
     }
 
     // Strict trained-correct preprocessor gates. The model's
@@ -342,34 +440,42 @@ async fn process_binary(
     let h_patches = h as u64 / PATCH_PX;
     let n_patches = w_patches * h_patches;
     if n_patches > IN_TOKEN_LIMIT {
-        return Err(ServerError::InvalidImage(format!(
-            "image dimensions {}x{} produce {} ViT patches \
-             ((W // {}) × (H // {})), exceeding the trained \
-             `in_token_limit = {}`. The model's preprocessor would \
-             internally BICUBIC-downscale to fit, producing detections \
-             relative to a smaller image than the one you sent — we \
-             refuse this rather than silently scale. Reduce dimensions \
-             so (W // {}) × (H // {}) ≤ {}.",
-            w, h, n_patches,
-            PATCH_PX, PATCH_PX,
-            IN_TOKEN_LIMIT,
-            PATCH_PX, PATCH_PX, IN_TOKEN_LIMIT
-        )));
+        return BinaryOutcome::PerFrame {
+            frame_id,
+            code: 400,
+            message: format!(
+                "image dimensions {}x{} produce {} ViT patches \
+                 ((W // {}) × (H // {})), exceeding the trained \
+                 `in_token_limit = {}`. The model's preprocessor would \
+                 internally BICUBIC-downscale to fit, producing detections \
+                 relative to a smaller image than the one you sent — we \
+                 refuse this rather than silently scale. Reduce dimensions \
+                 so (W // {}) × (H // {}) ≤ {}.",
+                w, h, n_patches,
+                PATCH_PX, PATCH_PX,
+                IN_TOKEN_LIMIT,
+                PATCH_PX, PATCH_PX, IN_TOKEN_LIMIT
+            ),
+        };
     }
     if w_patches >= POS_EMB_PATCH_CAP || h_patches >= POS_EMB_PATCH_CAP {
-        return Err(ServerError::InvalidImage(format!(
-            "image dimensions {}x{} would map to a {}×{} patch grid; the \
-             MoonViT positional embedding's bicubic-interpolation cap is \
-             {} patches per side (= {} px), per the model's preprocessor \
-             at image_processing_locateanything.py line 68 (\"Exceed pos \
-             emb\"). Reduce each dimension to < {} px.",
-            w, h, w_patches, h_patches,
-            POS_EMB_PATCH_CAP, POS_EMB_PATCH_CAP * PATCH_PX,
-            POS_EMB_PATCH_CAP * PATCH_PX
-        )));
+        return BinaryOutcome::PerFrame {
+            frame_id,
+            code: 400,
+            message: format!(
+                "image dimensions {}x{} would map to a {}×{} patch grid; the \
+                 MoonViT positional embedding's bicubic-interpolation cap is \
+                 {} patches per side (= {} px), per the model's preprocessor \
+                 at image_processing_locateanything.py line 68 (\"Exceed pos \
+                 emb\"). Reduce each dimension to < {} px.",
+                w, h, w_patches, h_patches,
+                POS_EMB_PATCH_CAP, POS_EMB_PATCH_CAP * PATCH_PX,
+                POS_EMB_PATCH_CAP * PATCH_PX
+            ),
+        };
     }
 
-    Ok(PendingFrame { header, jpeg })
+    BinaryOutcome::Pending(PendingFrame { header, jpeg })
 }
 
 /// Add the canonical `type` and `frame_id` keys to a worker response and

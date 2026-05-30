@@ -104,6 +104,7 @@ import torch
 from PIL import Image, ImageFile, ImageOps
 from transformers import AutoConfig, AutoModel, AutoTokenizer, AutoProcessor
 
+from . import prompts
 from .parsing import parse_boxes, parse_points, has_abstention
 from .pixel_token_math import plan_resize
 
@@ -703,9 +704,9 @@ class LocateAnythingInference:
         """
         if not isinstance(prompt, str) or not prompt:
             raise ValueError(
-                "prompt must be a non-empty string. See "
-                "docs/MODEL_CAPABILITIES.md#what-it-does-well-in-order for "
-                "the canonical prompt forms."
+                "prompt must be a non-empty string. See worker/prompts.py "
+                "(the single source of truth for the seven canonical "
+                "LocateAnything-3B prompt templates) for the canonical forms."
             )
         if not isinstance(jpeg_bytes, (bytes, bytearray)) or not jpeg_bytes:
             raise ValueError("jpeg_bytes must be non-empty bytes")
@@ -844,6 +845,40 @@ class LocateAnythingInference:
         text = self.processor.py_apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
+        # Per-request invariant: every NVIDIA-trained conversation begins
+        # with this exact system-block prefix and ends with the assistant-
+        # turn marker that `add_generation_prompt=True` is supposed to
+        # append. Any deviation means py_apply_chat_template silently swapped
+        # to a different template (most plausibly the Qwen-default that
+        # emits "You are Qwen, created by Alibaba Cloud. You are a helpful
+        # assistant." — verified to live in the model's vendored
+        # tokenizer_config.json at line 9346). That swap would move
+        # inference off-distribution invisibly; we hard-fail instead.
+        if not text.startswith(prompts.CANONICAL_RENDERED_PREFIX):
+            raise RuntimeError(
+                "Rendered chat-template text does NOT start with the "
+                "NVIDIA-trained system-message bookend. The processor's "
+                "py_apply_chat_template has silently swapped templates "
+                "(most plausibly to the Qwen-default 'You are Qwen, "
+                "created by Alibaba Cloud. ...'). Refusing to run "
+                "inference off-distribution. "
+                f"Expected first {len(prompts.CANONICAL_RENDERED_PREFIX)} "
+                f"chars: {prompts.CANONICAL_RENDERED_PREFIX!r}. "
+                f"Got first {len(prompts.CANONICAL_RENDERED_PREFIX)} "
+                f"chars: {text[:len(prompts.CANONICAL_RENDERED_PREFIX)]!r}."
+            )
+        if not text.endswith(prompts.CANONICAL_RENDERED_SUFFIX):
+            raise RuntimeError(
+                "Rendered chat-template text does NOT end with the "
+                "assistant-turn invitation that add_generation_prompt=True "
+                "is supposed to append. The processor's behavior has "
+                "diverged from what NVIDIA's SFT trainer used. Refusing "
+                "to run inference off-distribution. "
+                f"Expected last {len(prompts.CANONICAL_RENDERED_SUFFIX)} "
+                f"chars: {prompts.CANONICAL_RENDERED_SUFFIX!r}. "
+                f"Got last {len(prompts.CANONICAL_RENDERED_SUFFIX)} "
+                f"chars: {text[-len(prompts.CANONICAL_RENDERED_SUFFIX):]!r}."
+            )
         vision_info = self.processor.process_vision_info(messages)
         if not isinstance(vision_info, tuple) or len(vision_info) != 2:
             raise RuntimeError(
