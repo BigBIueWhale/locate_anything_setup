@@ -92,25 +92,81 @@ Recommended client-side approach for a 4K camera:
 * **Temporally smooth** over 3-5 frames before declaring a track —
   the model has no temporal model itself.
 
-This multiplies inference cost by 12 per frame. At an indicative
-single-frame `slow`-mode throughput of ~0.5 FPS, that's ~0.04 FPS
-end-to-end. The geometry helpers in
+This multiplies inference cost by 12 per frame. At the measured
+single-frame `slow`-mode throughput of ~1.07 FPS on 1080p drone
+content (table below), that's ~0.09 FPS end-to-end per 4K source
+frame. The geometry helpers in
 [`worker/tiling.py`](../worker/tiling.py) (grid generation, IoU, NMS)
 are ready for adoption into such a client.
 
-## Throughput on RTX 5090 (estimated)
+## Throughput on RTX 5090
 
-Estimated from the boot-time calibration on a clean snapshot:
+Measured in-container with 315 inferences = 3 real drone JPEGs
+(1080p-class, within the 25,600-patch budget so the preprocessor does
+no rescale) × the seven canonical drone prompts
+(`prompts.DRONE_PROMPTS_RANKED`) × all three generation modes × 5
+trials, using the trained sampling parameters (`temperature=0.7,
+top_p=0.9, repetition_penalty=1.1`) and the SDPA mem-eff attention
+path (MagiAttention is unbuildable on sm_120 — see
+[`docs/PINNED_VERSIONS.md`](./PINNED_VERSIONS.md)).
 
-* Single-frame, `hybrid` mode, 1080p image, 5-category prompt:
-  ~0.5–1.0 s per frame ⇒ ~1–2 fps.
-* Single-frame, `slow` mode, same input:
-  ~1.5–3.0 s per frame ⇒ ~0.3–0.6 fps.
-* 4 × 3 tiled, `slow` mode, 4K source:
-  ~20–40 s per frame ⇒ ~0.03–0.05 fps.
+| Mode     | mean gen_time | p95   | tokens/s | mean num_boxes | mean forward_steps |
+|----------|--------------:|------:|---------:|---------------:|-------------------:|
+| `fast`   |        757 ms | 1.11s |     35.8 |           1.48 |                4.3 |
+| `hybrid` |        785 ms | 1.17s |     32.7 |           1.56 |                6.4 |
+| `slow`   |        937 ms | 1.61s |     24.7 |           1.62 |               17.6 |
 
-The actual measured values are printed at container boot and
-returned by `GET /v1/capabilities` under `.calibration`.
+MTP cuts forward passes by ~73 % in `fast` and ~64 % in `hybrid`
+relative to `slow` (mean `fast/slow=0.27`, `hybrid/slow=0.36`).
+Wall-clock improvement is modest (~17 % `hybrid → slow`) because each
+inference is dominated by the prefill (vision-token encoding + first
+LLM forward) on a 1080p input; MTP's speedup amortizes over output
+length, so the paper's 2.5× headline applies to high-density
+detection (Dense200, COCO) rather than 1-3-box drone shots.
+
+### MTP acceptance (`hybrid` mode)
+
+Across 105 `hybrid` inferences, MTP emitted 464 multi-token blocks of
+which 45 were structurally malformed and triggered a single-token AR
+completion before returning to MTP. **Acceptance rate ≈ 90.3 %.** 74
+of 105 inferences (70.5 %) saw zero AR fallbacks; the per-inference
+failure distribution is `{0:74, 1:26, 3:1, 4:4}`. `fast` and `slow`
+report zero `switch_to_ar` events by construction (`fast` never falls
+back; `slow` never tries MTP).
+
+The structural difficulty varies sharply by prompt shape (mean
+`switch_to_ar` over 15 `hybrid` trials each):
+
+| Prompt | mean | max |
+|--------|-----:|----:|
+| `Locate all the instances that matches the following description: drone</c>quadcopter</c>uav</c>aircraft.` | 1.60 | 4 |
+| `Locate all the instances that match the following description: a small drone in the sky.`               | 0.67 | 1 |
+| `Locate all the instances that matches the following description: drone.`                                | 0.33 | 1 |
+| `Locate all the instances that match the following description: a flying object in the sky.`             | 0.33 | 1 |
+| `Point to: drone in the sky.`                                                                            | 0.07 | 1 |
+| `Locate a single instance that matches the following description: the drone.`                            | 0.00 | 0 |
+| `Point to: quadcopter.`                                                                                  | 0.00 | 0 |
+
+Multi-category detection has the most MTP structural complexity (the
+output must interleave `<ref>X</ref><box>…</box>` per category in
+parallel); pointing and single-instance grounding are the cleanest.
+The 10 % malformed-MTP events are invisible at the response layer —
+`hybrid` AR-completes them in place and the output parses cleanly —
+but they DO cost the forward-pass savings: those tokens run at
+`slow`-mode speed.
+
+### Tiling math (4 × 3 grid of 4K tiles)
+
+* `hybrid`: 12 × 785 ms ≈ 9.4 s per source frame (~0.11 fps).
+* `slow`  : 12 × 937 ms ≈ 11.2 s per source frame (~0.09 fps).
+
+The worker serializes tile inference (single-concurrent-user design
+— see [`docs/OPERATIONS.md`](./OPERATIONS.md#concurrency)).
+
+The `calibration` block returned by `GET /v1/capabilities` reports a
+single boot-time inference cycle on the synthetic calibration JPEG;
+that is a per-boot health signal, not a workload-representative
+throughput number.
 
 ## Recommendation
 
