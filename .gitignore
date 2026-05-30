@@ -16,3 +16,7 @@
 # is kept (it may carry hand-curated assets later); only the generated
 # JPEG is ignored.
 /test_data/calibration.jpg
+
+# Claude Code session/permission metadata. Per-developer local state,
+# not project content.
+/.claude/
