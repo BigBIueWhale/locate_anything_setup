@@ -4,13 +4,33 @@ Parse LocateAnything-3B output text into structured detections.
 The model emits 6-token blocks like:
     <box><x1><y1><x2><y2></box>            — box, 4 integer coords in [0,1000]
     <box><x><y></box>                       — point, 2 integer coords in [0,1000]
-    <box>None</box>                         — explicit abstention
-    <ref>category</ref><box>...</box>       — labeled box
-The literal `None` (capitalized, mirroring the Python `None` literal — observed
-in NVIDIA's own training outputs) inside a box is the abstention marker. We
-also accept lowercase `none` as a documentation safety net in case a later
-release flips the case; both forms route through the same detection-skipped
-path.
+    <box>None</box>                         — per-category abstention placeholder
+    <ref>category</ref><box>...</box>       — labeled box (detection / grounding)
+
+The literal `None` (capital N, token id 4064 in the released checkpoint —
+verified live; NVIDIA's DATA_PREPARATION.md:143 shows lowercase `none` but the
+trained token is capital `None`) inside a box is the per-category abstention
+marker. Our box/point regexes are numeric-only, so `<box>None</box>` does not
+match and is silently dropped — identical to NVIDIA's eval parser at
+/tmp/nvlabs_eagle/Embodied/evaluation/inference_grounding_ddp.py:282-300 which
+uses the same numeric-only box_pattern. The lowercase variant is also tolerated
+by `has_abstention` as a forward-compat safety net.
+
+Aggregate abstention ("the frame returned nothing usable") is derivable from
+the parse results — empty `detections` AND empty `points` ⇔ aggregate
+abstention. The response's `abstained` field at `InferenceResult.abstained` is
+populated using exactly that derivation in `worker/inference.py`; it
+deliberately does NOT scan raw_text for `<box>None</box>`, because per-category
+abstention triples are emitted alongside real detections in multi-category
+prompts and a substring scan would flip the aggregate flag to True even when
+other categories returned valid boxes. NVIDIA's own pipeline has no aggregate
+`abstained` concept either — `metrics/other_metric.py:140-156` only tracks
+per-category None.
+
+`has_abstention` is retained as a substring utility used by the BOOT SELF-TEST
+in `worker/calibration.py` to distinguish "model emitted the trained explicit
+abstention literal" from "model emitted gibberish the parser couldn't consume".
+It is NOT the truth source for the response field.
 
 Verified against /tmp/nvlabs_eagle/Embodied/locateanything_worker.py
 (LocateAnythingWorker.parse_boxes) and the model's generate_utils.py.
@@ -133,7 +153,20 @@ def parse_points(answer: str, image_width: int, image_height: int) -> List[Point
 
 
 def has_abstention(answer: str) -> bool:
-    """Return True if the model explicitly emitted <box>none</box>."""
+    """Return True if `answer` contains the trained explicit abstention
+    literal `<box>None</box>` (or lowercase `<box>none</box>` as a
+    forward-compat tolerance).
+
+    This is a SUBSTRING TEST — it fires once per match regardless of how
+    many other categories returned real boxes in the same response. Use
+    it ONLY when you specifically want to know whether the model emitted
+    the trained abstention literal at all (e.g. in `worker/calibration.py`
+    to distinguish "model produced recognized output" from "model emitted
+    gibberish" at boot). For the aggregate "did this frame return
+    anything usable" question, use `not (detections or points)` instead —
+    that is the semantic the response's `abstained` field exposes, and it
+    matches NVIDIA's eval pipeline which has no aggregate abstained
+    concept (see module docstring)."""
     return _NONE_RE.search(answer) is not None
 
 

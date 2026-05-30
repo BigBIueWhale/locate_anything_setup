@@ -19,6 +19,7 @@ import statistics
 import time
 
 from .inference import LocateAnythingInference
+from .parsing import has_abstention
 
 
 @dataclass(frozen=True)
@@ -86,15 +87,28 @@ def calibrate(
     # The synthetic calibration image is four polygons drawn with PIL;
     # the model probably won't recognize them as the prompted categories.
     # That is fine — what we DO require is evidence that the model emitted
-    # SOME structured output the parser was able to consume. One of:
+    # SOME structured output that the parser was able to consume. One of:
     # (a) at least one parsed box, (b) at least one parsed point,
-    # (c) an explicit abstention `<box>none</box>`. Anything else means
-    # raw_text was unparseable, which would be a model-or-parser bug we
-    # want to catch at boot — not in production.
-    if not (warm.detections or warm.points or warm.abstained):
+    # (c) the trained explicit abstention literal `<box>None</box>`
+    #     present in raw_text. Anything else means raw_text was
+    #     unparseable, which would be a model-or-parser bug we want to
+    #     catch at boot — not in production.
+    #
+    # We deliberately invoke `has_abstention(warm.raw_answer)` here rather
+    # than reading `warm.abstained`. After the abstention-semantics
+    # tighten, `warm.abstained` is the AGGREGATE flag
+    # (`not (detections or points)`) and would always be True when
+    # detections and points are both empty — making the disjunction
+    # tautological and silently masking the gibberish-output failure mode
+    # this assertion exists to catch. The substring scan via
+    # `has_abstention` is the parser-internal probe for "did the model
+    # emit the trained literal at all", which is what we actually need
+    # for the parser-drift self-test.
+    if not (warm.detections or warm.points or has_abstention(warm.raw_answer)):
         raise RuntimeError(
-            "calibration warm-up yielded no structured output: no boxes, "
-            "no points, and no abstention. raw_text first 200 chars: "
+            "calibration warm-up yielded no recognizable output: no parsed "
+            "boxes, no parsed points, and no `<box>None</box>` abstention "
+            "literal in raw_text. raw_text first 200 chars: "
             f"{warm.raw_answer[:200]!r}. Either the model is mis-loaded, "
             "the prompt path is broken, or the parser regex needs an "
             "update for new output forms."

@@ -105,7 +105,7 @@ from PIL import Image, ImageFile, ImageOps
 from transformers import AutoConfig, AutoModel, AutoTokenizer, AutoProcessor
 
 from . import prompts
-from .parsing import parse_boxes, parse_points, has_abstention
+from .parsing import parse_boxes, parse_points
 from .pixel_token_math import plan_resize
 
 
@@ -549,6 +549,16 @@ class InferenceResult:
     raw_answer: str
     detections: list  # list[dict]
     points: list      # list[dict]
+    # True iff `detections` and `points` are both empty — i.e. the model
+    # effectively returned nothing usable for this frame. Derivable from
+    # the two lists but stamped explicitly so naive clients can branch
+    # on it without re-parsing. NVIDIA's eval pipeline has no aggregate
+    # `abstained` concept; empty parsed output is the aggregate-no-result
+    # signal there too (inference_grounding_ddp.py:282-300 +
+    # metrics/other_metric.py:140-156). Per-category abstention in a
+    # multi-category detect prompt is NOT signalled here — it's
+    # recoverable from `raw_answer` as the set difference between the
+    # prompt's category list and `{d['label'] for d in detections}`.
     abstained: bool
     latency_ms: float
     image_size: tuple
@@ -937,7 +947,19 @@ class LocateAnythingInference:
             raw_answer=answer,
             detections=detections,
             points=points,
-            abstained=has_abstention(answer),
+            # Aggregate semantic. The earlier substring scan
+            # `has_abstention(answer)` was removed because the model
+            # emits <box>None</box> once per absent category in
+            # multi-category detection (verified live on `cat_negative.jpg`
+            # + 5-category prompt: 1 detection + 4 None triples → the
+            # scan flipped True alongside detections=[cat], leaking
+            # misinformation a naive client would interpret as "no
+            # boxes"). NVIDIA's eval treats per-category None as zero
+            # detections for that category (`inference_detection_ddp.py:
+            # 283-300` numeric-only regex drops it) — never as aggregate
+            # abstention; we mirror that aggregate semantic here. See
+            # InferenceResult.abstained for the contract.
+            abstained=not (detections or points),
             latency_ms=latency_ms,
             image_size=(image.width, image.height),
             resize_plan={

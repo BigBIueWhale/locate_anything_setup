@@ -192,11 +192,36 @@ not a streaming mode.
 
 ## Abstention
 
-The model can emit `<box>none</box>` to signal "no detection". The
-training corpus has 22 M explicit negative queries (16 % of the SFT
-data). The server parses this signal (`worker/parsing.py:has_abstention`)
-and exposes `"abstained": true` in the response. **It is not a
-calibrated confidence** — treat it as a hint, not a guarantee.
+The model emits `<box>None</box>` (capital-N — verified live; NVIDIA's
+`DATA_PREPARATION.md:143` shows lowercase `none` but the trained token
+id 4064 decodes to capital `None`) as a per-category abstention
+placeholder. The training corpus has 22 M explicit negative queries
+(16 % of the SFT data). Our parser's box/point regexes are numeric-only
+— same shape as NVIDIA's eval at
+`Embodied/evaluation/inference_grounding_ddp.py:282-300` — so
+`<box>None</box>` silently does not match and is dropped.
+
+The Result body's `"abstained": true` is the AGGREGATE signal: it fires
+iff `detections` and `points` are both empty — i.e. the model
+effectively returned nothing usable for this frame. This deliberately
+collapses "all categories abstained" with "model produced unparseable
+output"; both are "nothing to render" from the client's perspective.
+NVIDIA's own eval pipeline has no aggregate `abstained` concept either
+— `Embodied/evaluation/metrics/other_metric.py:140-156` only tracks
+per-category None. (An earlier substring-scan `has_abstention(raw_text)`
+in this server's response path was removed because it leaked
+per-category abstention into the aggregate flag — multi-category
+detect prompts emit `<ref>X</ref><box>None</box>` for absent categories
+alongside real boxes for present ones, and the substring scan would
+flip the aggregate flag True even when real detections were returned.)
+
+For per-category abstention in a multi-category detection prompt,
+clients recover the absent categories as the set difference between
+the prompt's category list and `{d.label for d in detections}` — the
+`<ref>X</ref><box>None</box>` triples for those categories are also
+present verbatim in `raw_text` if needed. **`abstained` is not a
+calibrated confidence** — treat it as "no usable output", not "model
+is confident there is nothing".
 
 ## Coordinate system
 
