@@ -124,7 +124,7 @@ check — fix the underlying issue, then re-run.
 ```
 locate_anything_setup/
 ├── README.md                       # this file
-├── LICENSE                         # MIT (repo code) + NOTICE re: NVIDIA weights
+├── LICENSE                         # Unlicense (repo code) + NOTICE re: NVIDIA weights
 ├── setup.sh                        # orchestrator
 ├── uninstall.sh                    # tiered cleanup (see docs/OPERATIONS.md)
 ├── Dockerfile                      # multi-stage (Rust + CUDA Python)

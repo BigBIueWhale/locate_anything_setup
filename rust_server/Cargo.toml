@@ -4,7 +4,7 @@ version     = "0.1.0"
 edition     = "2021"
 rust-version = "1.95"
 description = "HTTP + WebSocket frontend for the LocateAnything-3B Python worker."
-license     = "MIT"
+license     = "Unlicense"
 publish     = false
 
 [[bin]]
