@@ -215,8 +215,9 @@ guaranteed empty); every other value → 4-coord boxes in `detections[]`
 (with `points` guaranteed empty). The server enforces this by filtering
 off-shape model output before stamping the response, so a naive client
 can branch on `prompt_task` alone without inspecting both lists. Any
-off-shape model output is dropped (R6 audit measured 0 / 3,444 cross-
-shape events at trained sampling params, so the filter is a forward-
+off-shape model output is dropped (zero cross-shape events were
+observed in 3,444 trials at trained sampling params spanning all 7
+templates × adversarial prompts; the filter is therefore a forward-
 compat guard rail rather than a frequent rejection path).
 
 `raw_text` carries the full decoded model output including structural

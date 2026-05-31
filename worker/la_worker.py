@@ -56,47 +56,38 @@ log = logging.getLogger("la_worker")
 # Hard-recovery contract (worker self-exit → container restart)
 # -------------------------------------------------------------------------
 #
-# Two server-side failure modes are designed to fail loud rather than
-# silently degrade:
+# Two server-side failure modes fail loud rather than silently degrade:
+# per-frame inference timeout and CUDA OutOfMemoryError. Both call
+# os._exit(WORKER_RESTART_EXIT_CODE) so entrypoint.sh's `wait -n`
+# propagates the exit through to Docker's `--restart unless-stopped`.
+# Typical visible gap: ~10–15 s for model reload + boot drift check +
+# drone calibration. Operator-facing details (per-failure client
+# signature, persistent-failure restart loop):
+# docs/OPERATIONS.md §Worker self-exit.
 #
-#   1. Per-frame inference timeout. We wrap the engine.run call in
-#      asyncio.wait_for(LA_INFERENCE_TIMEOUT_S=600s). On expiry:
-#      asyncio.TimeoutError is raised, the asyncio.Lock IS released, BUT
-#      the underlying thread keeps running. CPython provides no mechanism
-#      to cancel a thread inside a non-Python C/CUDA frame holding the
-#      GIL — verified empirically in the R2 design audit. The only
-#      correct recovery is process exit: the orphan thread dies with the
-#      process, the next container has fresh CUDA state.
+# WHY hard-exit instead of in-process recovery — for each:
 #
-#      The 600 s default is derived from the theoretical maximum legitimate
-#      inference latency: `max_new_tokens(8192) / observed-min-tps(slow
-#      ~30 tps) + prefill_max + 2× safety margin ≈ 600 s`. The R2
-#      empirical study measured max 273 s on a synthetic 80×80 dense-
-#      text-grid hitting max_new_tokens; 600 s leaves ample margin so
-#      legitimate workloads are never falsely killed. The wedge-detection
-#      latency (up to 600 s before recovery) is the principled trade
-#      against any false-positive risk — per project principle
-#      "correctness over speed-of-wedge-detection".
+#   * Inference timeout: CPython provides no mechanism to cancel a
+#     thread blocked inside a non-Python C/CUDA frame holding the GIL.
+#     `asyncio.wait_for` releases the asyncio.Lock cleanly on expiry,
+#     but the underlying thread keeps running and keeps holding the
+#     GPU. Process exit is the only mechanism that kills the orphan.
 #
-#   2. CUDA OutOfMemoryError. PyTorch's caching allocator IS empirically
-#      stable across repeated OOMs with PYTORCH_CUDA_ALLOC_CONF=
-#      expandable_segments:True (R4 study verified 10 forced OOMs left
-#      allocator state identical). But empirical stability ≠ provable
-#      correctness; the principled choice per "no fallbacks, no half-
-#      finished implementations" is to exit so the next frame runs
-#      against a fresh CUDA context.
-#
-# Both paths call os._exit(WORKER_RESTART_EXIT_CODE). entrypoint.sh's
-# `wait -n` returns this status; the script propagates it as the
-# container exit code; Docker `--restart unless-stopped` restarts the
-# container with the same image. Typical visible gap: ~10–15 s
-# (model reload + boot drift check + drone calibration).
-#
-# Persistent failure (memory leak, driver bug, adversarial workload that
-# repeatedly OOMs or wedges) manifests as a Docker restart-loop with
-# exponential backoff — see docs/OPERATIONS.md §Worker self-exit.
+#   * CUDA OOM: PyTorch's caching allocator IS empirically stable
+#     across repeated OOMs on PYTORCH_CUDA_ALLOC_CONF=expandable_segments
+#     :True, but empirical stability is not provable correctness. The
+#     principled choice is to exit so the next frame runs against a
+#     fresh CUDA context.
 
-# Per-frame inference timeout in seconds; env-configurable.
+# Per-frame inference timeout in seconds; env-configurable. Default 600 s
+# is the theoretical maximum legitimate inference latency for this model
+# at the trained sampling parameters: max_new_tokens (8192) divided by
+# the observed minimum slow-mode tokens-per-second (~30) plus prefill
+# (~0.5 s) plus 2× safety, ≈ 600 s. The single longest-output legitimate
+# input characterised on this server (a synthetic dense-text grid that
+# saturates max_new_tokens in slow mode) ran for ~273 s; the 600 s bound
+# never falsely kills a legitimate workload. Wedge-detection latency is
+# bounded by the same value — accepted as the principled trade.
 LA_INFERENCE_TIMEOUT_S = float(os.environ.get("LA_INFERENCE_TIMEOUT_S", "600"))
 
 # EX_TEMPFAIL from sysexits.h — "service unavailable, retry recommended".
@@ -647,11 +638,10 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument(
         "--calibration-prompt",
         # Paired with the drone calibration image. `point_to('drone in
-        # the sky')` is the cleanest drone prompt for this workload —
-        # the MTP probe at /tmp/probe_mtp.py showed 0.07 mean
-        # `switch_to_ar` across 15 hybrid trials (lowest of the 7
-        # canonical drone prompts), so the per-boot calibration
-        # latency reflects the well-behaved MTP fast path.
+        # the sky')` is the structurally cleanest drone prompt — it
+        # produces few output tokens and triggers MTP's fast path
+        # almost every block, so per-boot calibration latency
+        # characterises the well-behaved fast-path workload.
         default=prompts.point_to("drone in the sky"),
     )
     p.add_argument(

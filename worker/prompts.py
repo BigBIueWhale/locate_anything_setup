@@ -92,9 +92,9 @@ POINT_PREFIX          = "Point to: "
 # any silent swap to a different chat template (e.g. the Qwen-default
 # tokenizer template that produces `You are Qwen, created by Alibaba
 # Cloud. ...`) hard-fails immediately rather than via output-quality
-# regression. Verified live against the running tokenizer + verified
-# against the SFT trainer's render at
-# /tmp/nvlabs_eagle/Embodied/eaglevl/train/locany_finetune_magi_stream.py.
+# regression. Cross-verified against the running tokenizer and against
+# NVlabs/Eagle's SFT trainer at
+# `Embodied/eaglevl/train/locany_finetune_magi_stream.py`.
 # ---------------------------------------------------------------------------
 
 CANONICAL_RENDERED_PREFIX = (

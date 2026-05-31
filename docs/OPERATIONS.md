@@ -130,20 +130,20 @@ per `--restart unless-stopped`.
 
 - For a CUDA wedge: in-process recovery is structurally impossible.
   Python provides no mechanism to cancel a thread blocked inside a
-  CUDA C call holding the GIL (verified empirically in the R2 design
-  audit). The asyncio.Lock IS released on the
+  CUDA C call holding the GIL. The `asyncio.Lock` IS released on the
   `asyncio.wait_for(...)` timeout, but the orphan thread keeps
   running and holding GPU state. The only correct recovery is
   process exit so the orphan dies with the process and the next
   container has a fresh CUDA context.
 - For a CUDA OOM: in-process recovery via `torch.cuda.empty_cache()`
-  is empirically safe on `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:
-  True` (10 forced OOMs left the allocator state identical in the R4
-  study) but empirical stability ≠ provable correctness. We pick
-  hard-exit for the principled invariant that the next frame always
-  runs against a fresh CUDA context. The ~10–15 s restart cost is
-  paid once per OOM, which we expect to be vanishingly rare in
-  single-tenant operation.
+  is empirically stable on `PYTORCH_CUDA_ALLOC_CONF=expandable_segments
+  :True` (the allocator state stays identical across repeated forced
+  OOMs in this configuration), but empirical stability is not provable
+  correctness. We pick hard-exit for the principled invariant that the
+  next frame always runs against a fresh CUDA context. The ~10–15 s
+  restart cost is paid once per OOM; in single-tenant operation with
+  all the WS-edge image-size + patch-budget caps in place this is
+  vanishingly rare.
 
 **Client-visible signature:**
 

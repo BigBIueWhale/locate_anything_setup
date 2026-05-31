@@ -12,25 +12,22 @@ The model emits 6-token blocks like:
                                               N sibling <box> blocks, ALL
                                               sharing the label
 
-The literal `None` (capital N, token id 4064 in the released checkpoint —
-verified live; NVIDIA's DATA_PREPARATION.md:143 shows lowercase `none` but the
-trained token is capital `None`) inside a box is the per-category abstention
-marker. Our box/point regexes are numeric-only, so `<box>None</box>` does not
-match and is silently dropped — identical to NVIDIA's eval parser at
-/tmp/nvlabs_eagle/Embodied/evaluation/inference_grounding_ddp.py:282-300 which
-uses the same numeric-only box_pattern. The lowercase variant is also tolerated
-by `has_abstention` as a forward-compat safety net.
+The literal `None` (capital N, token id 4064 in the released checkpoint)
+inside a box is the per-category abstention marker. Note that NVIDIA's
+DATA_PREPARATION.md:143 shows lowercase `none` but the trained token
+decodes to capital `None`; our regexes are numeric-only so `<box>None</box>`
+is silently dropped regardless of case — identical to NVIDIA's eval parser
+at `Embodied/evaluation/inference_grounding_ddp.py:282-300` (in the
+NVlabs/Eagle repo) which uses the same numeric-only `box_pattern`. The
+lowercase variant is also tolerated by `has_abstention` as a forward-
+compat safety net.
 
 Multi-instance grounding (template 3) emits ONE <ref> followed by N sibling
 <box> blocks; all N boxes are instances of the same phrase. Our parser mirrors
 NVIDIA's eval-time `<ref>(category)</ref>((?:<box>.*?</box>)+)` capture
-(`inference_grounding_ddp.py:390` and `inference_detection_ddp.py:282-300`) so
-every sibling box inherits the ref's label. An earlier two-pass design captured
-only the FIRST box per <ref> and returned siblings as `label=None`; that
-diverged from NVIDIA's eval and silently lost labels on multi-instance
-grounding queries (live-verified: 4 of 5 labels dropped on `Locate all the
-instances that match the following description: an object.` against
-calibration.jpg before this fix).
+(`Embodied/evaluation/inference_grounding_ddp.py:390` and
+`inference_detection_ddp.py:282-300`) so every sibling box inherits the
+ref's label.
 
 Aggregate abstention ("the frame returned nothing usable") is derivable from
 the parse results — empty `detections` AND empty `points` ⇔ aggregate
@@ -48,8 +45,8 @@ in `worker/calibration.py` to distinguish "model emitted the trained explicit
 abstention literal" from "model emitted gibberish the parser couldn't consume".
 It is NOT the truth source for the response field.
 
-Verified against /tmp/nvlabs_eagle/Embodied/locateanything_worker.py
-(LocateAnythingWorker.parse_boxes) and the model's generate_utils.py.
+Verified against NVlabs/Eagle's `Embodied/locateanything_worker.py`
+(LocateAnythingWorker.parse_boxes) and the model's `generate_utils.py`.
 """
 
 from __future__ import annotations
@@ -58,10 +55,10 @@ from typing import List, Optional
 import re
 
 # Regex for a <ref>label</ref> ref-run followed by ONE OR MORE sibling <box>
-# blocks. Mirrors NVIDIA's eval parser at
-#   /tmp/nvlabs_eagle/Embodied/evaluation/inference_grounding_ddp.py:390
+# blocks. Mirrors NVIDIA's eval parser in the NVlabs/Eagle repo at
+#   Embodied/evaluation/inference_grounding_ddp.py:390
 #     ref_pattern = r'<ref>([^<]+)</ref>((?:<box>.*?</box>)+)'
-#   /tmp/nvlabs_eagle/Embodied/evaluation/inference_detection_ddp.py:282-300
+#   Embodied/evaluation/inference_detection_ddp.py:282-300
 #     (same pattern; their inline example shows two boxes attributed to one ref)
 #
 # The shared-ref-multi-box shape is the TRAINED output for template 3 (phrase
@@ -175,7 +172,7 @@ def parse_points(answer: str, image_width: int, image_height: int) -> List[Point
     """Parse <box><x><y></box> point blocks. Two coords only.
 
     Mirrors NVIDIA's eval-time parser at
-    /tmp/nvlabs_eagle/Embodied/evaluation/inference_grounding_ddp.py:564-587
+    NVlabs/Eagle's `Embodied/evaluation/inference_grounding_ddp.py:564-587`,
     which runs BOTH a point_pattern AND a box_pattern over each captured
     ref-run, attaching the run's category to every match.
 
@@ -184,7 +181,7 @@ def parse_points(answer: str, image_width: int, image_height: int) -> List[Point
           valid 2-coord <box> inside via _POINT_RE, attributing them to the
           run's label. Template 7 (`Point to: PHRASE.`) emits this shape:
           `<ref>PHRASE</ref><box><x><y></box>` — single labeled point per
-          query, verified live in earlier audits.
+          query.
       (2) Orphan points — 2-coord blocks not inside any ref-run and not
           shadowed by a 4-coord box span. These get label=None. The model
           can also emit bare points without a <ref> prefix.

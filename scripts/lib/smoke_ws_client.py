@@ -89,12 +89,10 @@ async def run(args):
             print(f"FAIL: result.latency_ms is missing or not numeric: {result}",
                   file=sys.stderr)
             sys.exit(9)
-        # The post-prompt_task-enforcement contract: every Result body
-        # carries `prompt_task` (one of the seven canonical wire names)
-        # and `model_output_truncated` (bool). The off-shape invariant
-        # is also asserted: `prompt_task=="point"` ⇒ `detections == []`;
-        # any other value ⇒ `points == []`. A future regression in the
-        # filter would land here as a clean CI failure.
+        # Typed-field contract per docs/CLIENT_PROTOCOL.md Result section.
+        # The wire-name set is enumerated here independently of the worker —
+        # if it drifts from worker/prompts.py::TEMPLATE_WIRE_NAMES the
+        # `pt not in VALID_TASKS` check surfaces it.
         VALID_TASKS = {"detection", "phrase_single", "phrase_multi",
                        "text_grounding", "scene_text", "gui_box", "point"}
         pt = result.get("prompt_task")

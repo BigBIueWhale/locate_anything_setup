@@ -556,13 +556,14 @@ def _patch_vit_sdpa_to_mem_efficient() -> None:
 # by-definition off-distribution and silently lands in the wrong field
 # without enforcement.
 #
-# Empirically the model NEVER emits off-shape at trained sampling params:
-# the R6 audit measured 0/3,444 cross-shape events across all 7 templates
-# × adversarial prompts (including "Point to: bounding box around the
-# drone."). Enforcement is therefore a forward-compat guard rail, not a
-# correctness fix — but it is principle-aligned with "use the model the
-# way it was trained" by surfacing-as-empty any model deviation rather
-# than letting the off-shape result silently leak into the wrong field.
+# Empirically the model does not emit off-shape at the trained sampling
+# parameters: zero cross-shape events were observed in 3,444 trials
+# spanning all 7 templates × adversarial prompts (including a Point
+# prompt literally containing the substring "bounding box"). The filter
+# is therefore a forward-compat guard rail, not a frequent rejection
+# path; it converts a hypothetical future model regression from a
+# silent-wrong-field-filled bug into a clean "model deviated → empty
+# response" signal that the `abstained` field already surfaces.
 #
 # Keys MUST equal worker/prompts.py::TEMPLATE_WIRE_NAMES AND the wire
 # names in rust_server/src/prompt_validator.rs::TemplateKind::wire_name;
@@ -929,15 +930,10 @@ class LocateAnythingInference:
         text = self.processor.py_apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
-        # Per-request invariant: every NVIDIA-trained conversation begins
-        # with this exact system-block prefix and ends with the assistant-
-        # turn marker that `add_generation_prompt=True` is supposed to
-        # append. Any deviation means py_apply_chat_template silently swapped
-        # to a different template (most plausibly the Qwen-default that
-        # emits "You are Qwen, created by Alibaba Cloud. You are a helpful
-        # assistant." — verified to live in the model's vendored
-        # tokenizer_config.json at line 9346). That swap would move
-        # inference off-distribution invisibly; we hard-fail instead.
+        # Per-request bookend check. The canonical prefix/suffix strings
+        # are in `prompts.CANONICAL_RENDERED_{PREFIX,SUFFIX}`. The Qwen-
+        # default fallback the error message warns about lives in the
+        # model's vendored `tokenizer_config.json:9346`.
         if not text.startswith(prompts.CANONICAL_RENDERED_PREFIX):
             raise RuntimeError(
                 "Rendered chat-template text does NOT start with the "
@@ -1017,16 +1013,9 @@ class LocateAnythingInference:
 
         detections = [d.to_json() for d in parse_boxes(answer, image.width, image.height)]
         points     = [p.to_json() for p in parse_points(answer, image.width, image.height)]
-        # Trained task→shape enforcement. The model was supervised on
-        # template 7 → 2-coord points and templates 1-6 → 4-coord boxes;
-        # any off-shape output is by-definition off-distribution. R6
-        # measured 0/3,444 cross-shape events on the trained sampling
-        # params, so this filter never throws away legitimate model
-        # output today — but its existence converts a hypothetical
-        # future model regression from a silent-wrong-field-filled bug
-        # into a clean "off-shape data dropped, response is empty"
-        # signal that the existing `abstained` field then surfaces. See
-        # EXPECTED_SHAPE module docstring for the full contract.
+        # Trained task→shape enforcement: drop off-shape parse output
+        # before stamping the response. See EXPECTED_SHAPE for the
+        # full contract.
         expected = EXPECTED_SHAPE[prompt_task]
         if expected == "point":
             detections = []
@@ -1036,22 +1025,10 @@ class LocateAnythingInference:
             raw_answer=answer,
             detections=detections,
             points=points,
-            # Aggregate semantic. The earlier substring scan
-            # `has_abstention(answer)` was removed because the model
-            # emits <box>None</box> once per absent category in
-            # multi-category detection (verified live on `cat_negative.jpg`
-            # + 5-category prompt: 1 detection + 4 None triples → the
-            # scan flipped True alongside detections=[cat], leaking
-            # misinformation a naive client would interpret as "no
-            # boxes"). NVIDIA's eval treats per-category None as zero
-            # detections for that category (`inference_detection_ddp.py:
-            # 283-300` numeric-only regex drops it) — never as aggregate
-            # abstention; we mirror that aggregate semantic here. See
-            # InferenceResult.abstained for the contract.
+            # Aggregate semantic. See InferenceResult.abstained docstring.
             abstained=not (detections or points),
-            # Explicit truncation signal. See InferenceResult docstring
-            # for the dependency on modeling_locateanything.py:464,500-501
-            # (the loop exits only on <|im_end|> OR budget exhaustion).
+            # Explicit truncation signal. See InferenceResult.model_output_truncated
+            # docstring.
             model_output_truncated=not answer.endswith("<|im_end|>"),
             prompt_task=prompt_task,
             latency_ms=latency_ms,

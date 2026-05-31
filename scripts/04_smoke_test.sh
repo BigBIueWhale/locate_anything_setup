@@ -113,11 +113,11 @@ fi
 #   2. Template-5 scene-text detection. Covers prompt_task=scene_text
 #      AND the per-box <ref>text</ref><box>...</box> shape that is
 #      otherwise only exercised on text-heavy imagery. The synthetic
-#      polygon image has no real text — Agent B's audit showed the
-#      model emits a degenerate full-image labeled box on no-text
-#      input — that's fine for CI structural coverage (the parser
-#      still consumes a labeled box; off-shape filter sees a "box"
-#      result for prompt_task=scene_text and lets it through).
+#      polygon image has no real text — the model is observed to emit
+#      a degenerate full-image labeled box on no-text input; that's
+#      fine for CI structural coverage (the parser still consumes a
+#      labeled box; the off-shape filter sees a "box" result for
+#      prompt_task=scene_text and lets it through).
 LOCATE_PROMPT='Locate all the instances that matches the following description: bottle</c>book</c>cup</c>laptop.'
 SCENE_TEXT_PROMPT='Detect all the text in box format.'
 

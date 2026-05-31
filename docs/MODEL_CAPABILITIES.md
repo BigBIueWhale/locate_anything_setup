@@ -38,8 +38,7 @@ boxes / 12 M images, split roughly:
 **Augmentation**: only random resize (50 % probability, long-edge
 in [640, 2560], Lanczos). No motion-blur, no Gaussian-blur, no
 color/brightness jitter, no noise, no JPEG-quality augmentation.
-Verified in
-`/tmp/nvlabs_eagle/Embodied/eaglevl/train/augmentation.py`.
+Verified in NVlabs/Eagle's `Embodied/eaglevl/train/augmentation.py`.
 
 ## What it does well (in order)
 
@@ -82,8 +81,8 @@ that URL so the client always knows where to look. **Do not paraphrase**
 ## Generation modes
 
 `fast`, `hybrid`, `slow`. Verified in
-`/tmp/la3b_meta/modeling_locateanything.py:347-353` and
-`/tmp/la3b_meta/generate_utils.py`.
+`models/LocateAnything-3B/modeling_locateanything.py:347-353` and
+`models/LocateAnything-3B/generate_utils.py`.
 
 * **fast** — Multi-Token Prediction (MTP) only. Predicts the 6-token
   `<box>...<...>...</box>` block in a single forward pass and never
@@ -164,7 +163,7 @@ attention stack).
 
 ## Generation parameters (used by every benchmark in the paper)
 
-From `/tmp/nvlabs_eagle/Embodied/evaluation/inference_compat.py:42-68`:
+From NVlabs/Eagle's `Embodied/evaluation/inference_compat.py:42-68`:
 
 ```python
 do_sample=True,
@@ -245,7 +244,7 @@ which contains 1001 discrete coord tokens `<0>` … `<1000>`).
 * **Box order** is `<box><x1><y1><x2><y2></box>` — verified against
   `Embodied/document/DATA_PREPARATION.md:131` and the
   `Embodied/evaluation/inference_*.py` parsers. A misleading comment
-  in `/tmp/la3b_meta/generate_utils.py:297` calls positions
+  in `models/LocateAnything-3B/generate_utils.py:297` calls positions
   "`x1,x2,y1,y2`" — that's positional-naming, not coordinate-semantic;
   the model emits x1,y1,x2,y2.
 * **Point order** is `<box><x><y></box>` (note: only two coords; the

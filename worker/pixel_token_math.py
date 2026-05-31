@@ -1,8 +1,8 @@
 """
 Pixel-to-token geometry for LocateAnything-3B.
 
-Verified against `/tmp/la3b_meta/image_processing_locateanything.py` and
-`preprocessor_config.json` (see docs/PIXEL_TO_TOKEN_MATH.md for derivation).
+Verified against `models/LocateAnything-3B/image_processing_locateanything.py`
+and `preprocessor_config.json` (see docs/PIXEL_TO_TOKEN_MATH.md for derivation).
 
 Key constants — DO NOT change unless re-verifying against the model's
 preprocessor_config.json upstream.
