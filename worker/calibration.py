@@ -6,9 +6,9 @@ fixed prompt — measures median + p95 per-frame latency, then publishes
 the median sustainable FPS. The published FPS is purely advisory; the
 server still processes every frame the client sends (no time-based drop).
 
-Calibration uses the canonical trained generation kwargs in `hybrid` mode.
-If the user has built the image with a different `LA_GEN_MODE`, we still
-calibrate `hybrid` so the numbers are comparable across builds.
+Calibration hardcodes `hybrid` mode so the numbers are comparable
+across builds regardless of which generation_mode any individual
+client picks at runtime.
 """
 
 from __future__ import annotations

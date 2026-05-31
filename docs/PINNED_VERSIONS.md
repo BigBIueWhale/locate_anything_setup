@@ -170,7 +170,6 @@ for all benchmark runs in the paper.
 | `LA_GEN_DO_SAMPLE`         | `1`               | `inference_compat.py:54`. |
 | `LA_GEN_REP_PEN`           | `1.1`             | `inference_compat.py:57`. |
 | `LA_GEN_MAX_NEW_TOKENS`    | `8192`            | README recommendation. |
-| `LA_GEN_MODE`              | `hybrid`          | Default; per-request override supported. |
 | `LA_GEN_N_FUTURE_TOKENS`   | `6`               | Trained block size (`config.json:text_config.block_size`). |
 
 The Python worker **hard-fails at boot** if any of these deviates

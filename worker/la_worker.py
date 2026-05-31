@@ -195,7 +195,6 @@ class WorkerApp:
                 "top_p":              gen.top_p,
                 "repetition_penalty": gen.repetition_penalty,
                 "max_new_tokens":     gen.max_new_tokens,
-                "generation_mode":    gen.generation_mode,
                 "n_future_tokens":    gen.n_future_tokens,
             },
             "supported_generation_modes": ["fast", "hybrid", "slow"],

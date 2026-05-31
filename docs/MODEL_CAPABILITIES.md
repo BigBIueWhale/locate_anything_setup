@@ -124,9 +124,10 @@ large. Quoted directly from paper §C.4:
 - **Detection / referring / layout** (the bulk of normal use):
   `hybrid` is the right default — the slow upside is sub-1-F1.
 
-The server's `LA_GEN_MODE=hybrid` default reflects "what to use when
-you don't know" — but every Frame's `generation_mode` field is
-required per request, so clients should select based on the task.
+Every Frame's `generation_mode` field is required per request — the
+server applies no default. Clients should pick based on the task per
+the recommendations above; `hybrid` is the safe choice when the
+workload's accuracy/throughput trade is unclear.
 
 ### A note on the attention backend
 

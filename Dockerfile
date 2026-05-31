@@ -310,7 +310,6 @@ ENV HF_HOME=/opt/locate_anything/hf_cache \
     LA_GEN_DO_SAMPLE=1 \
     LA_GEN_REP_PEN=1.1 \
     LA_GEN_MAX_NEW_TOKENS=8192 \
-    LA_GEN_MODE=hybrid \
     LA_GEN_N_FUTURE_TOKENS=6 \
     LA_INTERNAL_PORT=${LA_INTERNAL_PORT} \
     LA_IPC_SOCKET=/tmp/la.sock \

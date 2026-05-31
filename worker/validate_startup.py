@@ -221,7 +221,7 @@ def validate_env() -> None:
         "LA_MODEL_DTYPE", "LA_ATTN_IMPL",
         "LA_GEN_TEMPERATURE", "LA_GEN_TOP_P", "LA_GEN_DO_SAMPLE",
         "LA_GEN_REP_PEN", "LA_GEN_MAX_NEW_TOKENS",
-        "LA_GEN_MODE", "LA_GEN_N_FUTURE_TOKENS",
+        "LA_GEN_N_FUTURE_TOKENS",
         "LA_IPC_SOCKET",
     ]
     missing = [k for k in required if not os.environ.get(k)]
@@ -248,7 +248,6 @@ def validate_env() -> None:
         "LA_GEN_TOP_P":            "0.9",
         "LA_GEN_REP_PEN":          "1.1",
         "LA_GEN_DO_SAMPLE":        "1",
-        "LA_GEN_MODE":             "hybrid",
         "LA_GEN_N_FUTURE_TOKENS":  "6",
         "LA_GEN_MAX_NEW_TOKENS":   "8192",
         "LA_MODEL_DTYPE":          "bfloat16",
@@ -270,8 +269,8 @@ def validate_env() -> None:
               "canonical values, or accept that this is no longer "
               "'as-trained' inference and remove this check explicitly."
         )
-    ok(f"env validated; mode={os.environ['LA_GEN_MODE']}, "
-       f"attn={os.environ['LA_ATTN_IMPL']}, dtype={os.environ['LA_MODEL_DTYPE']}")
+    ok(f"env validated; attn={os.environ['LA_ATTN_IMPL']}, "
+       f"dtype={os.environ['LA_MODEL_DTYPE']}")
 
 
 def validate_preprocessor_config(model_dir: str) -> None:

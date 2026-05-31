@@ -39,11 +39,11 @@ ATTENTION:
     at training time, via PyTorch SDPA + a hand-constructed 4D
     attention mask. The result is mathematically equivalent to
     magi+hybrid within bf16 precision; only execution speed differs
-    (no fused FA-style kernel). This means `LA_ATTN_IMPL=sdpa` +
-    `LA_GEN_MODE=hybrid` preserves the train-time attention pattern,
-    train-time MTP/PBD generation behaviour, and train-time generation
-    kwargs simultaneously. It is the correct configuration, not a
-    fallback.
+    (no fused FA-style kernel). This means `LA_ATTN_IMPL=sdpa`
+    preserves the train-time attention pattern and train-time
+    generation kwargs simultaneously; combined with any per-request
+    `generation_mode`, MTP/PBD generation behaviour matches training.
+    It is the correct configuration, not a fallback.
 
 OVERRIDE MECHANICS:
     The model's custom `_autoset_attn_implementation` (modeling_qwen2.py
@@ -143,7 +143,6 @@ class GenConfig:
     repetition_penalty: float
     do_sample: bool
     max_new_tokens: int
-    generation_mode: str
     n_future_tokens: int
 
     @classmethod
@@ -161,7 +160,6 @@ class GenConfig:
             repetition_penalty=float(_require_env("LA_GEN_REP_PEN")),
             do_sample=(ds == "1"),
             max_new_tokens=int(_require_env("LA_GEN_MAX_NEW_TOKENS")),
-            generation_mode=_require_env("LA_GEN_MODE"),
             n_future_tokens=int(_require_env("LA_GEN_N_FUTURE_TOKENS")),
         )
 
