@@ -222,6 +222,24 @@ Truncation is empirically rare on the trained-budget
 `max_new_tokens=8192` (max observed output in the live drone domain:
 ~50 tokens, 99.4 % headroom).
 
+Per-item shape inside `detections` / `points`:
+
+```json
+{ "label": "drone" | null, "bbox_norm": [x1, y1, x2, y2], "bbox_px": [x1, y1, x2, y2] }   // detections[i]
+{ "label": "drone in the sky" | null, "point_norm": [x, y], "point_px": [x, y] }            // points[i]
+```
+
+`label` is the string captured by the preceding `<ref>...</ref>` tag,
+inherited across all sibling `<box>` blocks of the same ref-run (so a
+template-3 multi-instance grounding query `Locate all the instances
+that match the following description: PHRASE.` returns N detections
+all labeled `PHRASE`, mirroring NVIDIA's eval-time parser at
+`Embodied/evaluation/inference_grounding_ddp.py:379-427`). `label`
+is `null` only for bare `<box>` blocks the model emitted without
+a preceding `<ref>` (off-pattern; none of the seven canonical
+templates trains this shape). Coords are integers in `[0, 1000]`
+for `*_norm` and floats in source-image pixels for `*_px`.
+
 ### Error (Text)
 
 ```json

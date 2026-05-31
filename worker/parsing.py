@@ -5,7 +5,12 @@ The model emits 6-token blocks like:
     <box><x1><y1><x2><y2></box>            — box, 4 integer coords in [0,1000]
     <box><x><y></box>                       — point, 2 integer coords in [0,1000]
     <box>None</box>                         — per-category abstention placeholder
-    <ref>category</ref><box>...</box>       — labeled box (detection / grounding)
+    <ref>category</ref><box>...</box>       — labeled box (templates 1, 2, 5, 6)
+    <ref>phrase</ref><box>A</box><box>B</box><box>C</box>
+                                            — multi-instance grounding
+                                              (template 3): ONE <ref> followed by
+                                              N sibling <box> blocks, ALL
+                                              sharing the label
 
 The literal `None` (capital N, token id 4064 in the released checkpoint —
 verified live; NVIDIA's DATA_PREPARATION.md:143 shows lowercase `none` but the
@@ -15,6 +20,17 @@ match and is silently dropped — identical to NVIDIA's eval parser at
 /tmp/nvlabs_eagle/Embodied/evaluation/inference_grounding_ddp.py:282-300 which
 uses the same numeric-only box_pattern. The lowercase variant is also tolerated
 by `has_abstention` as a forward-compat safety net.
+
+Multi-instance grounding (template 3) emits ONE <ref> followed by N sibling
+<box> blocks; all N boxes are instances of the same phrase. Our parser mirrors
+NVIDIA's eval-time `<ref>(category)</ref>((?:<box>.*?</box>)+)` capture
+(`inference_grounding_ddp.py:390` and `inference_detection_ddp.py:282-300`) so
+every sibling box inherits the ref's label. An earlier two-pass design captured
+only the FIRST box per <ref> and returned siblings as `label=None`; that
+diverged from NVIDIA's eval and silently lost labels on multi-instance
+grounding queries (live-verified: 4 of 5 labels dropped on `Locate all the
+instances that match the following description: an object.` against
+calibration.jpg before this fix).
 
 Aggregate abstention ("the frame returned nothing usable") is derivable from
 the parse results — empty `detections` AND empty `points` ⇔ aggregate
@@ -41,14 +57,39 @@ from dataclasses import dataclass
 from typing import List, Optional
 import re
 
-# Regex for a labeled box (ref-tag preceding the box block).
-_LABELED_BOX_RE = re.compile(
+# Regex for a <ref>label</ref> ref-run followed by ONE OR MORE sibling <box>
+# blocks. Mirrors NVIDIA's eval parser at
+#   /tmp/nvlabs_eagle/Embodied/evaluation/inference_grounding_ddp.py:390
+#     ref_pattern = r'<ref>([^<]+)</ref>((?:<box>.*?</box>)+)'
+#   /tmp/nvlabs_eagle/Embodied/evaluation/inference_detection_ddp.py:282-300
+#     (same pattern; their inline example shows two boxes attributed to one ref)
+#
+# The shared-ref-multi-box shape is the TRAINED output for template 3 (phrase
+# grounding multi); see DATA_PREPARATION.md:171 verbatim:
+#     <ref>people wearing hats</ref><box><100>...</box><box><500>...</box>
+# Template 1 (closed-class detection) re-emits <ref> per box per
+# DATA_PREPARATION.md:155 so each category-group has its own <ref>X</ref>
+# followed by its own box-run — still correctly handled by this regex
+# because the lazy box-run terminates at the next <ref>. Template 5
+# (scene-text) similarly re-emits <ref>text</ref> per box per
+# DATA_PREPARATION.md:179.
+#
+# Inner pattern <box>.*?</box> is lazy (non-greedy) with re.DOTALL so it
+# matches the shortest `<box>…</box>` span possible — important when the model
+# emits per-category abstention `<box>None</box>` interspersed with real
+# boxes. _BOX_RE (the numeric-only 4-coord regex) is used to extract real
+# boxes from the captured run; `None` blocks are silently dropped because
+# they don't match _BOX_RE.
+_REF_RUN_RE = re.compile(
     r"<ref>(?P<label>[^<]*?)</ref>"
-    r"\s*<box><(?P<x1>\d+)><(?P<y1>\d+)><(?P<x2>\d+)><(?P<y2>\d+)></box>"
+    r"(?P<boxes>(?:\s*<box>.*?</box>)+)",
+    flags=re.DOTALL,
 )
-# Regex for an unlabeled box.
+# Regex for a single <box>...</box> with exactly 4 numeric coords.
+# Used both standalone (orphan-box pass-2 fallback) and inside the captured
+# boxes group of _REF_RUN_RE.
 _BOX_RE = re.compile(r"<box><(\d+)><(\d+)><(\d+)><(\d+)></box>")
-# Regex for a point.
+# Regex for a single <box>...</box> with exactly 2 numeric coords (point).
 _POINT_RE = re.compile(r"<box><(\d+)><(\d+)></box>")
 # Regex for explicit None abstention. The model emits capital-N `None` (mirroring
 # the Python literal); we also accept lowercase as a forward-compat safety net.
@@ -89,24 +130,35 @@ def parse_boxes(answer: str, image_width: int, image_height: int) -> List[Detect
     actually saw (post-resize). Because the model's resize preserves
     aspect ratio and is uniform in x and y, the same [0,1000]→[0,W] map
     works for either dst or src, so passing src dims is correct.
+
+    Two-pass design:
+      (1) Find each <ref>label</ref> ref-run via _REF_RUN_RE. For each run,
+          extract every valid 4-coord <box> inside via _BOX_RE, attributing
+          all of them to the run's label. This is the shape NVIDIA trained
+          on for templates 1-6 (one <ref> followed by ≥1 siblings; template 3
+          is the only one that legitimately emits multiple siblings).
+      (2) Find orphan <box> blocks — boxes whose span does NOT overlap any
+          ref-run from pass 1. Attribute them as label=None. None of the
+          seven canonical templates emit bare boxes, but we accept them
+          defensively for off-pattern model output.
+
+    Interval-overlap check: `a.start < b.end AND b.start < a.end`.
     """
     out: List[Detection] = []
     consumed_intervals: List[tuple] = []
 
-    # Pass 1: labeled boxes. Track each match's (start, end) so pass 2
-    # can skip any unlabeled-box match whose <box>…</box> span falls
-    # inside a labeled one (the labeled regex always consumes a strict
-    # superset starting at <ref>).
-    for m in _LABELED_BOX_RE.finditer(answer):
+    # Pass 1: each <ref>…</ref><box>…</box>[<box>…</box>…] run emits one
+    # Detection per VALID box inside the run, ALL sharing the ref's label.
+    for m in _REF_RUN_RE.finditer(answer):
         consumed_intervals.append(m.span())
-        x1, y1, x2, y2 = (int(m.group(k)) for k in ("x1", "y1", "x2", "y2"))
-        if not _coord_valid(x1, y1, x2, y2):
-            continue
-        out.append(_make_box(m.group("label").strip() or None,
-                             x1, y1, x2, y2, image_width, image_height))
+        label = m.group("label").strip() or None
+        for bm in _BOX_RE.finditer(m.group("boxes")):
+            x1, y1, x2, y2 = (int(bm.group(k)) for k in (1, 2, 3, 4))
+            if _coord_valid(x1, y1, x2, y2):
+                out.append(_make_box(label, x1, y1, x2, y2,
+                                     image_width, image_height))
 
-    # Pass 2: unlabeled boxes — only those whose span does NOT overlap
-    # any pass-1 span. Interval overlap is `a.start < b.end and b.start < a.end`.
+    # Pass 2: orphan boxes — boxes whose span does NOT overlap any ref-run.
     for m in _BOX_RE.finditer(answer):
         s, e = m.span()
         if any(s < ie and is_ < e for (is_, ie) in consumed_intervals):
@@ -122,21 +174,69 @@ def parse_boxes(answer: str, image_width: int, image_height: int) -> List[Detect
 def parse_points(answer: str, image_width: int, image_height: int) -> List[Point]:
     """Parse <box><x><y></box> point blocks. Two coords only.
 
-    The point regex `<box><(\\d+)><(\\d+)></box>` would otherwise match
-    spurious "point" blocks inside any 4-coord box (`<box><x1><y1>` is
-    a prefix of `<box><x1><y1><x2><y2>`). We therefore filter out any
-    point whose span overlaps a labeled or unlabeled box span. This
-    mirrors the dedup pattern in parse_boxes.
+    Mirrors NVIDIA's eval-time parser at
+    /tmp/nvlabs_eagle/Embodied/evaluation/inference_grounding_ddp.py:564-587
+    which runs BOTH a point_pattern AND a box_pattern over each captured
+    ref-run, attaching the run's category to every match.
+
+    Two-pass design:
+      (1) For each <ref>label</ref><box>...</box>... ref-run, extract every
+          valid 2-coord <box> inside via _POINT_RE, attributing them to the
+          run's label. Template 7 (`Point to: PHRASE.`) emits this shape:
+          `<ref>PHRASE</ref><box><x><y></box>` — single labeled point per
+          query, verified live in earlier audits.
+      (2) Orphan points — 2-coord blocks not inside any ref-run and not
+          shadowed by a 4-coord box span. These get label=None. The model
+          can also emit bare points without a <ref> prefix.
+
+    De-dup rule: a 2-coord <box><x><y></box> is a strict substring of the
+    `<box><x><y>...` prefix of any 4-coord box, but _POINT_RE requires
+    `</box>` immediately after the 2nd coord, so it can never spuriously
+    match inside a real 4-coord block's text. We still dedup against
+    _BOX_RE spans defensively — and we dedup pass-2 against pass-1's
+    point spans to avoid double-counting points that live inside ref-runs.
+
+    Critically, we do NOT dedup against _REF_RUN_RE spans whole — the
+    ref-run span contains the box content, and for template 7 the box
+    content IS the point we want to extract.
     """
-    consumed_intervals: List[tuple] = [
-        m.span() for m in _LABELED_BOX_RE.finditer(answer)
-    ] + [
-        m.span() for m in _BOX_RE.finditer(answer)
-    ]
+    box_spans: List[tuple] = [m.span() for m in _BOX_RE.finditer(answer)]
     out: List[Point] = []
+    consumed_point_spans: List[tuple] = []
+
+    # Pass 1: labeled points inside <ref>...</ref><box>...</box>... ref-runs.
+    for m in _REF_RUN_RE.finditer(answer):
+        label = m.group("label").strip() or None
+        boxes_text = m.group("boxes")
+        boxes_offset = m.start("boxes")
+        for pm in _POINT_RE.finditer(boxes_text):
+            abs_start = boxes_offset + pm.start()
+            abs_end   = boxes_offset + pm.end()
+            # Skip if this 2-coord match overlaps a real 4-coord box span.
+            # (Cannot happen in practice — _POINT_RE requires </box> after
+            # 2nd coord — but defensive against future regex relaxation.)
+            if any(abs_start < ie and bs < abs_end for (bs, ie) in box_spans):
+                continue
+            x, y = int(pm.group(1)), int(pm.group(2))
+            if not (0 <= x <= 1000 and 0 <= y <= 1000):
+                continue
+            out.append(
+                Point(
+                    label=label,
+                    point_norm=[x, y],
+                    point_px=[round(x / 1000.0 * image_width, 2),
+                              round(y / 1000.0 * image_height, 2)],
+                )
+            )
+            consumed_point_spans.append((abs_start, abs_end))
+
+    # Pass 2: orphan points — 2-coord blocks not inside any 4-coord box
+    # and not already emitted by pass 1.
     for m in _POINT_RE.finditer(answer):
         s, e = m.span()
-        if any(s < ie and is_ < e for (is_, ie) in consumed_intervals):
+        if any(s < ie and bs < e for (bs, ie) in box_spans):
+            continue
+        if any(s < ie and cs < e for (cs, ie) in consumed_point_spans):
             continue
         x, y = int(m.group(1)), int(m.group(2))
         if not (0 <= x <= 1000 and 0 <= y <= 1000):
