@@ -41,7 +41,15 @@ pub const GUI_BOX_PREFIX:        &str = "Locate the region that matches the foll
 pub const POINT_PREFIX:          &str = "Point to: ";
 
 /// JSON dump used by `la_server --print-canonical-templates` for the
-/// boot-time drift check against worker/prompts.py.
+/// boot-time drift check against worker/prompts.py. The Python side's
+/// `prompts.CANONICAL_TEMPLATES` dict must match this object exactly
+/// (dict-equality); a mismatch in any key causes the worker to refuse
+/// to start (worker/validate_startup.py::validate_prompt_template_drift).
+///
+/// `template_wire_names` enumerates the seven stable enum strings used
+/// for the per-request `prompt_task` field (Rust→Python IPC + client-
+/// facing Result body). Listed in TemplateKind declaration order, which
+/// is also the order they appear in worker/prompts.py's TEMPLATE_WIRE_NAMES.
 pub fn canonical_templates_json() -> serde_json::Value {
     serde_json::json!({
         "category_separator":    CATEGORY_SEPARATOR,
@@ -52,6 +60,15 @@ pub fn canonical_templates_json() -> serde_json::Value {
         "scene_text_exact":      SCENE_TEXT_EXACT,
         "gui_box_prefix":        GUI_BOX_PREFIX,
         "point_prefix":          POINT_PREFIX,
+        "template_wire_names": [
+            TemplateKind::Detection.wire_name(),
+            TemplateKind::PhraseSingle.wire_name(),
+            TemplateKind::PhraseMulti.wire_name(),
+            TemplateKind::TextGrounding.wire_name(),
+            TemplateKind::SceneText.wire_name(),
+            TemplateKind::GuiBox.wire_name(),
+            TemplateKind::Point.wire_name(),
+        ],
     })
 }
 
@@ -95,6 +112,24 @@ impl TemplateKind {
             TemplateKind::SceneText     => SCENE_TEXT_EXACT,
             TemplateKind::GuiBox        => "Locate the region that matches the following description: [PHRASE].",
             TemplateKind::Point         => "Point to: [PHRASE].",
+        }
+    }
+
+    /// Stable enum-string used for the per-request `prompt_task` field
+    /// on the Rust→Python IPC header AND surfaced verbatim in the
+    /// client-facing Result body. Must match the keys of
+    /// worker/inference.py::EXPECTED_SHAPE exactly — drift detected at
+    /// boot by worker/validate_startup.py::validate_prompt_template_drift
+    /// via the `template_wire_names` list in canonical_templates_json().
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            TemplateKind::Detection     => "detection",
+            TemplateKind::PhraseSingle  => "phrase_single",
+            TemplateKind::PhraseMulti   => "phrase_multi",
+            TemplateKind::TextGrounding => "text_grounding",
+            TemplateKind::SceneText     => "scene_text",
+            TemplateKind::GuiBox        => "gui_box",
+            TemplateKind::Point         => "point",
         }
     }
 }

@@ -20,6 +20,7 @@ import time
 
 from .inference import LocateAnythingInference
 from .parsing import has_abstention
+from . import prompts
 
 
 @dataclass(frozen=True)
@@ -81,9 +82,18 @@ def calibrate(
     if n_runs < 1:
         raise ValueError(f"n_runs={n_runs} must be ≥ 1")
 
+    # Classify the calibration prompt once; engine.run() requires the
+    # wire name as a positional arg now (post-prompt_task enforcement).
+    # The Rust validator does the same classification at request time;
+    # this is the in-process Python mirror via prompts.classify_prompt
+    # (raises if the prompt isn't one of the seven canonical templates,
+    # caught early at boot rather than per-request).
+    test_prompt_task = prompts.classify_prompt(test_prompt)
+
     # Warm-up: first inference triggers extra JIT / cuDNN autotune overhead.
     print(f"[calibrate] warmup run on {p}", flush=True)
-    warm = engine.run(jpeg, test_prompt, generation_mode="hybrid")
+    warm = engine.run(jpeg, test_prompt, generation_mode="hybrid",
+                      prompt_task=test_prompt_task)
     # The default calibration target is a real drone JPEG + `point_to`
     # drone prompt (see `worker/la_worker.py` argparse defaults) so the
     # published `median_fps` is workload-representative. Whether the
@@ -123,7 +133,8 @@ def calibrate(
     latencies_ms: List[float] = []
     for i in range(n_runs):
         t0 = time.perf_counter()
-        result = engine.run(jpeg, test_prompt, generation_mode="hybrid")
+        result = engine.run(jpeg, test_prompt, generation_mode="hybrid",
+                            prompt_task=test_prompt_task)
         t1 = time.perf_counter()
         latencies_ms.append((t1 - t0) * 1000.0)
         print(f"[calibrate] run {i+1}/{n_runs}: {latencies_ms[-1]:.1f} ms, "

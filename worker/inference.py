@@ -544,6 +544,42 @@ def _patch_vit_sdpa_to_mem_efficient() -> None:
 
 
 
+# Map of `prompt_task` wire name → expected response shape. The model
+# was trained on a strict template → shape mapping (see worker/prompts.py
+# module docstring): templates 1-6 emit 4-coord boxes; template 7 emits
+# 2-coord points. The Rust validator at rust_server/src/prompt_validator
+# .rs classifies every accepted prompt into one of these seven wire names
+# and forwards it through the IPC header as `prompt_task`. `run()` uses
+# this map to DROP off-shape parse output before stamping the response:
+# a 4-coord box that escapes through a Point prompt's response (or a
+# 2-coord point that escapes through a detection prompt's response) is
+# by-definition off-distribution and silently lands in the wrong field
+# without enforcement.
+#
+# Empirically the model NEVER emits off-shape at trained sampling params:
+# the R6 audit measured 0/3,444 cross-shape events across all 7 templates
+# × adversarial prompts (including "Point to: bounding box around the
+# drone."). Enforcement is therefore a forward-compat guard rail, not a
+# correctness fix — but it is principle-aligned with "use the model the
+# way it was trained" by surfacing-as-empty any model deviation rather
+# than letting the off-shape result silently leak into the wrong field.
+#
+# Keys MUST equal worker/prompts.py::TEMPLATE_WIRE_NAMES AND the wire
+# names in rust_server/src/prompt_validator.rs::TemplateKind::wire_name;
+# the boot drift check at worker/validate_startup.py::
+# validate_prompt_template_drift fails the container start on any
+# mismatch.
+EXPECTED_SHAPE = {
+    "detection":      "box",
+    "phrase_single":  "box",
+    "phrase_multi":   "box",
+    "text_grounding": "box",
+    "scene_text":     "box",
+    "gui_box":        "box",
+    "point":          "point",
+}
+
+
 @dataclass
 class InferenceResult:
     raw_answer: str
@@ -572,6 +608,15 @@ class InferenceResult:
     # the implicit-only signal as a typed boolean so clients no longer
     # need to substring-check raw_text themselves.
     model_output_truncated: bool
+    # Wire name of the canonical template the prompt was classified as
+    # by the Rust validator (one of EXPECTED_SHAPE.keys()). Echoed in
+    # the client-facing Result body so the client can branch on the
+    # authoritative field WITHOUT re-classifying the prompt themselves:
+    # for `prompt_task == "point"` look at `points[]`; for any other
+    # wire name look at `detections[]`. Per the trained task→shape
+    # contract, the OTHER list is always empty (off-shape outputs are
+    # filtered before this object is constructed; see run()).
+    prompt_task: str
     latency_ms: float
     image_size: tuple
     resize_plan: dict
@@ -718,8 +763,15 @@ class LocateAnythingInference:
         jpeg_bytes: bytes,
         prompt: str,
         generation_mode: str,
+        prompt_task: str,
     ) -> InferenceResult:
-        """Run one inference. `generation_mode` is REQUIRED; no default.
+        """Run one inference. `generation_mode` and `prompt_task` are
+        REQUIRED; no defaults.
+
+        `prompt_task` is the wire name of the canonical template the
+        prompt was classified as (Rust validator output forwarded through
+        the IPC header; see EXPECTED_SHAPE for valid values). Used to
+        drop off-shape model output per the trained task→shape contract.
 
         JPEG decoded inside this method — Python's PIL is the canonical
         decoder for the LocateAnything image processor.
@@ -729,6 +781,16 @@ class LocateAnythingInference:
                 "prompt must be a non-empty string. See worker/prompts.py "
                 "(the single source of truth for the seven canonical "
                 "LocateAnything-3B prompt templates) for the canonical forms."
+            )
+        if not isinstance(prompt_task, str) or prompt_task not in EXPECTED_SHAPE:
+            raise ValueError(
+                f"prompt_task={prompt_task!r} is not one of the canonical "
+                f"wire names {sorted(EXPECTED_SHAPE.keys())!r}. The Rust "
+                "frontend should classify every accepted prompt into one "
+                "of these values via prompt_validator::TemplateKind::"
+                "wire_name and forward it through the IPC header — "
+                "receiving an unknown value here means the upstream "
+                "contract was violated."
             )
         if not isinstance(jpeg_bytes, (bytes, bytearray)) or not jpeg_bytes:
             raise ValueError("jpeg_bytes must be non-empty bytes")
@@ -955,6 +1017,21 @@ class LocateAnythingInference:
 
         detections = [d.to_json() for d in parse_boxes(answer, image.width, image.height)]
         points     = [p.to_json() for p in parse_points(answer, image.width, image.height)]
+        # Trained task→shape enforcement. The model was supervised on
+        # template 7 → 2-coord points and templates 1-6 → 4-coord boxes;
+        # any off-shape output is by-definition off-distribution. R6
+        # measured 0/3,444 cross-shape events on the trained sampling
+        # params, so this filter never throws away legitimate model
+        # output today — but its existence converts a hypothetical
+        # future model regression from a silent-wrong-field-filled bug
+        # into a clean "off-shape data dropped, response is empty"
+        # signal that the existing `abstained` field then surfaces. See
+        # EXPECTED_SHAPE module docstring for the full contract.
+        expected = EXPECTED_SHAPE[prompt_task]
+        if expected == "point":
+            detections = []
+        elif expected == "box":
+            points = []
         return InferenceResult(
             raw_answer=answer,
             detections=detections,
@@ -976,6 +1053,7 @@ class LocateAnythingInference:
             # for the dependency on modeling_locateanything.py:464,500-501
             # (the loop exits only on <|im_end|> OR budget exhaustion).
             model_output_truncated=not answer.endswith("<|im_end|>"),
+            prompt_task=prompt_task,
             latency_ms=latency_ms,
             image_size=(image.width, image.height),
             resize_plan={

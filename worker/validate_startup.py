@@ -437,6 +437,46 @@ def validate_prompt_template_drift() -> None:
         f"({len(py_constants)} entries)"
     )
 
+    # Additional cross-check: worker/inference.py::EXPECTED_SHAPE keys
+    # must equal the wire-name set. This catches the case where
+    # someone modifies EXPECTED_SHAPE without also updating the
+    # canonical TEMPLATE_WIRE_NAMES (and therefore failing the dict
+    # equality above). The dict comparison above already enforces
+    # Rust↔Python on `template_wire_names`; this final check completes
+    # the chain by also enforcing inference.py↔prompts.py.
+    from . import inference
+    expected_shape_keys = set(inference.EXPECTED_SHAPE.keys())
+    wire_name_set       = set(prompts.TEMPLATE_WIRE_NAMES)
+    if expected_shape_keys != wire_name_set:
+        only_in_expected = sorted(expected_shape_keys - wire_name_set)
+        only_in_wire     = sorted(wire_name_set - expected_shape_keys)
+        parts = [
+            "prompt_task wire-name DRIFT between worker/inference.py::"
+            "EXPECTED_SHAPE and worker/prompts.py::TEMPLATE_WIRE_NAMES:"
+        ]
+        if only_in_expected:
+            parts.append(
+                f"  In EXPECTED_SHAPE but not in TEMPLATE_WIRE_NAMES: "
+                f"{only_in_expected}"
+            )
+        if only_in_wire:
+            parts.append(
+                f"  In TEMPLATE_WIRE_NAMES but not in EXPECTED_SHAPE: "
+                f"{only_in_wire}"
+            )
+        parts.append(
+            "Update one or both so the set of wire names is identical. "
+            "The Rust validator's TemplateKind::wire_name has already "
+            "been verified in lockstep with prompts.TEMPLATE_WIRE_NAMES "
+            "via the dict equality above, so any divergence here is "
+            "between the two Python modules only."
+        )
+        fail("\n".join(parts))
+    ok(
+        f"EXPECTED_SHAPE keys verified equal to TEMPLATE_WIRE_NAMES "
+        f"({len(expected_shape_keys)} entries)"
+    )
+
 
 def run_all(model_dir: str) -> None:
     validate_env()

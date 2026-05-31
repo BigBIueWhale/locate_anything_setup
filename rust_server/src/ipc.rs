@@ -57,15 +57,25 @@ impl WorkerConn {
     /// The `Ok` variants both carry a body the WS handler forwards verbatim
     /// (after stamping `type` + `frame_id`); only `Err` is a transport
     /// failure that should close the WS — the framed UDS may have desynced.
+    ///
+    /// `prompt_task` is the wire name of the canonical template the prompt
+    /// was classified as (see `prompt_validator::TemplateKind::wire_name`).
+    /// It is forwarded to the worker so the parser can drop off-shape
+    /// output per the trained task→shape contract (e.g. a 4-coord box
+    /// returned for a Point template is dropped before reaching the
+    /// client). This is NOT exposed in the client-facing InferHeader
+    /// schema — it is derived server-side from the validated prompt.
     pub async fn infer(
         &mut self,
         header: &InferHeader,
         jpeg: Bytes,
+        prompt_task: &'static str,
     ) -> Result<InferOutcome, ServerError> {
         let header_json = serde_json::to_string(&serde_json::json!({
             "kind":            "frame",
             "frame_id":        &header.frame_id,
             "prompt":          &header.prompt,
+            "prompt_task":     prompt_task,
             "generation_mode": &header.generation_mode,
             "jpeg_len":        header.jpeg_len,
         })).map_err(|e| {

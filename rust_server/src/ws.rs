@@ -168,7 +168,9 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
         // type + frame_id stamped on. A transport error closes the WS
         // because the framed UDS may now be desynced.
         let frame_id = pending.header.frame_id.clone();
-        let payload = match conn.infer(&pending.header, pending.jpeg).await {
+        let payload = match conn.infer(
+            &pending.header, pending.jpeg, pending.prompt_task.wire_name(),
+        ).await {
             Ok(InferOutcome::Success(v))     => stamp_response(v, "result", &frame_id),
             Ok(InferOutcome::WorkerError(v)) => stamp_response(v, "error",  &frame_id),
             Err(e) => {
@@ -189,6 +191,11 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
 struct PendingFrame {
     header: InferHeader,
     jpeg: Bytes,
+    /// The validated template kind, carried separately from the InferHeader
+    /// (which is the public client-facing schema). Forwarded to the worker
+    /// as the IPC header's `prompt_task` field for trained-correct
+    /// task→shape filter enforcement. See `prompt_validator::TemplateKind`.
+    prompt_task: prompt_validator::TemplateKind,
 }
 
 /// The three possible outcomes of binary-frame parsing/validation.
@@ -273,14 +280,22 @@ async fn process_binary(
     // ---- 4. Strict trained-correct prompt-template validation. The
     //         validator itself handles empty / length / template / slot
     //         checks and produces an English diagnostic that points the
-    //         client at the canonical-reference URL. -------------------
-    if let Err(e) = prompt_validator::validate(&header.prompt) {
-        return BinaryOutcome::PerFrame {
-            frame_id,
-            code: 400,
-            message: format!("header.prompt rejected: {}", e.message()),
-        };
-    }
+    //         client at the canonical-reference URL. The returned
+    //         TemplateKind is forwarded to the worker as `prompt_task`
+    //         so the parser can drop off-shape model output per the
+    //         trained task→shape contract (see prompt_validator::
+    //         TemplateKind::wire_name + worker/inference.py::
+    //         EXPECTED_SHAPE). -----------------------------------------
+    let prompt_task = match prompt_validator::validate(&header.prompt) {
+        Ok(kind) => kind,
+        Err(e) => {
+            return BinaryOutcome::PerFrame {
+                frame_id,
+                code: 400,
+                message: format!("header.prompt rejected: {}", e.message()),
+            };
+        }
+    };
     // Defense-in-depth: even though prompt_validator already enforces a
     // character cap matching MAX_PROMPT_CHARS, keep the explicit check
     // here in case the validator's cap ever loosens — these are two
@@ -475,7 +490,7 @@ async fn process_binary(
         };
     }
 
-    BinaryOutcome::Pending(PendingFrame { header, jpeg })
+    BinaryOutcome::Pending(PendingFrame { header, jpeg, prompt_task })
 }
 
 /// Add the canonical `type` and `frame_id` keys to a worker response and

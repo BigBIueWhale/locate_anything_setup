@@ -110,6 +110,25 @@ CANONICAL_RENDERED_SUFFIX = (
 )
 
 
+# Stable enum-string per template, used for the per-request `prompt_task`
+# field on the Rust→Python IPC header AND surfaced verbatim in the client-
+# facing Result body. Order must match
+# `rust_server/src/prompt_validator.rs::TemplateKind` declaration order
+# AND the keys of `worker/inference.py::EXPECTED_SHAPE`; the boot drift
+# check (worker/validate_startup.py::validate_prompt_template_drift)
+# enforces both equalities so a future rename on either side fails the
+# container start.
+TEMPLATE_WIRE_NAMES = [
+    "detection",
+    "phrase_single",
+    "phrase_multi",
+    "text_grounding",
+    "scene_text",
+    "gui_box",
+    "point",
+]
+
+
 # Aggregated for the boot-time drift check (Python ↔ Rust). The Rust binary
 # emits its embedded constants via `la_server --print-canonical-templates`;
 # we compare the JSON output against this dict.
@@ -122,6 +141,7 @@ CANONICAL_TEMPLATES = {
     "scene_text_exact":      SCENE_TEXT_EXACT,
     "gui_box_prefix":        GUI_BOX_PREFIX,
     "point_prefix":          POINT_PREFIX,
+    "template_wire_names":   TEMPLATE_WIRE_NAMES,
 }
 
 
@@ -192,6 +212,41 @@ def point_to(phrase: str) -> str:
     if not phrase or not phrase.strip():
         raise ValueError("point_to requires a non-empty phrase")
     return f"{POINT_PREFIX}{phrase.strip()}."
+
+
+def classify_prompt(prompt: str) -> str:
+    """Classify a canonical prompt string into its `prompt_task` wire name
+    (one of TEMPLATE_WIRE_NAMES). This is the Python mirror of the Rust
+    validator's classification step at
+    `rust_server/src/prompt_validator.rs::validate()` — used by
+    `worker/calibration.py` and other internal call sites that need the
+    wire name but don't go through the WebSocket path (where the Rust
+    validator already classifies).
+
+    Strict: raises ValueError if `prompt` doesn't start with one of the
+    canonical prefixes. Prefix matching is byte-exact — the
+    `matches`/`match` and `description: ` distinctions are load-bearing.
+    The boot drift check ensures the wire names returned here remain
+    in lockstep with the Rust validator's `TemplateKind::wire_name`.
+    """
+    if prompt == SCENE_TEXT_EXACT:
+        return "scene_text"
+    if prompt.startswith(DETECTION_PREFIX):
+        return "detection"
+    if prompt.startswith(SINGLE_PHRASE_PREFIX):
+        return "phrase_single"
+    if prompt.startswith(MULTI_PHRASE_PREFIX):
+        return "phrase_multi"
+    if prompt.startswith(TEXT_GROUNDING_PREFIX):
+        return "text_grounding"
+    if prompt.startswith(GUI_BOX_PREFIX):
+        return "gui_box"
+    if prompt.startswith(POINT_PREFIX):
+        return "point"
+    raise ValueError(
+        f"prompt does not match any of the seven canonical LocateAnything-3B "
+        f"template prefixes (see {CANONICAL_REFERENCE_URL}): {prompt!r}"
+    )
 
 
 # ===========================================================================

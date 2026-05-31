@@ -192,11 +192,12 @@ what NVIDIA does at training time).
 {
   "type":        "result",
   "frame_id":    "f-000142",
-  "raw_text":    "<box><420><510><560><640></box>",
-  "detections":  [],
+  "raw_text":    "<ref>drone</ref><box><420><510><560><640></box><|im_end|>",
+  "detections":  [{"label": "drone", "bbox_norm": [420,510,560,640], "bbox_px": [806.4, 550.8, 1075.2, 691.2]}],
   "points":      [],
   "abstained":   false,
   "model_output_truncated": false,
+  "prompt_task": "detection",
   "image_size":  [1920, 1080],
   "resize_plan": { "dst_w": 1932, "dst_h": 1092, "n_llm_tokens": 2691, "scale": 1.006 },
   "generation_mode_used": "slow",
@@ -204,6 +205,19 @@ what NVIDIA does at training time).
   "total_ms":    821.0
 }
 ```
+
+`prompt_task` is the wire name of the canonical template the server
+classified the prompt as — one of `"detection"`, `"phrase_single"`,
+`"phrase_multi"`, `"text_grounding"`, `"scene_text"`, `"gui_box"`,
+`"point"`. The mapping to response shape is fixed by NVIDIA's
+training: `"point"` → 2-coord points in `points[]` (with `detections`
+guaranteed empty); every other value → 4-coord boxes in `detections[]`
+(with `points` guaranteed empty). The server enforces this by filtering
+off-shape model output before stamping the response, so a naive client
+can branch on `prompt_task` alone without inspecting both lists. Any
+off-shape model output is dropped (R6 audit measured 0 / 3,444 cross-
+shape events at trained sampling params, so the filter is a forward-
+compat guard rail rather than a frequent rejection path).
 
 `raw_text` carries the full decoded model output including structural
 tokens (`<box>`, `<ref>`, `<0>`..`<1000>`) and the trailing

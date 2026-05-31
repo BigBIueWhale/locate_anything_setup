@@ -387,7 +387,7 @@ class WorkerApp:
         # SOI marker. We re-validate here as defense in depth: this worker is
         # also reachable by anything inside the container that can touch
         # /tmp/la.sock.
-        for key in ("prompt", "generation_mode", "frame_id"):
+        for key in ("prompt", "generation_mode", "frame_id", "prompt_task"):
             if key not in header:
                 raise ValueError(
                     f"header.{key} missing. The Rust frontend should have "
@@ -444,10 +444,11 @@ class WorkerApp:
         # executing engine.run because Python provides no mechanism to
         # cancel a thread inside a CUDA C call — the orphan dies with the
         # process when _hard_exit_for_restart calls os._exit.
+        prompt_task = header["prompt_task"]
         async with self.lock:
             t0 = time.perf_counter()
             result = await asyncio.wait_for(
-                asyncio.to_thread(self.engine.run, jpeg, prompt, mode),
+                asyncio.to_thread(self.engine.run, jpeg, prompt, mode, prompt_task),
                 timeout=LA_INFERENCE_TIMEOUT_S,
             )
             total_ms = (time.perf_counter() - t0) * 1000.0
@@ -459,6 +460,12 @@ class WorkerApp:
             "detections":    result.detections,
             "points":        result.points,
             "abstained":     result.abstained,
+            # Wire name of the canonical template the prompt was
+            # classified as by the Rust validator. Echoed to the client
+            # so they can branch on `prompt_task == "point"` (→ read
+            # `points[]`) vs any other value (→ read `detections[]`)
+            # without re-classifying the prompt themselves.
+            "prompt_task":   result.prompt_task,
             # True iff `raw_text` does NOT end with the model's <|im_end|>
             # end-of-turn marker, meaning the custom .generate() loop
             # terminated because max_new_tokens was reached, NOT because
