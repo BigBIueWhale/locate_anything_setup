@@ -196,6 +196,7 @@ what NVIDIA does at training time).
   "detections":  [],
   "points":      [],
   "abstained":   false,
+  "model_output_truncated": false,
   "image_size":  [1920, 1080],
   "resize_plan": { "dst_w": 1932, "dst_h": 1092, "n_llm_tokens": 2691, "scale": 1.006 },
   "generation_mode_used": "slow",
@@ -206,21 +207,23 @@ what NVIDIA does at training time).
 
 `raw_text` carries the full decoded model output including structural
 tokens (`<box>`, `<ref>`, `<0>`..`<1000>`) and the trailing
-`<|im_end|>` end-of-turn marker. If `raw_text` does NOT end with
-`<|im_end|>`, the `max_new_tokens` budget was exhausted mid-emission
-and the response is truncated — `detections` / `points` will be
-missing any block whose closing `</box>` did not fit. The model's
-custom `.generate()` loop at
-`models/LocateAnything-3B/modeling_locateanything.py:464,500-501`
-terminates exclusively on `<|im_end|>` OR budget exhaustion, so the
-two cases are distinguishable from the trailing token alone. Partial
-blocks are silently dropped at the parser layer — this matches
-NVIDIA's own evaluation behaviour
+`<|im_end|>` end-of-turn marker. The model's custom `.generate()` loop
+at `models/LocateAnything-3B/modeling_locateanything.py:464,500-501`
+terminates exclusively on `<|im_end|>` OR `max_new_tokens=8192`
+exhaustion — these are the ONLY two exit reasons.
+
+`model_output_truncated: true` exactly captures the budget-exhaustion
+case (`not raw_text.endswith("<|im_end|>")`). When it fires, the
+response is necessarily incomplete — any block whose closing `</box>`
+did not fit is silently dropped at the parser layer. Partial blocks
+are dropped to match NVIDIA's own evaluation behaviour
 (`Embodied/evaluation/inference_grounding_ddp.py:282-300` requires
 the full 4-coord shape; partials never enter their metrics either).
 Truncation is empirically rare on the trained-budget
 `max_new_tokens=8192` (max observed output in the live drone domain:
-~50 tokens, 99.4 % headroom).
+~50 tokens, 99.4 % headroom; the only realistic trigger is dense-scene
+scene-text detection on hundreds of distinct text regions, ~273 s in
+slow mode).
 
 Per-item shape inside `detections` / `points`:
 
@@ -258,14 +261,25 @@ class is the server's. The body always echoes the originating
 ### Two error surfaces — and only two
 
 * `type:"error"` JSON message — per-frame failure where the framing is
-  still intact (prompt too long, CUDA OOM inside `.generate()`, etc.).
-  The WebSocket stays open and the next Frame proceeds normally.
+  still intact (prompt validation rejection, JPEG malformed, image
+  dimensions out of range, generation_mode unknown, etc.). For most
+  per-frame errors the WebSocket stays open and the next Frame
+  proceeds normally. **Two exceptions**: `code:504` (inference
+  timeout — exceeded `LA_INFERENCE_TIMEOUT_S`, default 600 s) and
+  `code:500` with `message` starting `"CUDA out of memory"` are
+  followed *immediately* by a `Close(1011)` because the worker
+  self-exits to restore CUDA state from scratch. The typed error
+  reaches the client first (the worker awaits the UDS write before
+  calling `os._exit`), then the Close. Reconnect after ~10–15 s
+  (model reload + boot self-test); see
+  [`docs/OPERATIONS.md`](./OPERATIONS.md#worker-self-exit-on-timeout--oom).
 * WebSocket Close frame — connection-fatal: framing wrong, header JSON
-  malformed, JPEG SOI absent, or the worker UDS desynced. Common
-  codes: `1001` going away (server shutdown / 60 s read-idle), `1008`
-  policy violation (framing/header/JPEG validation), `1011` server
-  error (worker unreachable / UDS desynced). The reason names the
-  condition.
+  malformed, JPEG SOI absent, the worker UDS desynced, or the worker
+  self-exited per the rule above. Common codes: `1001` going away
+  (server shutdown / 60 s read-idle), `1008` policy violation
+  (framing/header/JPEG validation), `1011` server error (worker
+  unreachable / worker self-exited for restart). The reason names
+  the condition.
 
 ### Reconnection
 

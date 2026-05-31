@@ -37,6 +37,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
+import torch  # only used at module level for torch.OutOfMemoryError catch
 # We import these eagerly so torch/transformers initialization happens
 # during the visible startup phase, not on the first request.
 from . import validate_startup
@@ -49,6 +50,82 @@ from . import prompts
 LOG_FMT = "%(asctime)s %(levelname)s [worker] %(message)s"
 logging.basicConfig(level=logging.INFO, format=LOG_FMT, stream=sys.stdout)
 log = logging.getLogger("la_worker")
+
+
+# -------------------------------------------------------------------------
+# Hard-recovery contract (worker self-exit → container restart)
+# -------------------------------------------------------------------------
+#
+# Two server-side failure modes are designed to fail loud rather than
+# silently degrade:
+#
+#   1. Per-frame inference timeout. We wrap the engine.run call in
+#      asyncio.wait_for(LA_INFERENCE_TIMEOUT_S=600s). On expiry:
+#      asyncio.TimeoutError is raised, the asyncio.Lock IS released, BUT
+#      the underlying thread keeps running. CPython provides no mechanism
+#      to cancel a thread inside a non-Python C/CUDA frame holding the
+#      GIL — verified empirically in the R2 design audit. The only
+#      correct recovery is process exit: the orphan thread dies with the
+#      process, the next container has fresh CUDA state.
+#
+#      The 600 s default is derived from the theoretical maximum legitimate
+#      inference latency: `max_new_tokens(8192) / observed-min-tps(slow
+#      ~30 tps) + prefill_max + 2× safety margin ≈ 600 s`. The R2
+#      empirical study measured max 273 s on a synthetic 80×80 dense-
+#      text-grid hitting max_new_tokens; 600 s leaves ample margin so
+#      legitimate workloads are never falsely killed. The wedge-detection
+#      latency (up to 600 s before recovery) is the principled trade
+#      against any false-positive risk — per project principle
+#      "correctness over speed-of-wedge-detection".
+#
+#   2. CUDA OutOfMemoryError. PyTorch's caching allocator IS empirically
+#      stable across repeated OOMs with PYTORCH_CUDA_ALLOC_CONF=
+#      expandable_segments:True (R4 study verified 10 forced OOMs left
+#      allocator state identical). But empirical stability ≠ provable
+#      correctness; the principled choice per "no fallbacks, no half-
+#      finished implementations" is to exit so the next frame runs
+#      against a fresh CUDA context.
+#
+# Both paths call os._exit(WORKER_RESTART_EXIT_CODE). entrypoint.sh's
+# `wait -n` returns this status; the script propagates it as the
+# container exit code; Docker `--restart unless-stopped` restarts the
+# container with the same image. Typical visible gap: ~10–15 s
+# (model reload + boot drift check + drone calibration).
+#
+# Persistent failure (memory leak, driver bug, adversarial workload that
+# repeatedly OOMs or wedges) manifests as a Docker restart-loop with
+# exponential backoff — see docs/OPERATIONS.md §Worker self-exit.
+
+# Per-frame inference timeout in seconds; env-configurable.
+LA_INFERENCE_TIMEOUT_S = float(os.environ.get("LA_INFERENCE_TIMEOUT_S", "600"))
+
+# EX_TEMPFAIL from sysexits.h — "service unavailable, retry recommended".
+# Chosen over 137 (SIGKILL convention) and 99 (project-internal) for the
+# clean POSIX-sysexits semantic; an operator grepping logs can find it
+# documented in /usr/include/sysexits.h:78.
+WORKER_RESTART_EXIT_CODE = 75
+
+
+def _hard_exit_for_restart(code: int = WORKER_RESTART_EXIT_CODE) -> None:
+    """Flush log handlers, stdout, stderr — then call os._exit(code).
+
+    We use os._exit (not sys.exit) so atexit handlers are skipped:
+    atexit runs Python finalization which can itself hang on a wedged
+    CUDA call, defeating the whole point of the timeout. Log flushing
+    matters because os._exit also skips stdio flushing, and we want
+    the diagnostic line to actually reach the container log before the
+    process dies."""
+    for h in logging.getLogger().handlers:
+        try:
+            h.flush()
+        except Exception:
+            pass
+    try:
+        sys.stderr.flush()
+        sys.stdout.flush()
+    except Exception:
+        pass
+    os._exit(code)
 
 
 # -------------------------------------------------------------------------
@@ -244,6 +321,51 @@ class WorkerApp:
                         await write_frame(writer, _err_json(
                             400, f"unknown header.kind: {kind!r}",
                         ))
+                except torch.OutOfMemoryError as e:
+                    # CUDA OOM. Must catch BEFORE RuntimeError (OOM is a
+                    # RuntimeError subclass). Write a typed per-frame
+                    # error so the client knows specifically why, then
+                    # hard-exit — see "Hard-recovery contract" at top
+                    # of file.
+                    log.error(
+                        "CUDA OutOfMemoryError during inference: %s — exiting %d for container restart",
+                        e, WORKER_RESTART_EXIT_CODE,
+                    )
+                    try:
+                        await write_frame(writer, _err_json(
+                            500,
+                            f"CUDA out of memory: {e}. The worker is "
+                            "restarting; retry the request after ~10-15s.",
+                        ))
+                    except Exception as write_err:
+                        log.warning(
+                            "failed to write OOM error to client before exit: %r",
+                            write_err,
+                        )
+                    _hard_exit_for_restart()
+                except asyncio.TimeoutError:
+                    # Per-frame inference timeout. asyncio.Lock is already
+                    # released by the `async with` unwind, but the orphan
+                    # thread keeps running — only process exit kills it.
+                    # See "Hard-recovery contract" at top of file.
+                    log.error(
+                        "inference exceeded LA_INFERENCE_TIMEOUT_S=%.1fs — exiting %d for container restart",
+                        LA_INFERENCE_TIMEOUT_S, WORKER_RESTART_EXIT_CODE,
+                    )
+                    try:
+                        await write_frame(writer, _err_json(
+                            504,
+                            f"inference timeout: exceeded "
+                            f"LA_INFERENCE_TIMEOUT_S={LA_INFERENCE_TIMEOUT_S}s. "
+                            "The worker is restarting; retry the request "
+                            "after ~10-15s.",
+                        ))
+                    except Exception as write_err:
+                        log.warning(
+                            "failed to write timeout error to client before exit: %r",
+                            write_err,
+                        )
+                    _hard_exit_for_restart()
                 except ValueError as e:
                     await write_frame(writer, _err_json(400, str(e)))
                 except RuntimeError as e:
@@ -308,14 +430,26 @@ class WorkerApp:
             )
 
         # PyTorch/CUDA cannot run two .generate() concurrently. Serialize.
-        # Once a frame enters _infer, the inference runs to completion
-        # regardless of client liveness: cancelling the asyncio.to_thread
-        # mid-flight would orphan a thread still holding the GPU. If the
-        # WS has closed by the time we go to write the response, the write
-        # fails into the closed UDS and the next frame proceeds.
+        # Once a frame enters _infer, the inference runs to completion (up
+        # to LA_INFERENCE_TIMEOUT_S seconds) regardless of client liveness.
+        # If the WS has closed by the time we go to write the response, the
+        # write fails into the closed UDS and the next frame proceeds.
+        #
+        # The asyncio.wait_for raises asyncio.TimeoutError on expiry; we do
+        # NOT catch it here — it propagates up to handle_connection's
+        # exception block which writes a per-frame error to the client AND
+        # hard-exits the worker (see "Hard-recovery contract" at the top of
+        # this file). The asyncio.Lock IS released cleanly on the exception
+        # (the `async with` unwind runs), but the underlying thread keeps
+        # executing engine.run because Python provides no mechanism to
+        # cancel a thread inside a CUDA C call — the orphan dies with the
+        # process when _hard_exit_for_restart calls os._exit.
         async with self.lock:
             t0 = time.perf_counter()
-            result = await asyncio.to_thread(self.engine.run, jpeg, prompt, mode)
+            result = await asyncio.wait_for(
+                asyncio.to_thread(self.engine.run, jpeg, prompt, mode),
+                timeout=LA_INFERENCE_TIMEOUT_S,
+            )
             total_ms = (time.perf_counter() - t0) * 1000.0
         # `ok` is an IPC-only discriminator the Rust frontend strips before
         # stamping type+frame_id; it never appears in the client-facing body.
@@ -325,6 +459,17 @@ class WorkerApp:
             "detections":    result.detections,
             "points":        result.points,
             "abstained":     result.abstained,
+            # True iff `raw_text` does NOT end with the model's <|im_end|>
+            # end-of-turn marker, meaning the custom .generate() loop
+            # terminated because max_new_tokens was reached, NOT because
+            # the model cleanly finished. Per
+            # models/LocateAnything-3B/modeling_locateanything.py:464,500-501
+            # the loop exits ONLY on <|im_end|> emission OR budget
+            # exhaustion, so this is a total signal. Surfaces the
+            # implicit-only check previously documented in
+            # docs/CLIENT_PROTOCOL.md as a `raw_text`-suffix substring
+            # test, so naive clients can branch on a typed boolean.
+            "model_output_truncated": result.model_output_truncated,
             "image_size":    [result.image_size[0], result.image_size[1]],
             "resize_plan":   result.resize_plan,
             "generation_mode_used": mode,

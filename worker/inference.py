@@ -560,6 +560,18 @@ class InferenceResult:
     # recoverable from `raw_answer` as the set difference between the
     # prompt's category list and `{d['label'] for d in detections}`.
     abstained: bool
+    # True iff `raw_answer` does NOT end with the model's <|im_end|>
+    # end-of-turn marker. Per the custom .generate() loop at
+    # models/LocateAnything-3B/modeling_locateanything.py:464,500-501
+    # the loop exits ONLY on `<|im_end|>` emission OR budget exhaustion
+    # (max_new_tokens=8192), so missing <|im_end|> ⇔ budget hit. The
+    # response is necessarily incomplete in that case — any block whose
+    # closing </box> did not fit is silently dropped by parse_boxes /
+    # parse_points (same behaviour as NVIDIA's eval at
+    # inference_grounding_ddp.py:282-300 numeric-only regex). Surfaces
+    # the implicit-only signal as a typed boolean so clients no longer
+    # need to substring-check raw_text themselves.
+    model_output_truncated: bool
     latency_ms: float
     image_size: tuple
     resize_plan: dict
@@ -960,6 +972,10 @@ class LocateAnythingInference:
             # abstention; we mirror that aggregate semantic here. See
             # InferenceResult.abstained for the contract.
             abstained=not (detections or points),
+            # Explicit truncation signal. See InferenceResult docstring
+            # for the dependency on modeling_locateanything.py:464,500-501
+            # (the loop exits only on <|im_end|> OR budget exhaustion).
+            model_output_truncated=not answer.endswith("<|im_end|>"),
             latency_ms=latency_ms,
             image_size=(image.width, image.height),
             resize_plan={

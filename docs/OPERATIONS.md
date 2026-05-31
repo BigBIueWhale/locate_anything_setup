@@ -92,42 +92,90 @@ on `unhealthy` health status. Concretely:
 
 | Event                                                          | Restart fires? |
 |----------------------------------------------------------------|----------------|
-| Python worker crash (validation fail, OOM, segfault)           | **YES** — entrypoint.sh's `wait -n` returns, peer is signalled, container exits. |
-| Rust binary crash (panic with `panic = "abort"`)               | **YES** — same path. |
+| Python worker crash (validation fail, segfault, unhandled exception) | **YES** — entrypoint.sh's `wait -n` returns, peer is signalled, container exits. |
+| Per-frame inference > `LA_INFERENCE_TIMEOUT_S` (default 600 s) | **YES** — worker calls `os._exit(75)`. See §Worker self-exit below. |
+| CUDA `OutOfMemoryError` during inference                       | **YES** — worker calls `os._exit(75)`. See §Worker self-exit below. |
+| Rust binary crash (panic with `panic = "abort"`)               | **YES** — same path as worker crash. |
 | Host reboot                                                    | **YES** — Docker starts the container on boot. |
-| Healthcheck returns `unhealthy` (worker wedged, lock stuck)    | **NO**         |
+| Asyncio loop deadlock outside the inference timeout            | **NO** — healthcheck reports `unhealthy` but Docker does not auto-restart. |
 
-If the worker is alive but wedged (e.g., a CUDA hang doesn't kill the
-process; the asyncio loop is stuck behind the model lock), the
-container will be reported as `unhealthy` but **will not be restarted
-automatically** by Docker. Recovery requires `docker restart
-locate-anything` or attaching an external "autoheal" sidecar.
+The asyncio-loop-deadlock case is the only remaining wedge gap (a CUDA
+hang inside inference is now caught by the 600 s timeout; an OOM is
+caught by the explicit OOM handler). It is rare in practice — true
+wedges that don't surface as inference timeouts would require the
+asyncio loop itself to be blocked, which our codebase has no plausible
+path to produce. If you observe such a wedge: `docker restart
+locate-anything` recovers, OR you can attach an external autoheal
+sidecar:
 
-Why we don't bake autoheal into the project:
-
-- The healthcheck is *deep* (`/v1/health` does a real round-trip
-  through the worker's `info` path) — true wedges should manifest as
-  the asyncio loop being unable to respond within 5s, and the
-  process exits via the existing
-  `worker/validate_startup.py`/`la_worker.py` paths in most failure
-  modes.
-- Autoheal sidecars (the standard one is
-  [`willfarrell/autoheal`](https://github.com/willfarrell/docker-autoheal))
-  add an extra always-running root-equivalent container, which we'd
-  rather not add to a single-user setup.
-- The Docker socket access required for autoheal is itself a security
-  consideration.
-
-If you observe wedges in practice, two options:
-
-1. Add `willfarrell/autoheal` as a sidecar in `docker-compose.yml`
-   with `--label autoheal=true` on this container.
+1. Add [`willfarrell/autoheal`](https://github.com/willfarrell/docker-autoheal)
+   as a sidecar in `docker-compose.yml` with `--label autoheal=true`
+   on this container. (Costs: extra always-running root-equivalent
+   container, Docker-socket access.)
 2. Bake a tiny in-container watchdog into the entrypoint that polls
    `/v1/health` from inside and SIGTERMs PID 1 after N consecutive
    failures.
 
 Neither is enabled by default. Operators should monitor `docker ps
 --filter health=unhealthy` if running unattended.
+
+### Worker self-exit on timeout / OOM
+
+The worker calls `os._exit(75)` (EX_TEMPFAIL from sysexits.h) on per-
+frame inference timeout or CUDA OOM; `entrypoint.sh`'s `wait -n`
+propagates the exit through to Docker which restarts the container
+per `--restart unless-stopped`.
+
+**Why hard-exit instead of in-process recovery?**
+
+- For a CUDA wedge: in-process recovery is structurally impossible.
+  Python provides no mechanism to cancel a thread blocked inside a
+  CUDA C call holding the GIL (verified empirically in the R2 design
+  audit). The asyncio.Lock IS released on the
+  `asyncio.wait_for(...)` timeout, but the orphan thread keeps
+  running and holding GPU state. The only correct recovery is
+  process exit so the orphan dies with the process and the next
+  container has a fresh CUDA context.
+- For a CUDA OOM: in-process recovery via `torch.cuda.empty_cache()`
+  is empirically safe on `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:
+  True` (10 forced OOMs left the allocator state identical in the R4
+  study) but empirical stability ≠ provable correctness. We pick
+  hard-exit for the principled invariant that the next frame always
+  runs against a fresh CUDA context. The ~10–15 s restart cost is
+  paid once per OOM, which we expect to be vanishingly rare in
+  single-tenant operation.
+
+**Client-visible signature:**
+
+| Failure | What the client receives |
+|---|---|
+| Timeout (LA_INFERENCE_TIMEOUT_S) | `type:"error"` JSON with `code:504` and message `"inference timeout: exceeded LA_INFERENCE_TIMEOUT_S=600.0s. The worker is restarting..."`, followed *immediately* by `Close(1011) "worker_unavailable"` as the worker exits. |
+| OOM | Same shape with `code:500` and message `"CUDA out of memory: ... The worker is restarting..."`, followed by `Close(1011)`. |
+
+Both are sent in that order on the same WebSocket — the worker awaits
+the UDS write of the per-frame error before calling `os._exit`, so the
+typed error reaches the client before the Close. Reconnect after the
+restart window (model reload + boot drift check + drone calibration ≈
+~10–15 s in the post-cache-warm steady state).
+
+**Persistent failure:** if OOMs or wedges become persistent (genuine
+memory leak, driver bug, adversarial workload), the worker enters a
+Docker-backoff restart loop — oscillating availability with
+progressively longer gaps between restart attempts. That is the
+EXPECTED hard-loud response to a persistent fault; per the project
+principle "no fallbacks, no half-finished implementations" we do not
+in-process retry. Operators seeing this pattern should:
+
+1. Check `docker logs locate-anything 2>&1 | grep -E "exiting 75|OOM|timeout"`
+   to identify the failure class.
+2. If timeouts: investigate the workload — `LA_INFERENCE_TIMEOUT_S`
+   may be too low for the operator's input class, or the input is
+   adversarial. Raise the timeout via env var if legitimate.
+3. If OOMs: check for memory leaks via `/v1/info` snapshots over
+   time (compare `gpu_used_mem_gib` after equal numbers of
+   inferences); investigate driver state via `nvidia-smi`.
+4. Stop the loop manually with `docker stop locate-anything`; resume
+   after diagnosis.
 
 ## What survives what
 
