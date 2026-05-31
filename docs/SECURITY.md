@@ -15,11 +15,24 @@ This project takes that seriously.
 
 ## What we do
 
-1. **Loopback bind only — IPv4, literal, runtime-verified.**
+1. **Loopback bind only (by default) — IPv4, literal, runtime-verified.**
    `scripts/03_start_service.sh` publishes the port as
    `-p 127.0.0.1:8765:8000/tcp`. The service is reachable *only* from
    the host's own IPv4 loopback. Any client must be on the same
    machine (or tunnel in over SSH from a separate identity).
+
+   **Opt-out**: running `bash setup.sh --bind-all-interfaces` writes
+   `install_state.env` at the project root, overlaying
+   `LA_HOST_BIND_IP=0.0.0.0`. Every script in the project then
+   publishes on every interface — i.e. the WS / HTTP endpoint is
+   reachable from any host that can reach this machine on port 8765.
+   This is opt-in only; the default remains loopback. The runtime
+   `ss -tlnH` verification below still applies — the kernel-side
+   listener must match the chosen bind exactly, otherwise the
+   container start aborts. Reverting is `bash setup.sh --bind-loopback`.
+   The full set of caveats below ("No TLS", "No auth", "No rate
+   limiting") all become live concerns the moment you opt in — read
+   them before flipping the flag.
 
    Three reinforcements:
 
@@ -158,10 +171,12 @@ This project takes that seriously.
   sensitive host either keep that group tight or run the
   container under a dedicated unprivileged account.
 
-* If you ever want to expose this service to the LAN: change
-  `LA_HOST_BIND_IP` in `scripts/lib/versions.sh`, re-run
-  `03_start_service.sh`, **and** put it behind a reverse proxy
-  with TLS + an auth scheme.
+* If you ever want to expose this service to the LAN: run
+  `bash setup.sh --bind-all-interfaces` (the persistent opt-in
+  flag — see §"What we do" / 1 above) **and** put it behind a
+  reverse proxy with TLS + an auth scheme before letting any
+  untrusted client reach port 8765. Without the proxy, anyone
+  reachable on that port can drive your GPU.
 
 * Watch `docker stats locate-anything` during heavy use — if memory
   usage approaches the host's VRAM limit, the Python worker will

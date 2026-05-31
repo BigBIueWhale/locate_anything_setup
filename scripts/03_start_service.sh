@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
-# Start the container as a long-running service. Bound to LOOPBACK only.
-# Re-running is idempotent: existing container is removed first.
+# Start the container as a long-running service. Bound to LA_HOST_BIND_IP
+# (default 127.0.0.1 — loopback only; can be overridden to 0.0.0.0 via
+# the project-root install_state.env, written by `setup.sh
+# --bind-all-interfaces`). Re-running is idempotent: existing container
+# is removed first.
 
 set -Eeuo pipefail
 _SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
@@ -28,7 +31,9 @@ Concrete actions:
        rotation ${LA_LOG_MAX_SIZE}×${LA_LOG_MAX_FILES}, healthcheck
        deep-probe).
     4. Verify via 'ss -tlnH' that the kernel-side listener is exactly
-       ${LA_HOST_BIND_IP}:${LA_HOST_PORT} (not 0.0.0.0, not [::], not [::1]).
+       ${LA_HOST_BIND_IP}:${LA_HOST_PORT} — any other address (e.g. [::]
+       or [::1] regardless of mode, or 127.0.0.1 when the install opted
+       into --bind-all-interfaces) aborts the start.
     5. Poll 'docker inspect .State.Health.Status' until 'healthy' or
        fail loud (240 s start_period + 10 retries × 15 s interval).
 
@@ -130,16 +135,16 @@ log_ok "Container ${LA_CONTAINER_NAME} started (bound to ${LA_HOST_BIND_IP}:${LA
 # ----------------------------------------------------------------------
 # Runtime verification of the host-side listener.
 #
-# Docker's port-publish syntax `-p 127.0.0.1:PORT:PORT` is supposed to
-# make the host listener IPv4-loopback-only, but we don't trust the
-# claim — we VERIFY by querying the kernel via `ss`. The listener must
-# bind to *exactly* one address: 127.0.0.1:${LA_HOST_PORT}. The script
-# rejects any of:
-#   * `0.0.0.0:8765`  — published on all IPv4 interfaces (DMZ-reachable)
-#   * `[::]:8765`     — published on all IPv6 interfaces (DMZ-reachable)
-#   * `[::1]:8765`    — IPv6 loopback (would surface only via `localhost`
-#                       lookups returning ::1; doc rules ban localhost)
-# Any of those = a misconfigured publish; refuse to declare success.
+# Docker's port-publish syntax `-p <BIND>:PORT:PORT` should make the
+# host-side listener bind to exactly the requested address, but we don't
+# trust the claim — we VERIFY by querying the kernel via `ss`. The
+# listener must bind to *exactly* one address: ${LA_HOST_BIND_IP}:${LA_HOST_PORT}.
+# Any other listener — IPv4 mismatch (e.g. `127.0.0.1` while
+# install_state.env requested `0.0.0.0`, or vice versa), IPv6 wildcard
+# `[::]:${LA_HOST_PORT}`, or IPv6 loopback `[::1]:${LA_HOST_PORT}` (which
+# would surface only via `localhost` lookups that return ::1, and this
+# project bans `localhost` in URLs anyway) — is a misconfigured publish;
+# refuse to declare success.
 #
 # The check uses `ss -tlnH` for a stable machine-parseable format. We
 # look at the Local Address column (field 4) and assert exactly one
@@ -162,11 +167,11 @@ EXPECTED_LISTENER="${LA_HOST_BIND_IP}:${LA_HOST_PORT}"
 while IFS= read -r addr; do
     if [[ "${addr}" != "${EXPECTED_LISTENER}" ]]; then
         die "host-side listener policy violation: kernel reports listener at '${addr}', expected EXACTLY '${EXPECTED_LISTENER}'. \
-A listener on 0.0.0.0:${LA_HOST_PORT} or [::]:${LA_HOST_PORT} or [::1]:${LA_HOST_PORT} means the published port is reachable beyond IPv4 loopback. \
+The listener does not match the install's bind choice (LA_HOST_BIND_IP=${LA_HOST_BIND_IP}, overlaid by install_state.env if present). \
 Refusing to declare success — stop the container and investigate the docker -p flag, daemon ipv6 config, or any conflicting host process."
     fi
 done <<< "${PORT_LISTENERS}"
-log_ok "Host listener verified: exactly ${EXPECTED_LISTENER} (no IPv6 listener, no INADDR_ANY listener)."
+log_ok "Host listener verified: exactly ${EXPECTED_LISTENER} (no IPv6 listener, no off-spec listener)."
 
 # Wait for the health check to flip to healthy (or fail).
 log_info "Waiting for the service to become healthy (model load + calibration takes ~60s)…"

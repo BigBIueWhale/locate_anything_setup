@@ -20,3 +20,9 @@
 # Claude Code session/permission metadata. Per-developer local state,
 # not project content.
 /.claude/
+
+# Per-install bind choice written by `setup.sh --bind-all-interfaces`
+# (and removed by `--bind-loopback`). Sourced by scripts/lib/common.sh
+# ::load_versions to overlay LA_HOST_BIND_IP onto the default in
+# scripts/lib/versions.sh. Per-machine, never committed.
+/install_state.env

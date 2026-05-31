@@ -63,6 +63,45 @@ version_ge() {
 load_versions() {
     # shellcheck disable=SC1091
     source "${_SELF_DIR}/versions.sh"
+
+    # Optional install-time overlay. `setup.sh --bind-all-interfaces` /
+    # `--bind-loopback` write `${PROJECT_ROOT}/install_state.env` so a
+    # bind-IP choice persists across re-runs of setup.sh and across
+    # container restarts. Strict allowlist: refuses any unknown key
+    # and any unknown value, so a typo in the file cannot quietly
+    # change behavior every script downstream depends on.
+    local state_file="${_PROJECT_ROOT}/install_state.env"
+    [[ -f "${state_file}" ]] || return 0
+
+    local line key
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        # Trim leading + trailing whitespace.
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        # Skip blank lines and comment lines.
+        [[ -z "${line}" || "${line:0:1}" == "#" ]] && continue
+        if [[ ! "${line}" =~ ^([A-Z_][A-Z0-9_]*)= ]]; then
+            die "install_state.env line ${line@Q} is not in KEY=value form. Refusing to apply — delete the file or fix the line."
+        fi
+        key="${BASH_REMATCH[1]}"
+        case "${key}" in
+            LA_HOST_BIND_IP) ;;
+            *)
+                die "install_state.env contains key '${key}'. Only LA_HOST_BIND_IP is permitted by the allowlist in scripts/lib/common.sh::load_versions. Refusing to apply."
+                ;;
+        esac
+    done < "${state_file}"
+
+    # Every line had a permitted key — safe to source the file as bash.
+    # shellcheck disable=SC1090
+    source "${state_file}"
+
+    case "${LA_HOST_BIND_IP}" in
+        127.0.0.1|0.0.0.0) ;;
+        *)
+            die "install_state.env LA_HOST_BIND_IP=${LA_HOST_BIND_IP@Q} is not one of the supported values (127.0.0.1, 0.0.0.0). Refusing to apply."
+            ;;
+    esac
 }
 
 project_root() {
