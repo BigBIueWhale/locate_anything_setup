@@ -103,15 +103,42 @@ if ! docker exec "${LA_CONTAINER_NAME}" test -f /opt/locate_anything/scripts/lib
     die "smoke client /opt/locate_anything/scripts/lib/smoke_ws_client.py is missing INSIDE the container — rebuild the image."
 fi
 
+# Two probes against the synthetic calibration.jpg:
+#   1. Template-1 closed-class detection. Verifies the multi-category
+#      detection path end-to-end including per-category abstention
+#      (`book` is structurally not present in the synthetic image, so
+#      the response includes one <ref>book</ref><box>None</box> triple
+#      that is correctly silently dropped by the parser; non-absent
+#      categories return clean boxes). Covers prompt_task=detection.
+#   2. Template-5 scene-text detection. Covers prompt_task=scene_text
+#      AND the per-box <ref>text</ref><box>...</box> shape that is
+#      otherwise only exercised on text-heavy imagery. The synthetic
+#      polygon image has no real text — Agent B's audit showed the
+#      model emits a degenerate full-image labeled box on no-text
+#      input — that's fine for CI structural coverage (the parser
+#      still consumes a labeled box; off-shape filter sees a "box"
+#      result for prompt_task=scene_text and lets it through).
 LOCATE_PROMPT='Locate all the instances that matches the following description: bottle</c>book</c>cup</c>laptop.'
+SCENE_TEXT_PROMPT='Detect all the text in box format.'
 
-log_info "Running smoke WS client via docker exec…"
+log_info "Running smoke WS client (template 1 — detection) via docker exec…"
 docker exec "${LA_CONTAINER_NAME}" \
     python /opt/locate_anything/scripts/lib/smoke_ws_client.py \
         --url "ws://127.0.0.1:${LA_INTERNAL_PORT}/v1/stream" \
         --image /opt/locate_anything/test_data/calibration.jpg \
         --prompt "${LOCATE_PROMPT}" \
         --mode hybrid \
+        --expect-task detection \
+        --timeout 120
+
+log_info "Running smoke WS client (template 5 — scene-text) via docker exec…"
+docker exec "${LA_CONTAINER_NAME}" \
+    python /opt/locate_anything/scripts/lib/smoke_ws_client.py \
+        --url "ws://127.0.0.1:${LA_INTERNAL_PORT}/v1/stream" \
+        --image /opt/locate_anything/test_data/calibration.jpg \
+        --prompt "${SCENE_TEXT_PROMPT}" \
+        --mode hybrid \
+        --expect-task scene_text \
         --timeout 120
 
 log_section "Smoke test passed"

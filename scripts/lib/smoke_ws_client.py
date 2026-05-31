@@ -89,10 +89,44 @@ async def run(args):
             print(f"FAIL: result.latency_ms is missing or not numeric: {result}",
                   file=sys.stderr)
             sys.exit(9)
+        # The post-prompt_task-enforcement contract: every Result body
+        # carries `prompt_task` (one of the seven canonical wire names)
+        # and `model_output_truncated` (bool). The off-shape invariant
+        # is also asserted: `prompt_task=="point"` ⇒ `detections == []`;
+        # any other value ⇒ `points == []`. A future regression in the
+        # filter would land here as a clean CI failure.
+        VALID_TASKS = {"detection", "phrase_single", "phrase_multi",
+                       "text_grounding", "scene_text", "gui_box", "point"}
+        pt = result.get("prompt_task")
+        if pt not in VALID_TASKS:
+            print(f"FAIL: result.prompt_task={pt!r} not one of "
+                  f"{sorted(VALID_TASKS)}: {result}", file=sys.stderr)
+            sys.exit(11)
+        if not isinstance(result.get("model_output_truncated"), bool):
+            print(f"FAIL: result.model_output_truncated is missing or "
+                  f"not bool: {result}", file=sys.stderr)
+            sys.exit(12)
+        if pt == "point" and len(result["detections"]) != 0:
+            print(f"FAIL: off-shape leak — prompt_task=point but "
+                  f"{len(result['detections'])} detections returned: "
+                  f"{result}", file=sys.stderr)
+            sys.exit(13)
+        if pt != "point" and len(result.get("points", [])) != 0:
+            print(f"FAIL: off-shape leak — prompt_task={pt!r} but "
+                  f"{len(result['points'])} points returned: {result}",
+                  file=sys.stderr)
+            sys.exit(14)
+        if args.expect_task and pt != args.expect_task:
+            print(f"FAIL: prompt_task={pt!r} did not match the smoke "
+                  f"caller's --expect-task={args.expect_task!r}",
+                  file=sys.stderr)
+            sys.exit(15)
         print(f"OK: latency={result['latency_ms']} ms, "
               f"{len(result['detections'])} boxes, "
               f"{len(result.get('points', []))} points, "
-              f"abstained={result.get('abstained')}",
+              f"abstained={result.get('abstained')}, "
+              f"prompt_task={pt}, "
+              f"truncated={result['model_output_truncated']}",
               flush=True)
         print(f"raw_text={result['raw_text'][:200]!r}", flush=True)
 
@@ -104,6 +138,13 @@ def main():
     p.add_argument("--prompt", required=True)
     p.add_argument("--mode",   default="hybrid")
     p.add_argument("--timeout", type=float, default=120.0)
+    p.add_argument("--expect-task", default=None,
+                   help="Optional: assert the server-side prompt_task "
+                        "classification equals this exact wire name (one "
+                        "of 'detection'/'phrase_single'/'phrase_multi'/"
+                        "'text_grounding'/'scene_text'/'gui_box'/'point'). "
+                        "Smoke tests use this to verify the Rust classifier "
+                        "agrees with their intent.")
     args = p.parse_args()
     asyncio.run(run(args))
 

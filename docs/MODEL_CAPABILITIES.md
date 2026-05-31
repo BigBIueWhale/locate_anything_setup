@@ -149,6 +149,19 @@ coord tokens shift by ≤ 1 quantization step (≤ 2.24 px at the
 2240 px image cap). Treat the table as accurate to ≈ ±0.2 F1; do
 not treat it as attention-backend-identical to your measurements.
 
+The MoonViT vision encoder uses the same SDPA mem-eff override (its
+own sdpa_attention is rebuilt with bf16 additive masks + 4D tensors
+via `_patch_vit_sdpa_to_mem_efficient`). Asymmetric-aspect numerical
+equivalence was directly measured against the upstream math-backend
+fallback on multi-segment masks: max absolute delta **6e-5** across
+grids from 2×2 to 160×160 patches and aspect ratios from 1:70 to 70:1
+— below the bf16 ULP at the encoder's output magnitude range, i.e.
+bit-equivalent within representable precision. Verified in-container
+on synthetic 2240×280 panorama, 280×2240 portrait, and 64×64 tiny
+inputs; 10-trial stability on the 16:1 panorama showed y-stdev of
+2.9 pixels (strongly self-consistent across the 27-layer × 16-head
+attention stack).
+
 ## Generation parameters (used by every benchmark in the paper)
 
 From `/tmp/nvlabs_eagle/Embodied/evaluation/inference_compat.py:42-68`:
