@@ -117,6 +117,98 @@ attention implementations). For current workload-representative
 absolute numbers see `docs/DRONE_DETECTION.md` §Throughput on
 RTX 5090.
 
+### Vision-encoder FA2 override
+
+The story above only covers the LLM side. The MoonViT vision encoder has
+an independent attention dispatch, and a separate regression hides under
+HF's auto-cascade:
+
+* The model code at `models/LocateAnything-3B/modeling_locateanything.py:104`
+  defaults the vision encoder to `'flash_attention_2'` whenever
+  `vision_config._attn_implementation` is unset — i.e. FA2 is the
+  train-time path. Moonshot's Kimi-VL paper §"variable-length sequence
+  attention mechanism supported by FlashAttention" documents that MoonViT
+  was trained on `flash_attn.flash_attn_varlen_func`, and
+  `models/LocateAnything-3B/modeling_vit.py:571` declares
+  `_supports_flash_attn_2 = True`.
+* But `models/LocateAnything-3B/config.json:62` ships
+  `vision_config._attn_implementation_autoset: True`. Transformers
+  4.57.1's `_autoset_attn_implementation` therefore CASCADES the
+  top-level `_attn_implementation` value into `vision_config` during
+  `from_pretrained`. Our LLM-side override of the top-level value to
+  `'sdpa'` (necessary because magi is sm_120-unbuildable, see above)
+  silently propagates `'sdpa'` to the vision encoder as a side effect,
+  even though there is no structural reason the vision encoder cannot
+  use FA2 on sm_120 (we already ship a sm_120 source-built flash-attn
+  2.8.3 for exactly this).
+* The cascaded `'sdpa'` then lands at
+  `models/LocateAnything-3B/modeling_vit.py:187`
+  `VL_VISION_ATTENTION_FUNCTIONS["sdpa"]` instead of the trained
+  `multihead_attention` (FA2 varlen) at modeling_vit.py:63-121. That
+  silently regresses the vision encoder to PyTorch SDPA — a 12-17%
+  bf16-tensor-core utilisation on RTX 5090 vs the train-correct FA2
+  path.
+
+`worker/inference.py::_force_vit_flash_attn_2` is the corrective
+runtime config mutation. It runs BEFORE `from_pretrained`, sets
+`config.vision_config._attn_implementation = "flash_attention_2"`, and
+stamps a `_la_vit_fa2_forced = True` marker. The function refuses to
+apply itself on any pre-condition drift:
+  (a) flash_attn importable AND `flash_attn.__version__` EXACTLY equals
+      `LA_FLASH_ATTN_VERSION` (the same pin used to source-build the
+      wheel — a different runtime version is a same-name-different-
+      kernel hazard);
+  (b) `flash_attn.flash_attn_varlen_func` importable (the specific entry
+      point MoonViT's `multihead_attention` calls — the non-varlen FA2
+      path would reject `head_dim=72` at
+      `flash-attention/csrc/flash_attn/flash_api.cpp:154` via
+      `TORCH_CHECK(d == d_rounded)`, but the varlen kernel pads in
+      shared memory and accepts it);
+  (c) The dispatch dict `VL_VISION_ATTENTION_FUNCTIONS` has exactly
+      `{"flash_attention_2", "sdpa", "eager"}` and its
+      `"flash_attention_2"` slot is still the same module's
+      `multihead_attention`;
+  (d) `multihead_attention`'s signature is exactly
+      `(q, k, v, q_cu_seqlens, k_cu_seqlens)`;
+  (e) `vision_config.{model_type, num_attention_heads, hidden_size}`
+      match `("moonvit", 16, 1152)` — the structural identity the
+      empirical equivalence test was measured against;
+  (f) Current `vision_config._attn_implementation` is one of
+      `{None, "sdpa"}` (idempotent no-op if already
+      `"flash_attention_2"`; refuse on `"magi"`/`"eager"`/anything else
+      because some other code deliberately set it).
+
+A post-load verification in `LocateAnythingInference.__init__` re-reads
+`self.model.vision_model.config._attn_implementation` AND every encoder
+block's per-instance `attn_implementation` (read by the dispatcher at
+`modeling_vit.py:463` on every forward call) and refuses to serve at
+degraded throughput if either disagrees.
+
+`_patch_vit_sdpa_to_mem_efficient` remains installed as defense-in-
+depth — it is dormant in the happy path (no encoder block ever looks
+up `VL_VISION_ATTENTION_FUNCTIONS["sdpa"]` while FA2 is active), but
+guards against an OOM if FA2 ever fails to apply for any reason; the
+post-load verification would have raised first.
+
+Empirical effect (single RTX 5090, hybrid generation_mode, prompt
+"Point to: drone in the sky."):
+
+* isolated ViT forward (median over 8 iters):
+    1200×764  (4,816 patches) — 95.0 ms → 46.9 ms (2.03×);
+    2000×1440 (14,976 patches) — 737.2 ms → 256.6 ms (2.87×);
+    2240×2240 (25,600 patches) — 1998.9 ms → 612.9 ms (**3.26×**).
+* end-to-end (median over 6 iters):
+    1200×764 — 241.5 ms → 239.4 ms (1.01×; ViT is not the bottleneck
+    at low res);
+    2000×1440 — 1094.4 ms → 603.1 ms (**1.81×**);
+    2240×2240 — 2620.2 ms → 1254.3 ms (**2.09×**).
+
+Output is structurally identical: both paths emit
+`<ref>drone in the sky</ref><box>…</box>` and detect the same drone at
+the same coordinates within `do_sample=True` sampling noise (SDPA:
+`<500><484>`, FA2: `<506><474>`; SDPA-vs-SDPA reruns of the same image
+differ by similar amounts on the do_sample=True trained config).
+
 ## Model-mandated Python deps (pinned EXACTLY)
 
 These match the upstream `nvlabs/Eagle/Embodied/pyproject.toml` and

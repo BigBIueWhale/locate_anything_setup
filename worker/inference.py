@@ -92,6 +92,43 @@ SDPA BACKEND OVERRIDE:
     up the attention function from `VL_VISION_ATTENTION_FUNCTIONS`
     on every forward call (line 463 of modeling_vit.py), so the
     module-level swap propagates without per-instance rebinding.
+
+VISION-ENCODER FA2 OVERRIDE:
+    Independent of the LLM-side magi→sdpa story above, the MoonViT
+    vision encoder was *trained* with FlashAttention 2's varlen kernel
+    (Moonshot's Kimi-VL paper §"variable-length sequence attention
+    mechanism supported by FlashAttention"; mirrored in
+    `/tmp/la_research/kimi_vl.txt:270-271`). The model code at
+    `models/LocateAnything-3B/modeling_vit.py:571` declares
+    `_supports_flash_attn_2 = True`, and NVIDIA's outer dispatcher at
+    `models/LocateAnything-3B/modeling_locateanything.py:104` defaults
+    the vision attn impl to `'flash_attention_2'` whenever
+    `vision_config._attn_implementation` is unset.
+
+    HuggingFace transformers 4.57.1's `_autoset_attn_implementation`,
+    however, CASCADES the top-level `_attn_implementation` value into
+    every sub-config that carries `_attn_implementation_autoset: True`
+    when `from_pretrained` is called. Our LLM-side override at
+    `_attn_implementation = 'sdpa'` (see OVERRIDE MECHANICS above)
+    therefore silently propagates the `'sdpa'` value to
+    `vision_config._attn_implementation` as a side effect, even though
+    the only structural reason we set 'sdpa' was the LLM's
+    sm_120/magi unbuildability — MoonViT has FA2 available and was
+    trained on it.
+
+    `_force_vit_flash_attn_2(config)` below counter-overrides this
+    cascade BEFORE `from_pretrained` runs: it sets
+    `config.vision_config._attn_implementation = 'flash_attention_2'`
+    after strict pre-checks on FA2 availability, dispatch-dict shape,
+    and vision-config structural identity. The post-load verification
+    then re-reads `self.model.vision_model.config._attn_implementation`
+    AND every encoder block's `attn_implementation` attribute to refuse
+    the boot if FA2 did not propagate. Empirically (see
+    `docs/PINNED_VERSIONS.md` §"vision-encoder FA2 override") this
+    restores ~2-3× vit forward speedup at high resolution, translating
+    to 1.8-2.1× end-to-end speedup at 2K-2240² — recovering the
+    train-correct default that HF's auto-cascade had silently
+    regressed.
 """
 
 from __future__ import annotations
@@ -118,6 +155,18 @@ Image.MAX_IMAGE_PIXELS = 20_000_000
 # Explicit refusal to decode truncated JPEGs. PIL's default is False
 # already, but a future dep could flip it; lock it down here.
 ImageFile.LOAD_TRUNCATED_IMAGES = False
+
+
+# Expected flash-attn version, mirrored from
+# `scripts/lib/versions.sh:LA_FLASH_ATTN_VERSION`. Kept as a module-level
+# constant rather than read from an env var because the vision-encoder
+# FA2 override is a baked-in train-correct default, not flag-toggleable
+# (cf. the LA_ATTN_IMPL env contract for the LLM, which IS
+# flag-toggleable for the magi/sdpa choice). If versions.sh is ever
+# updated, update both sides — the Dockerfile already pip-installs
+# from versions.sh, so a mismatch here will surface immediately at
+# boot via `_force_vit_flash_attn_2`'s strict version check.
+_EXPECTED_FLASH_ATTN_VERSION = "2.8.3"
 
 
 # Exception types PIL+libjpeg-turbo can raise on a malformed/unsupported
@@ -410,6 +459,21 @@ def _patch_vit_sdpa_to_mem_efficient() -> None:
     (flash-attn-varlen) or eager_attention functions in the same
     module — only `sdpa_attention`, which is the only one routed by
     `_attn_implementation="sdpa"` (the dispatch dict at line 187-191).
+
+    DORMANCY UNDER FA2 (current happy path):
+        Since `_force_vit_flash_attn_2` runs immediately before
+        from_pretrained and steers the encoder onto FA2 unconditionally
+        (with strict pre-checks AND a post-load verification that
+        refuses the boot otherwise), the replacement function installed
+        here is dormant in the standard happy path — no encoder block
+        ever looks up `VL_VISION_ATTENTION_FUNCTIONS["sdpa"]` at
+        runtime. It is kept installed as defense-in-depth: if a future
+        change to `_force_vit_flash_attn_2` or its post-load
+        verification ever allowed a partial fall-back onto SDPA without
+        re-raising, the math-backend OOM at full LA_MAX_IMAGE_DIM that
+        this patch was designed to prevent would silently re-emerge.
+        The post-load verification would have raised first, so this is
+        a belt-and-suspenders guarantee, not the primary defence.
     """
     import sys
     import inspect
@@ -540,6 +604,317 @@ def _patch_vit_sdpa_to_mem_efficient() -> None:
                 )
 
 
+def _force_vit_flash_attn_2(config, model_dir: str) -> None:
+    """Force the MoonViT vision encoder onto FlashAttention 2 (varlen).
+
+    PROBLEM:
+        See "VISION-ENCODER FA2 OVERRIDE" in the module docstring.
+        Briefly: NVIDIA's dispatcher at
+        `models/LocateAnything-3B/modeling_locateanything.py:104`
+        defaults the vision encoder to `'flash_attention_2'` when
+        `vision_config._attn_implementation` is unset; and MoonViT's
+        `multihead_attention` at modeling_vit.py:63-121 calls
+        `flash_attn.flash_attn_varlen_func` — which is what Moonshot
+        actually TRAINED with (Kimi-VL paper §"variable-length sequence
+        attention mechanism supported by FlashAttention";
+        `/tmp/la_research/kimi_vl.txt:270-271`). But transformers
+        4.57.1's `_autoset_attn_implementation` cascades the top-level
+        `_attn_implementation='sdpa'` (which we set for the LLM, due to
+        magi being sm_120-unbuildable) down into `vision_config`
+        because `vision_config._attn_implementation_autoset: True` in
+        config.json:62. Net effect: silently degrades the vision
+        encoder onto PyTorch SDPA (and then the mem-eff patch above),
+        losing ~2-3× of the trained-time FA2 throughput.
+
+    FIX:
+        Counter-override the cascade IMMEDIATELY before from_pretrained
+        runs by setting `config.vision_config._attn_implementation =
+        "flash_attention_2"`. NVIDIA's dispatcher at
+        modeling_locateanything.py:104 then keeps that value (it only
+        defaults the *unset* case), and the encoder block records the
+        impl into per-layer `self.attn_implementation` at
+        modeling_vit.py:431 — which `attention_qkvpacked` then looks
+        up from `VL_VISION_ATTENTION_FUNCTIONS` on every forward call
+        (modeling_vit.py:463). The post-load verification in
+        `LocateAnythingInference.__init__` re-reads every encoder
+        block's attribute to confirm the override propagated.
+
+    STRICT PRE-CHECKS (refuse to apply on any drift):
+        (a) flash_attn importable AND `flash_attn.__version__` EXACTLY
+            equals the pinned `_EXPECTED_FLASH_ATTN_VERSION` mirroring
+            `scripts/lib/versions.sh:LA_FLASH_ATTN_VERSION`. A
+            same-name-different-version flash_attn could produce
+            silently wrong outputs.
+        (b) flash_attn.flash_attn_varlen_func importable. That is the
+            specific entry point MoonViT.multihead_attention calls; a
+            future flash_attn that drops the varlen path (or renames
+            it) must hard-fail here rather than silently fall back
+            via modeling_vit.py:84-87's `if flash_attn_varlen_func is
+            None` warn-and-sdpa.
+        (c) A live transformers_modules.*.modeling_vit module is in
+            sys.modules with the expected dispatch dict shape:
+            keys == {"flash_attention_2", "sdpa", "eager"} and
+            VL_VISION_ATTENTION_FUNCTIONS["flash_attention_2"] is the
+            `multihead_attention` function from that module.
+        (d) `multihead_attention`'s signature is exactly the
+            (q, k, v, q_cu_seqlens, k_cu_seqlens) the encoder layer at
+            modeling_vit.py:463 calls it with.
+        (e) `config.vision_config` is structurally what the empirical
+            FA2 vs SDPA comparison was measured on: model_type
+            "moonvit", num_attention_heads 16, hidden_size 1152
+            (therefore head_dim 72). The FA2 varlen kernel handles
+            head_dim 72 via the in-shared-memory padding path; the
+            non-varlen FA2 path would reject it at
+            `flash_attn/csrc/flash_attn/flash_api.cpp:154`
+            (`TORCH_CHECK(d == d_rounded)`). Drift in any of these
+            fields invalidates the empirical equivalence test, so
+            refuse the override.
+        (f) `config.vision_config._attn_implementation` is currently
+            in `{None, "sdpa"}` — i.e. either unset OR auto-cascaded
+            from the LLM-side sdpa override. If it is already
+            `"flash_attention_2"` (e.g. an earlier override or an HF
+            release that fixes the cascade), this is a no-op. Any
+            other value (`"magi"`, `"eager"`, …) means someone else
+            deliberately set the vision attn impl elsewhere and we
+            refuse to silently overwrite that choice.
+
+    AFTER:
+        Sets `config.vision_config._attn_implementation =
+        "flash_attention_2"` and stamps a marker
+        `config.vision_config._la_vit_fa2_forced = True` for the
+        post-load verify line in `__init__`. Logs an OK line in the
+        same style as `validate_startup.ok(...)`.
+
+    NOTE: this function only mutates the in-memory config. It does
+    NOT monkey-patch any model code (cf. the upstream-correct
+    dispatch path at modeling_vit.py:463) and does NOT touch the
+    `models/LocateAnything-3B/` directory.
+    """
+    import sys
+    import inspect
+
+    # ---- (a) flash_attn importable + exact version --------------------
+    try:
+        import flash_attn  # noqa: F401
+    except ImportError as e:
+        raise RuntimeError(
+            "MoonViT FA2 override FAILED at pre-check (a): `import "
+            f"flash_attn` raised {type(e).__name__}: {e}. The Dockerfile "
+            "source-builds flash-attn (see scripts/lib/versions.sh:89 "
+            "LA_FLASH_ATTN_VERSION); if this fails inside the container, "
+            "the source build did not produce an importable module. "
+            "Refusing to start at degraded vision-encoder throughput."
+        ) from e
+    fa_version = getattr(flash_attn, "__version__", None)
+    if fa_version != _EXPECTED_FLASH_ATTN_VERSION:
+        raise RuntimeError(
+            "MoonViT FA2 override FAILED at pre-check (a): "
+            f"flash_attn.__version__={fa_version!r} != "
+            f"{_EXPECTED_FLASH_ATTN_VERSION!r} "
+            "(pinned in scripts/lib/versions.sh:89 LA_FLASH_ATTN_VERSION; "
+            "mirrored in worker/inference.py:_EXPECTED_FLASH_ATTN_VERSION). "
+            "A different flash_attn build could change numerical output "
+            "or break the varlen-with-head_dim=72 path. Refusing to "
+            "force the vision encoder onto FA2 with an unverified build."
+        )
+
+    # ---- (b) flash_attn_varlen_func importable ------------------------
+    try:
+        from flash_attn import flash_attn_varlen_func  # noqa: F401
+    except ImportError as e:
+        raise RuntimeError(
+            "MoonViT FA2 override FAILED at pre-check (b): "
+            "`from flash_attn import flash_attn_varlen_func` raised "
+            f"{type(e).__name__}: {e}. MoonViT's `multihead_attention` "
+            "at models/LocateAnything-3B/modeling_vit.py:63-121 calls "
+            "this exact symbol; without it modeling_vit.py:84-87 would "
+            "warn-and-fall-back to SDPA — defeating the whole point of "
+            "this override. Refusing to start."
+        ) from e
+
+    # ---- (c) live modeling_vit module with expected dispatch dict ----
+    # `AutoConfig.from_pretrained` does NOT trigger the modeling-module
+    # import — that only happens inside `AutoModel.from_pretrained`. So
+    # at this point in __init__ (before from_pretrained runs)
+    # `transformers_modules.*.modeling_vit` is NOT yet in sys.modules.
+    # We need to mutate the config BEFORE from_pretrained, so we cannot
+    # defer the structural checks until after the model loads. The fix
+    # is to materialise the modeling_vit module explicitly via
+    # transformers' dynamic_module_utils — the same mechanism
+    # trust_remote_code uses internally — to bring it into sys.modules,
+    # then walk sys.modules the same way `_patch_vit_sdpa_to_mem_
+    # efficient` does. This is read-only: we resolve a class but never
+    # instantiate it, so no weights are touched.
+    EXPECTED_VIT_DISPATCH_KEYS = frozenset({"flash_attention_2", "sdpa", "eager"})
+    try:
+        from transformers.dynamic_module_utils import (
+            get_class_from_dynamic_module,
+        )
+        # The class path is the one the outer modeling_locateanything
+        # imports from at the top of the file
+        # (`from .modeling_vit import MoonVitPretrainedModel`); resolving
+        # by class triggers the module import as a side effect.
+        # `pretrained_model_name_or_path` is the model dir on disk.
+        get_class_from_dynamic_module(
+            "modeling_vit.MoonVitPretrainedModel",
+            model_dir,
+        )
+    except Exception as e:
+        raise RuntimeError(
+            "MoonViT FA2 override FAILED at pre-check (c): could not "
+            "trigger `modeling_vit.MoonVitPretrainedModel` import via "
+            "transformers.dynamic_module_utils.get_class_from_dynamic_module: "
+            f"{type(e).__name__}: {e}. Without the module loaded, we "
+            "cannot verify the dispatch-dict shape before mutating the "
+            "config. Refusing to start at degraded vision-encoder throughput."
+        ) from e
+    candidates = [
+        m for m in list(sys.modules.values())
+        if m is not None
+        and getattr(m, "__name__", "").endswith(".modeling_vit")
+        and hasattr(m, "VL_VISION_ATTENTION_FUNCTIONS")
+    ]
+    if not candidates:
+        raise RuntimeError(
+            "MoonViT FA2 override FAILED at pre-check (c): even after "
+            "explicit get_class_from_dynamic_module, no loaded "
+            "`transformers_modules.*.modeling_vit` module with a "
+            "`VL_VISION_ATTENTION_FUNCTIONS` dict found in sys.modules. "
+            "The trust_remote_code dynamic-module namespace shape has "
+            "changed in this transformers version. Refusing to start at "
+            "degraded vision-encoder throughput."
+        )
+    for mod in candidates:
+        actual_keys = frozenset(mod.VL_VISION_ATTENTION_FUNCTIONS.keys())
+        if actual_keys != EXPECTED_VIT_DISPATCH_KEYS:
+            raise RuntimeError(
+                "MoonViT FA2 override FAILED at pre-check (c): "
+                f"VL_VISION_ATTENTION_FUNCTIONS keys in module "
+                f"{mod.__name__!r} are {sorted(actual_keys)!r}; expected "
+                f"{sorted(EXPECTED_VIT_DISPATCH_KEYS)!r}. A new key (e.g. "
+                "'magi') or a missing key would mean the dispatch contract "
+                "has shifted. Refusing to apply."
+            )
+        fa2_fn = mod.VL_VISION_ATTENTION_FUNCTIONS["flash_attention_2"]
+        expected_fn = getattr(mod, "multihead_attention", None)
+        if expected_fn is None:
+            raise RuntimeError(
+                "MoonViT FA2 override FAILED at pre-check (c): module "
+                f"{mod.__name__!r} has no `multihead_attention` "
+                "attribute. modeling_vit.py:188 expects "
+                "VL_VISION_ATTENTION_FUNCTIONS['flash_attention_2'] to "
+                "be the module-level `multihead_attention` function; "
+                "without it the FA2 path is structurally broken."
+            )
+        if fa2_fn is not expected_fn:
+            raise RuntimeError(
+                "MoonViT FA2 override FAILED at pre-check (c): "
+                f"VL_VISION_ATTENTION_FUNCTIONS['flash_attention_2'] in "
+                f"module {mod.__name__!r} is "
+                f"{getattr(fa2_fn, '__qualname__', fa2_fn)!r}, NOT the "
+                "module's own `multihead_attention`. Some other code "
+                "has remapped the FA2 slot — refusing to silently route "
+                "the encoder through an unknown implementation."
+            )
+        # ---- (d) multihead_attention signature -----------------------
+        EXPECTED_FA2_PARAMS = ("q", "k", "v", "q_cu_seqlens", "k_cu_seqlens")
+        sig = inspect.signature(expected_fn)
+        actual_params = tuple(sig.parameters)
+        if actual_params != EXPECTED_FA2_PARAMS:
+            raise RuntimeError(
+                "MoonViT FA2 override FAILED at pre-check (d): "
+                f"modeling_vit.multihead_attention signature has drifted. "
+                f"Expected parameters {EXPECTED_FA2_PARAMS!r}, observed "
+                f"{actual_params!r}. The encoder layer at "
+                "modeling_vit.py:463-465 calls it with keyword args "
+                "q_cu_seqlens=… and k_cu_seqlens=…; a parameter rename "
+                "would silently break that call. Refusing to apply."
+            )
+
+    # ---- (e) vision_config structural identity ------------------------
+    if not hasattr(config, "vision_config"):
+        raise RuntimeError(
+            "MoonViT FA2 override FAILED at pre-check (e): the loaded "
+            "LocateAnything config has no `vision_config`. The model "
+            "structure has drifted from the pinned HF revision "
+            "(scripts/lib/versions.sh:34 LA_MODEL_HF_REVISION). "
+            "Refusing to start."
+        )
+    vc = config.vision_config
+    expected_vc = {
+        "model_type":          "moonvit",
+        "num_attention_heads": 16,
+        "hidden_size":         1152,
+    }
+    vc_drift = []
+    for key, want in expected_vc.items():
+        got = getattr(vc, key, None)
+        if got != want:
+            vc_drift.append(f"vision_config.{key}={got!r} (expected {want!r})")
+    if vc_drift:
+        raise RuntimeError(
+            "MoonViT FA2 override FAILED at pre-check (e): "
+            "vision_config structural identity has drifted from the "
+            "empirically-tested baseline (head_dim = hidden_size / "
+            "num_attention_heads = 1152 / 16 = 72; the FA2 varlen "
+            "kernel handles 72 specifically — see "
+            "/tmp/la_research/flash-attention/csrc/flash_attn/flash_api.cpp:154 "
+            "for why head_dim padding rules vary by entry point). "
+            "Drifted fields: " + "; ".join(vc_drift)
+            + ". Refusing to apply the FA2 override against an "
+              "untested vision-encoder shape."
+        )
+
+    # ---- (f) current _attn_implementation value -----------------------
+    current_impl = getattr(vc, "_attn_implementation", None)
+    if current_impl == "flash_attention_2":
+        # Idempotent: already on FA2 (e.g. some future HF release fixes
+        # the cascade, or this function ran twice in the same boot).
+        # No-op, log, and mark — the post-load verify line wants the
+        # marker present.
+        if not getattr(vc, "_la_vit_fa2_forced", False):
+            vc._la_vit_fa2_forced = True
+        print(
+            "[validate_startup] OK: vision_config._attn_implementation "
+            "already 'flash_attention_2' — no-op (idempotent re-run); "
+            "MoonViT will use flash_attn_varlen_func per its trained "
+            "default (modeling_locateanything.py:104).",
+            flush=True,
+        )
+        return
+    if current_impl not in (None, "sdpa"):
+        raise RuntimeError(
+            "MoonViT FA2 override FAILED at pre-check (f): "
+            f"vision_config._attn_implementation={current_impl!r} is "
+            "neither None nor 'sdpa'. The expected pre-states are: "
+            "(None) the cascade hasn't run yet, OR ('sdpa') HF's "
+            "_autoset_attn_implementation cascaded the LLM-side sdpa "
+            "value (see config.json:62 `_attn_implementation_autoset: "
+            "True` + transformers 4.57.1 modeling_utils.py cascade "
+            "behaviour). Any other value means some other code has "
+            "deliberately set the vision attn impl — refusing to "
+            "silently overwrite that choice. Refusing to start."
+        )
+
+    # All pre-checks passed; apply the mutation.
+    vc._attn_implementation = "flash_attention_2"
+    vc._la_vit_fa2_forced = True
+
+    print(
+        "[validate_startup] OK: forced "
+        "vision_config._attn_implementation: "
+        f"{current_impl!r} -> 'flash_attention_2' "
+        f"(flash_attn {fa_version} + flash_attn_varlen_func verified). "
+        "Restores MoonViT's trained-time FA2 path "
+        "(Kimi-VL paper §FA-varlen / modeling_vit.py:571 "
+        "_supports_flash_attn_2=True / modeling_locateanything.py:104 "
+        "default 'flash_attention_2'). Counter-overrides the "
+        "transformers 4.57.1 _autoset_attn_implementation cascade that "
+        "would otherwise propagate the LLM-side sdpa override "
+        "(LA_ATTN_IMPL=sdpa) into vision_config because of "
+        "config.json:62 _attn_implementation_autoset:True.",
+        flush=True,
+    )
 
 
 # Map of `prompt_task` wire name → expected response shape. The model
@@ -688,8 +1063,8 @@ class LocateAnythingInference:
         # `attn_implementation=` kwarg on from_pretrained — the model's
         # custom `_autoset_attn_implementation` short-circuits and drops
         # the kwarg whenever config.json's `_attn_implementation` is
-        # 'magi' (which it always is in this model). vision_config is
-        # left alone — MoonViT does not have a magi/sdpa branch.
+        # 'magi' (which it always is in this model). The vision_config is
+        # NOT left alone — see _force_vit_flash_attn_2 below.
         config = AutoConfig.from_pretrained(
             model_dir,
             trust_remote_code=True,
@@ -703,6 +1078,31 @@ class LocateAnythingInference:
                 "This is a structural mismatch with the pinned HF revision."
             )
         config.text_config._attn_implementation = self.attn_impl
+
+        # Counter-override the HF auto-cascade that would otherwise route
+        # the MoonViT vision encoder onto SDPA. The mechanism:
+        #   - models/LocateAnything-3B/config.json:62 declares
+        #     `vision_config._attn_implementation_autoset: True`.
+        #   - transformers 4.57.1's `_autoset_attn_implementation`
+        #     therefore cascades the value of
+        #     `config._attn_implementation` (which we just set to
+        #     `self.attn_impl == 'sdpa'`) down into vision_config when
+        #     `AutoModel.from_pretrained(...)` runs.
+        #   - The cascaded 'sdpa' then routes through
+        #     `models/LocateAnything-3B/modeling_locateanything.py:104`
+        #     and lands at `models/LocateAnything-3B/modeling_vit.py:187`
+        #     `VL_VISION_ATTENTION_FUNCTIONS["sdpa"]` instead of the
+        #     train-time `multihead_attention` (flash_attn_varlen_func)
+        #     at modeling_vit.py:63-121.
+        # The whole reason we set `config._attn_implementation = 'sdpa'`
+        # was the LLM's magi-on-sm_120 unbuildability — there is no
+        # analogous structural blocker on the vision side, and the
+        # train-time impl (per Moonshot's Kimi-VL paper §"variable-length
+        # sequence attention mechanism supported by FlashAttention";
+        # /tmp/la_research/kimi_vl.txt:270-271) IS FlashAttention 2. So
+        # this restores the train-correct default. See "VISION-ENCODER
+        # FA2 OVERRIDE" in this module's docstring for full citations.
+        _force_vit_flash_attn_2(config, model_dir)
 
         self.model = AutoModel.from_pretrained(
             model_dir,
@@ -727,6 +1127,96 @@ class LocateAnythingInference:
                 f"but model.language_model.model._attn_implementation={actual!r}. "
                 f"The model would crash at forward() — refusing to start."
             )
+
+        # Post-load verification for the vision-encoder FA2 override.
+        # The pre-load config mutation in _force_vit_flash_attn_2 sets
+        # `vision_config._attn_implementation = "flash_attention_2"`,
+        # and modeling_locateanything.py:104 records that into the live
+        # `vision_model.config._attn_implementation` AND propagates it
+        # into every encoder block's per-instance `attn_implementation`
+        # attribute (modeling_vit.py:431, set from block_cfg via the
+        # MoonVitEncoder constructor at modeling_vit.py:511). We re-read
+        # both surfaces here; any divergence means the cascade
+        # counter-override did NOT propagate as expected, and the
+        # encoder would silently fall onto a different impl at the
+        # first forward call. Refuse to serve at degraded throughput.
+        vit_cfg_impl = getattr(self.model.vision_model.config,
+                               "_attn_implementation", None)
+        if vit_cfg_impl != "flash_attention_2":
+            raise RuntimeError(
+                "MoonViT FA2 override POST-LOAD VERIFICATION FAILED: "
+                f"self.model.vision_model.config._attn_implementation="
+                f"{vit_cfg_impl!r}, expected 'flash_attention_2'. The "
+                "pre-load mutation in `_force_vit_flash_attn_2` (which "
+                "set config.vision_config._attn_implementation) did not "
+                "carry through to the live vision_model.config. Override "
+                "mechanism (cite chain): "
+                "models/LocateAnything-3B/modeling_locateanything.py:104 "
+                "is the dispatcher that records the impl onto "
+                "vision_model.config; "
+                "models/LocateAnything-3B/modeling_vit.py:431 records it "
+                "into each encoder block's `attn_implementation`; "
+                "models/LocateAnything-3B/modeling_vit.py:463 looks it "
+                "up from VL_VISION_ATTENTION_FUNCTIONS at every forward. "
+                "Refusing to serve at degraded vision-encoder throughput."
+            )
+        marker = getattr(config.vision_config, "_la_vit_fa2_forced", False)
+        if marker is not True:
+            raise RuntimeError(
+                "MoonViT FA2 override POST-LOAD VERIFICATION FAILED: "
+                f"config.vision_config._la_vit_fa2_forced={marker!r}, "
+                "expected True. The marker should have been stamped by "
+                "_force_vit_flash_attn_2 — if it is missing, that "
+                "function did not run, OR a code path replaced the "
+                "config object between the call and here. Refusing to "
+                "serve at degraded vision-encoder throughput."
+            )
+        # Per-block verification. Walk every encoder block and confirm
+        # the per-instance `attn_implementation` reads 'flash_attention_2'
+        # — the dispatcher at modeling_vit.py:463 reads the per-instance
+        # attribute, NOT the config, on every forward call. A bug that
+        # silently leaves any one block on a different impl would only
+        # surface as throughput noise, not a hard error.
+        if not hasattr(self.model.vision_model, "encoder"):
+            raise RuntimeError(
+                "MoonViT FA2 override POST-LOAD VERIFICATION FAILED: "
+                "self.model.vision_model has no `encoder` attribute. "
+                "The MoonVitPretrainedModel structure has changed from "
+                "the pinned HF revision "
+                "(scripts/lib/versions.sh:34 LA_MODEL_HF_REVISION). "
+                "Refusing to start."
+            )
+        blocks = self.model.vision_model.encoder.blocks
+        bad_blocks = [
+            (i, getattr(block, "attn_implementation", None))
+            for i, block in enumerate(blocks)
+            if getattr(block, "attn_implementation", None) != "flash_attention_2"
+        ]
+        if bad_blocks:
+            raise RuntimeError(
+                "MoonViT FA2 override POST-LOAD VERIFICATION FAILED: "
+                f"{len(bad_blocks)} of {len(blocks)} encoder block(s) "
+                "did NOT receive the flash_attention_2 impl. First few "
+                f"divergent (block_idx, attn_implementation): "
+                f"{bad_blocks[:5]!r}. The dispatcher at "
+                "models/LocateAnything-3B/modeling_vit.py:463 reads "
+                "per-block `self.attn_implementation` on every forward "
+                "call, so a divergent block would silently route through "
+                "the wrong impl. Override mechanism (cite chain): "
+                "modeling_locateanything.py:104 dispatches into "
+                "MoonVitPretrainedModel(config.vision_config); "
+                "modeling_vit.py:574-597 forwards block_cfg through "
+                "MoonVitEncoder; modeling_vit.py:431 records "
+                "attn_implementation onto each MoonVitEncoderLayer. "
+                "Refusing to serve at degraded vision-encoder throughput."
+            )
+        print(
+            "[validate_startup] OK: MoonViT FA2 post-load verified — "
+            f"vision_model.config._attn_implementation='flash_attention_2' "
+            f"+ all {len(blocks)} encoder blocks report "
+            f"attn_implementation='flash_attention_2'.",
+            flush=True,
+        )
 
         # Force the PyTorch SDPA dispatcher onto the memory-efficient
         # backend in BOTH the Qwen2 LLM and the MoonViT vision encoder,
