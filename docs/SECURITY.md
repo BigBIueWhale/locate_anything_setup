@@ -1,8 +1,11 @@
 # Security notes
 
-The host this project runs on is **DMZ-exposed** per the
-[personal_server](../../personal_server/README.md) setup. That means
-the iptables `INPUT` chain is mostly default-DROP plus a few
+These notes assume the host this project runs on is **DMZ-exposed**
+— i.e. the network in front of it does not firewall inbound traffic
+to it. (If your host is behind a hardware firewall or router with
+strict inbound rules, the public-exposure concerns below are softer,
+but the loopback-bind design still matters.) On a DMZ-exposed host
+the iptables `INPUT` chain is typically default-DROP plus a few
 allowed ports — but **Docker bypasses `INPUT`** by inserting its
 own DNAT rules in `nat/PREROUTING` and forwarding in `FORWARD` /
 `DOCKER-USER`. So a `-p 8765:8000` publish without an explicit host
@@ -150,8 +153,10 @@ This project takes that seriously.
 ## Operational recommendations
 
 * Run the service as the desktop user; the docker group is
-  root-equivalent (per personal_server §12). The personal_server
-  setup is already configured this way.
+  effectively root-equivalent (any user in `docker` can mount
+  arbitrary host paths into a container), so on a security-
+  sensitive host either keep that group tight or run the
+  container under a dedicated unprivileged account.
 
 * If you ever want to expose this service to the LAN: change
   `LA_HOST_BIND_IP` in `scripts/lib/versions.sh`, re-run

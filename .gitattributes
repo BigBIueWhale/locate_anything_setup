@@ -8,6 +8,7 @@
 /rust_server/Cargo.lock linguist-generated=true
 
 # Model SHA-256 pin metadata. These are content addresses that may be
-# updated mechanically (re-run the lookup subagent) and should fold
-# in diffs.
+# updated mechanically (re-run scripts/01_download_weights.sh after a
+# pinned-revision bump and copy the per-file hashes it reports) and
+# should fold in diffs.
 /worker/validate_startup.py linguist-language=Python

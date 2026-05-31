@@ -93,25 +93,25 @@ truth. To upgrade a component, edit one line there and re-run
 
 ## Host prerequisites
 
-This setup runs on top of the personal-server stack documented at
-[`/home/user/Desktop/personal_server/README.md`](../personal_server/README.md).
-That covers driver, CUDA toolkit, Docker, NVIDIA Container Toolkit,
-and developer tools. If you haven't run those scripts yet, run them
-first.
+Driver, CUDA toolkit, Docker, NVIDIA Container Toolkit, and developer
+tools must already be installed on the host — this project does NOT
+touch host packages, only validates the pins below
+(`scripts/00_validate_host.sh` enforces). The exact pins live in
+[`scripts/lib/versions.sh`](./scripts/lib/versions.sh).
 
 What `00_validate_host.sh` strictly requires:
 
-| Component       | Required pin                              | Where it's installed |
+| Component       | Required pin                              | Install via |
 |-----------------|-------------------------------------------|----------------------|
 | Ubuntu          | 24.04 LTS (`noble`)                       | OS install           |
-| NVIDIA driver   | ≥ 595.45.04                               | personal_server §10  |
+| NVIDIA driver   | ≥ 595.45.04                               | host package manager (e.g. `nvidia-driver-595-open`) |
 | GPU             | RTX 5090 / Blackwell **sm_120**           | hardware             |
 | GPU VRAM        | ≥ 24 GiB                                  | hardware             |
-| Docker          | 29.x                                      | personal_server §12  |
-| nvidia ctk      | 1.19.0                                    | personal_server §13  |
+| Docker          | 29.x                                      | host package manager (`docker-ce`)                   |
+| nvidia ctk      | 1.19.0                                    | host package manager (`nvidia-container-toolkit`)    |
 | Disk free       | ≥ 30 GiB at the project directory         | OS                   |
 | Host port 8765  | unbound                                   | OS                   |
-| Rust (host)     | any (only to generate `Cargo.lock`)       | personal_server §16  |
+| Rust (host)     | any (only to generate `Cargo.lock`)       | host package manager / `rustup` |
 
 If any check fails, the script aborts with the exact pin it expected
 and the value it actually found. Do not modify the script to skip a
@@ -124,7 +124,9 @@ check — fix the underlying issue, then re-run.
 ```
 locate_anything_setup/
 ├── README.md                       # this file
+├── LICENSE                         # MIT (repo code) + NOTICE re: NVIDIA weights
 ├── setup.sh                        # orchestrator
+├── uninstall.sh                    # tiered cleanup (see docs/OPERATIONS.md)
 ├── Dockerfile                      # multi-stage (Rust + CUDA Python)
 ├── docker-compose.yml              # optional alternative to scripts/03
 ├── container/
@@ -140,36 +142,49 @@ locate_anything_setup/
 │       ├── protocol.rs             # wire-protocol types (InferHeader + constants)
 │       ├── jpeg.rs                 # JPEG header validation
 │       ├── ipc.rs                  # Unix-socket client to Python
+│       ├── prompt_validator.rs     # strict trained-correct prompt template gate
 │       └── ws.rs                   # /v1/stream WebSocket handler
 ├── worker/                         # Python inference sidecar
+│   ├── __init__.py
 │   ├── la_worker.py                # asyncio UDS server entrypoint
 │   ├── inference.py                # LocateAnything model wrapper
 │   ├── parsing.py                  # <box>…</box> regex parsers
-│   ├── prompts.py                  # the 7 canonical prompt templates
+│   ├── prompts.py                  # the 7 canonical prompt templates (single source of truth)
 │   ├── pixel_token_math.py         # resolution → token geometry
-│   ├── tiling.py                   # external tiling for tiny objects
-│   ├── calibration.py              # boot-time FPS measurement
-│   └── validate_startup.py         # GPU, env, weights, flash_attn checks
+│   ├── tiling.py                   # external tiling helpers for tiny objects
+│   ├── calibration.py              # boot-time FPS measurement on a real drone JPEG
+│   └── validate_startup.py         # GPU, env, weights, drift checks
 ├── scripts/
 │   ├── lib/
-│   │   ├── common.sh               # logging, traps, version loader
-│   │   └── versions.sh             # the ONE source of pinned versions
+│   │   ├── common.sh                       # logging, traps, version loader
+│   │   ├── versions.sh                     # the ONE source of pinned versions
+│   │   ├── smoke_ws_client.py              # minimal WS client used by 04
+│   │   └── concurrency_smoke_client.py     # FIFO-fairness probe used by 05
 │   ├── 00_validate_host.sh
 │   ├── 01_download_weights.sh
 │   ├── 02_build_image.sh
 │   ├── 03_start_service.sh
-│   └── 04_smoke_test.sh
+│   ├── 04_smoke_test.sh
+│   └── 05_concurrency_smoke.sh
+├── examples/
+│   ├── README.md
+│   └── reference_client.py         # documented client patterns
 ├── test_data/
-│   └── calibration.jpg             # generated by step 1
+│   ├── calibration.jpg             # generated by step 1; used by smoke tests
+│   ├── drone_sirius.jpg            # default boot-calibration image (public domain)
+│   ├── drone_byrobot.jpg           # additional drone test imagery
+│   ├── drone_r18.jpg
+│   └── cat_negative.jpg            # household-objects test image
 ├── models/                         # weights live here (bind-mounted RO into the container)
 └── docs/
-    ├── ARCHITECTURE.md
-    ├── CLIENT_PROTOCOL.md
-    ├── DRONE_DETECTION.md
-    ├── MODEL_CAPABILITIES.md
-    ├── PIXEL_TO_TOKEN_MATH.md
-    ├── PINNED_VERSIONS.md
-    └── SECURITY.md
+    ├── ARCHITECTURE.md             # multi-stage build + runtime layout
+    ├── CLIENT_PROTOCOL.md          # HTTP endpoints + WebSocket /v1/stream wire format
+    ├── DRONE_DETECTION.md          # honest assessment + measured throughput
+    ├── MODEL_CAPABILITIES.md       # what the model does and does NOT do well
+    ├── OPERATIONS.md               # lifecycle, restart, offline, uninstall
+    ├── PIXEL_TO_TOKEN_MATH.md      # resolution geometry derivation
+    ├── PINNED_VERSIONS.md          # every pin and its reason
+    └── SECURITY.md                 # threat model + hardening checklist
 ```
 
 ---

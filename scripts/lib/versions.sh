@@ -4,12 +4,13 @@
 # To change a version: edit one line here, re-run setup.sh, never patch downstream.
 
 # ===== Host prerequisites (validated, not installed by this project) =====
-# Driver and CUDA on the host are installed by the personal-server scripts
-# referenced in /home/user/Desktop/personal_server/README.md (sections §10, §11, §13).
-LA_REQUIRE_DRIVER_BRANCH="595"           # §10 pin from personal_server
+# Install these on the host before running setup.sh — this project does
+# NOT touch host drivers or system packages, only validates that the
+# pins below are satisfied (scripts/00_validate_host.sh enforces).
+LA_REQUIRE_DRIVER_BRANCH="595"           # NVIDIA driver major branch
 LA_REQUIRE_DRIVER_MIN="595.45.04"        # CUDA 13.0+ minimum
-LA_REQUIRE_NVCTK_VERSION="1.19.0"        # §13 pin; supports driver 5xx through 595.x
-LA_REQUIRE_DOCKER_MAJOR="29"             # §12 pin (29.x)
+LA_REQUIRE_NVCTK_VERSION="1.19.0"        # nvidia-container-toolkit; supports driver 5xx through 595.x
+LA_REQUIRE_DOCKER_MAJOR="29"             # Docker Engine major version (29.x)
 LA_REQUIRE_UBUNTU_CODENAME="noble"       # 24.04 LTS
 
 # Required minimum GPU compute capability. RTX 5090 is sm_120 (Blackwell GB202).
@@ -81,10 +82,10 @@ LA_TORCH_CUDA_TAG="cu130"
 LA_TORCH_INDEX_URL="https://download.pytorch.org/whl/${LA_TORCH_CUDA_TAG}"
 
 # ===== Flash-attention 2 (source-built for sm_120) =====
-# 2.8.3 is the latest 2.x stable on PyPI (verified live against
-# https://pypi.org/pypi/flash-attn/json — an earlier research subagent
-# claimed 2.8.4 existed; it does not). FA4 does NOT run on RTX 5090
-# — TMEM hardware missing on GB202. Source build (~25 min on this CPU).
+# 2.8.3 is the latest 2.x stable on PyPI; 2.8.4 does not exist
+# (verified against https://pypi.org/pypi/flash-attn/json at 2026-05-28).
+# FA4 does NOT run on RTX 5090 — TMEM hardware missing on GB202.
+# Source build (~25 min on this CPU).
 LA_FLASH_ATTN_VERSION="2.8.3"
 LA_FLASH_ATTN_ARCHS="120"     # only build sm_120 kernels — fast build, exact match
 

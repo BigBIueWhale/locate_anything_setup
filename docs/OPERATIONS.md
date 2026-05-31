@@ -336,9 +336,9 @@ the project. Its contract:
 ### What `uninstall.sh` does NOT touch
 
 - **Host packages** (driver, CUDA toolkit, Docker, nvidia container
-  toolkit). Those were installed by the personal_server scripts and
-  are this project's *prerequisites*, not its dependencies. Uninstall
-  them via apt if you need to.
+  toolkit). Those were installed on the host before this project ran
+  and are this project's *prerequisites*, not its dependencies.
+  Uninstall them via apt if you need to.
 
 - **The project source tree**. Source files, `README.md`, scripts,
   `versions.sh`, `Cargo.toml`, `Cargo.lock`. The source itself is

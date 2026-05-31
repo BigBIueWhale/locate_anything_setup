@@ -155,7 +155,7 @@ input than it sent:
 * **Start with `FF D8 FF`** — JPEG SOI marker.
 * **Decode cleanly with libjpeg-turbo** (header parse done in Rust;
   full decode done in Python).
-* **Be RGB**, not CMYK. PIL's CMYK→RGB transform isn't ICC-aware and
+* **Be RGB**, not CMYK. PIL's CMYK→RGB transform isn't ICC-aware (does not honor embedded ICC colour profiles) and
   produces wrong colours; we reject CMYK rather than degrade.
 * **Both dimensions in `[32, max_image_dim=2240]`** px.
 * **`(W // 14) × (H // 14) ≤ 25,600`** ViT patches (the exact formula

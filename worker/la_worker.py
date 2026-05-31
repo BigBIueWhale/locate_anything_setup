@@ -463,10 +463,9 @@ class WorkerApp:
             # the model cleanly finished. Per
             # models/LocateAnything-3B/modeling_locateanything.py:464,500-501
             # the loop exits ONLY on <|im_end|> emission OR budget
-            # exhaustion, so this is a total signal. Surfaces the
-            # implicit-only check previously documented in
-            # docs/CLIENT_PROTOCOL.md as a `raw_text`-suffix substring
-            # test, so naive clients can branch on a typed boolean.
+            # exhaustion, so this is a total signal. Naive clients can
+            # branch on this typed boolean instead of substring-checking
+            # raw_text themselves.
             "model_output_truncated": result.model_output_truncated,
             "image_size":    [result.image_size[0], result.image_size[1]],
             "resize_plan":   result.resize_plan,

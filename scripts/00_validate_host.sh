@@ -5,8 +5,7 @@
 #
 # Run as the desktop user (NOT root). The script does not need elevated
 # privileges; nvidia-smi, docker, and disk space are all readable by the
-# user when membership in the `docker` group has been granted per §12 of
-# the personal_server README.
+# user when membership in the `docker` group has been granted.
 
 set -Eeuo pipefail
 
@@ -75,7 +74,7 @@ log_ok "OS: Ubuntu 24.04 (${VERSION_CODENAME})"
 require_cmd nvidia-smi
 DRIVER_VER=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader,nounits | head -n1 | tr -d '[:space:]')
 if ! version_ge "${DRIVER_VER}" "${LA_REQUIRE_DRIVER_MIN}"; then
-    die "NVIDIA driver ${DRIVER_VER} < required minimum ${LA_REQUIRE_DRIVER_MIN}. Run §10 of personal_server."
+    die "NVIDIA driver ${DRIVER_VER} < required minimum ${LA_REQUIRE_DRIVER_MIN}. Install/upgrade the NVIDIA driver on the host (e.g. \`sudo apt install nvidia-driver-${LA_REQUIRE_DRIVER_BRANCH}-open\` and reboot)."
 fi
 log_ok "NVIDIA driver: ${DRIVER_VER} (≥ ${LA_REQUIRE_DRIVER_MIN})"
 
@@ -99,7 +98,7 @@ require_cmd docker
 DOCKER_VER=$(docker --version | awk '{print $3}' | tr -d ',')
 DOCKER_MAJ=${DOCKER_VER%%.*}
 if [[ "${DOCKER_MAJ}" != "${LA_REQUIRE_DOCKER_MAJOR}" ]]; then
-    die "Docker major version ${DOCKER_MAJ} != required ${LA_REQUIRE_DOCKER_MAJOR} (29.x). Run §12 of personal_server."
+    die "Docker major version ${DOCKER_MAJ} != required ${LA_REQUIRE_DOCKER_MAJOR} (29.x). Install/upgrade docker-ce on the host (see https://docs.docker.com/engine/install/)."
 fi
 if ! docker ps >/dev/null 2>&1; then
     die "docker ps failed — is the docker.service running and is your user in the docker group? (newgrp docker or re-login)."
@@ -119,7 +118,7 @@ DOCKER_INFO_OUT=$(docker info 2>&1) || die \
 Daemon may be restarting or unreachable. Re-run after a few seconds. \
 docker info stderr: ${DOCKER_INFO_OUT}"
 if ! grep -q "Runtimes:.*nvidia" <<< "${DOCKER_INFO_OUT}"; then
-    die "Docker reports no 'nvidia' runtime — run §13 of personal_server. \
+    die "Docker reports no 'nvidia' runtime — install nvidia-container-toolkit on the host (see https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html). \
 Actual 'Runtimes:' line: $(grep -E '^[[:space:]]*Runtimes:' <<< "${DOCKER_INFO_OUT}" || echo '(none found)')"
 fi
 # Pin enforcement: the daemon-registered runtime is one signal, but we also
@@ -127,14 +126,14 @@ fi
 # silent drift on the host (e.g., apt upgrade installed a newer nvctk)
 # could change container-side behavior without us noticing.
 if ! command -v nvidia-ctk >/dev/null 2>&1; then
-    die "nvidia-ctk binary not found on PATH — run §13 of personal_server."
+    die "nvidia-ctk binary not found on PATH — install nvidia-container-toolkit on the host."
 fi
 NVCTK_VER=$(nvidia-ctk --version 2>/dev/null | awk '/version/{print $NF; exit}' | tr -d 'v')
 if [[ -z "${NVCTK_VER}" ]]; then
     die "could not parse 'nvidia-ctk --version' output."
 fi
 if [[ "${NVCTK_VER}" != "${LA_REQUIRE_NVCTK_VERSION}" ]]; then
-    die "nvidia-container-toolkit ${NVCTK_VER} != required ${LA_REQUIRE_NVCTK_VERSION}. Run §13 of personal_server."
+    die "nvidia-container-toolkit ${NVCTK_VER} != required ${LA_REQUIRE_NVCTK_VERSION}. Install/upgrade the matching nvidia-container-toolkit package on the host."
 fi
 log_ok "nvidia-container-toolkit: ${NVCTK_VER}"
 

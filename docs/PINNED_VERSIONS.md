@@ -11,13 +11,13 @@ and re-run `setup.sh`.
 
 | Var | Value | Why |
 |---|---|---|
-| `LA_REQUIRE_UBUNTU_CODENAME`     | `noble`        | 24.04 LTS — what the personal_server stack pins. |
-| `LA_REQUIRE_DRIVER_BRANCH`       | `595`          | Matches `nvidia-driver-595-open` from personal_server §10. |
+| `LA_REQUIRE_UBUNTU_CODENAME`     | `noble`        | 24.04 LTS. |
+| `LA_REQUIRE_DRIVER_BRANCH`       | `595`          | NVIDIA driver 595.x (e.g. the `nvidia-driver-595-open` package on Ubuntu). |
 | `LA_REQUIRE_DRIVER_MIN`          | `595.45.04`    | Minimum that supports CUDA 13.0 per NVIDIA's release notes. |
 | `LA_REQUIRE_GPU_COMPUTE_CAP`     | `12.0`         | RTX 5090 / Blackwell sm_120. The torch wheels and flash-attn build below target sm_120 specifically. |
 | `LA_REQUIRE_GPU_MEM_MIN_MIB`     | `24000`        | bf16 weights ~7 GiB + KV/activation headroom for 16K context. |
-| `LA_REQUIRE_DOCKER_MAJOR`        | `29`           | Matches `docker-ce = 5:29.4.1-1` from personal_server §12. |
-| `LA_REQUIRE_NVCTK_VERSION`       | `1.19.0`       | personal_server §13 pin. |
+| `LA_REQUIRE_DOCKER_MAJOR`        | `29`           | Docker Engine 29.x (e.g. `docker-ce = 5:29.4.1-1` on Ubuntu). |
+| `LA_REQUIRE_NVCTK_VERSION`       | `1.19.0`       | nvidia-container-toolkit version that supports driver 5xx. |
 | `LA_REQUIRE_DISK_FREE_GIB`       | `30`           | ~12 GiB image + 8 GiB weights + headroom. |
 
 ## Model identity
@@ -140,7 +140,7 @@ specific behavior from these versions — don't loosen the pins.
 
 | Var | Value | Why |
 |---|---|---|
-| `LA_HFHUB_VERSION`       | `0.27.0` | `huggingface_hub.snapshot_download`. |
+| `LA_HFHUB_VERSION`       | `0.36.2` | `huggingface_hub.snapshot_download`. |
 | `LA_HF_TRANSFER_VERSION` | `0.1.8`  | hf_transfer for fast parallel download. |
 | `LA_PSUTIL_VERSION`      | `6.1.0`  | Optional, used in /v1/info. |
 
@@ -164,7 +164,7 @@ for all benchmark runs in the paper.
 | ENV var                    | Value             | Source |
 |---|---|---|
 | `LA_MODEL_DTYPE`           | `bfloat16`        | `config.json:torch_dtype`. |
-| `LA_ATTN_IMPL`             | `sdpa`              | Override of `config.json:_attn_implementation='magi'` — magi unbuildable on sm_120, sdpa is the only other valid branch in `Qwen2Model.forward()` and reconstructs the same block-mask pattern. See `## magi_attention` section above. |
+| `LA_ATTN_IMPL`             | `sdpa`              | Override of `config.json:_attn_implementation='magi'` — magi unbuildable on sm_120, sdpa is the only other valid branch in `Qwen2Model.forward()` and reconstructs the same block-mask pattern. See § `flash-attn (source build, sm_120 only)` above. |
 | `LA_GEN_TEMPERATURE`       | `0.7`             | `inference_compat.py:55`. |
 | `LA_GEN_TOP_P`             | `0.9`             | `inference_compat.py:56`. |
 | `LA_GEN_DO_SAMPLE`         | `1`               | `inference_compat.py:54`. |

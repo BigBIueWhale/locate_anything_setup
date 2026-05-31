@@ -40,7 +40,7 @@ re-running on a healthy install is a verify-and-skip no-op.
                                   nvidia-container-toolkit, free disk,
                                   free port). Refuses to run as root.
   scripts/02_build_image.sh       docker build. First run is ~25 min,
-                                  dominated by the flash-attn 2.8.4
+                                  dominated by the flash-attn 2.8.3
                                   source compile. Pass --rebuild to
                                   force a fresh build.
   scripts/01_download_weights.sh  pull nvidia/LocateAnything-3B at the

@@ -96,8 +96,7 @@ that URL so the client always knows where to look. **Do not paraphrase**
 ### NVIDIA paper Table 12 — per-task mode F1
 
 The F1@mIoU delta between modes is task-dependent and sometimes very
-large. Quoted directly from paper §C.4 (verified by the deep-audit
-subagent):
+large. Quoted directly from paper §C.4:
 
 | Task                            | fast | hybrid | **slow** | Pick |
 |---------------------------------|------|--------|----------|------|
@@ -148,7 +147,7 @@ coord tokens shift by ≤ 1 quantization step (≤ 2.24 px at the
 2240 px image cap). Treat the table as accurate to ≈ ±0.2 F1; do
 not treat it as attention-backend-identical to your measurements.
 
-The MoonViT vision encoder uses the same SDPA mem-eff override (its
+The MoonViT vision encoder uses the same SDPA (scaled-dot-product-attention, PyTorch's built-in) mem-eff override (its
 own sdpa_attention is rebuilt with bf16 additive masks + 4D tensors
 via `_patch_vit_sdpa_to_mem_efficient`). Asymmetric-aspect numerical
 equivalence was directly measured against the upstream math-backend
@@ -220,12 +219,13 @@ collapses "all categories abstained" with "model produced unparseable
 output"; both are "nothing to render" from the client's perspective.
 NVIDIA's own eval pipeline has no aggregate `abstained` concept either
 — `Embodied/evaluation/metrics/other_metric.py:140-156` only tracks
-per-category None. (An earlier substring-scan `has_abstention(raw_text)`
-in this server's response path was removed because it leaked
-per-category abstention into the aggregate flag — multi-category
-detect prompts emit `<ref>X</ref><box>None</box>` for absent categories
-alongside real boxes for present ones, and the substring scan would
-flip the aggregate flag True even when real detections were returned.)
+per-category None. The `abstained` boolean is therefore *strictly*
+derived from `not (detections or points)` and never from a substring
+scan over `raw_text`: a substring scan would flip the aggregate flag
+True for any multi-category response that contained an absent-category
+`<ref>X</ref><box>None</box>` triple — even when real detections were
+returned for other categories — and silently mislead a client that
+treats `abstained=true` as "no objects detected".
 
 For per-category abstention in a multi-category detection prompt,
 clients recover the absent categories as the set difference between

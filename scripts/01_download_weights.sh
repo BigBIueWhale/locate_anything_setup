@@ -178,7 +178,7 @@ fi
 # --- Regenerate Cargo.lock if missing ---
 if [[ ! -f "${PROJECT_ROOT}/rust_server/Cargo.lock" ]]; then
     if ! command -v cargo >/dev/null 2>&1; then
-        die "rust_server/Cargo.lock is missing and host 'cargo' is not on PATH. Install Rust on the host (per §16 of personal_server) or commit Cargo.lock."
+        die "rust_server/Cargo.lock is missing and host 'cargo' is not on PATH. Install Rust on the host (e.g. via rustup) or commit Cargo.lock."
     fi
     log_info "Regenerating rust_server/Cargo.lock"
     ( cd "${PROJECT_ROOT}/rust_server" && cargo generate-lockfile )

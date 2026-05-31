@@ -1,7 +1,7 @@
 # Drone detection — capabilities, limits, and honest assessment
 
 This document is here because the project was set up with the
-intent of building **ground-based FPV-drone early-warning** on top
+intent of building **ground-based FPV-drone (first-person-view drone) early-warning** on top
 of LocateAnything-3B. After verifying the model's training data,
 architecture, and benchmarks, the honest answer is:
 
@@ -116,7 +116,7 @@ path (MagiAttention is unbuildable on sm_120 — see
 | `hybrid` |        785 ms | 1.17s |     32.7 |           1.56 |                6.4 |
 | `slow`   |        937 ms | 1.61s |     24.7 |           1.62 |               17.6 |
 
-MTP cuts forward passes by ~73 % in `fast` and ~64 % in `hybrid`
+Multi-Token Prediction (MTP) cuts forward passes by ~73 % in `fast` and ~64 % in `hybrid`
 relative to `slow` (mean `fast/slow=0.27`, `hybrid/slow=0.36`).
 Wall-clock improvement is modest (~17 % `hybrid → slow`) because each
 inference is dominated by the prefill (vision-token encoding + first

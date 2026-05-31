@@ -83,11 +83,11 @@ def calibrate(
         raise ValueError(f"n_runs={n_runs} must be ≥ 1")
 
     # Classify the calibration prompt once; engine.run() requires the
-    # wire name as a positional arg now (post-prompt_task enforcement).
-    # The Rust validator does the same classification at request time;
-    # this is the in-process Python mirror via prompts.classify_prompt
-    # (raises if the prompt isn't one of the seven canonical templates,
-    # caught early at boot rather than per-request).
+    # wire name as a positional argument. The Rust validator does the
+    # same classification at request time; prompts.classify_prompt is
+    # the in-process Python mirror (raises if the prompt isn't one of
+    # the seven canonical templates, caught early at boot rather than
+    # per-request).
     test_prompt_task = prompts.classify_prompt(test_prompt)
 
     # Warm-up: first inference triggers extra JIT / cuDNN autotune overhead.
@@ -107,13 +107,12 @@ def calibrate(
     #     catch at boot — not in production.
     #
     # We deliberately invoke `has_abstention(warm.raw_answer)` here rather
-    # than reading `warm.abstained`. After the abstention-semantics
-    # tighten, `warm.abstained` is the AGGREGATE flag
-    # (`not (detections or points)`) and would always be True when
-    # detections and points are both empty — making the disjunction
-    # tautological and silently masking the gibberish-output failure mode
-    # this assertion exists to catch. The substring scan via
-    # `has_abstention` is the parser-internal probe for "did the model
+    # than reading `warm.abstained`. The aggregate `warm.abstained` is
+    # `not (detections or points)` and would always be True when both
+    # lists are empty — making the disjunction tautological and silently
+    # masking the gibberish-output failure mode this assertion exists to
+    # catch. The substring scan via `has_abstention` is the parser-internal
+    # probe for "did the model
     # emit the trained literal at all", which is what we actually need
     # for the parser-drift self-test.
     if not (warm.detections or warm.points or has_abstention(warm.raw_answer)):
