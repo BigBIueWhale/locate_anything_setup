@@ -2907,7 +2907,7 @@ fn build_binding_response(req: &amp;[u8], src: SocketAddr) -&gt; Option&lt;Vec&l
 
 <p>Per-source-Internet-Protocol rate limit via the <code>governor</code> crate (separate instance from the authentication rate limiter): <code>Quota::with_period(Duration::from_millis(200)).context("invalid quota period")?.allow_burst(NonZeroU32::new(10).context("nonzero")?)</code> — capacity 10, refill 5 per second.</p>
 
-<p><strong>Tracked-IP table cap: hard 8192 entries (approximately 512 kibibytes), with explicit eviction policy.</strong> The governor crate's <code>RateLimiter::retain_recent()</code> method is invoked on a 60-second Tokio interval; <code>retain_recent</code> removes entries whose Generic Cell Rate Algorithm bucket has fully refilled (i.e., the source is no longer rate-tracked). If the entry count after a <code>retain_recent()</code> tick is still above 8192, the rate-limiter's <code>retain</code> method is called a second time with a stricter predicate that drops the half of entries with the longest time-since-last-touched. This is a deterministic two-stage cleanup, not a "soft" target; the cap is enforced.</p>
+<p><strong>Tracked-IP table bound: <code>retain_recent()</code> age-eviction, target ≈ 8192 entries (≈ 512 kibibytes).</strong> <strong>Correction (verified against governor 0.10.4 source on 2026-06-02):</strong> the <code>governor</code> <code>RateLimiter</code> handle exposes ONLY <code>retain_recent()</code> — a FIXED-predicate sweep that drops entries whose Generic Cell Rate Algorithm bucket has fully refilled (the source is no longer rate-tracked); there is NO public custom-predicate <code>RateLimiter::retain</code> (earlier drafts invoked a "second <code>retain</code> with a stricter predicate" — that method does not exist in 0.10.4). The 60-second Tokio garbage-collection task therefore calls <code>retain_recent()</code>, which — given the STUN quota's ~2-second refill — keeps the table bounded to sources active in roughly the last few seconds; the natural cap is the count of recently-probing IPs, not a fixed number. If a strict numeric cap must be enforced regardless of churn, the limiter is constructed over an explicitly-held <code>DashMapStateStore</code> (which is a <code>dashmap::DashMap</code>, <code>governor 0.10.4 src/state/keyed/dashmap.rs:14</code>) and the GC task additionally calls that map's own <code>len()</code> / <code>retain(...)</code> directly — the <code>RateLimiter</code> wrapper does not surface them. (The §17.3 auth limiter already describes its bound correctly as a <em>soft</em> cap via <code>retain_recent()</code>; this brings §13.7 into line.)</p>
 
 <p><strong>On rate-limit-overflow for a single source: silent drop of the STUN binding-request. No error response.</strong> Sending a STUN error message in response would itself be a packet-amplification vector (an attacker sending spoofed binding-requests with a victim's source address would cause the demo server to flood the victim with error responses).</p>
 
@@ -3604,13 +3604,13 @@ let ok: bool = presented_bytes.ct_eq(expected_bytes).into();
 <p>Use the <code>governor</code> crate's <code>RateLimiter::keyed(Quota::per_minute(NonZeroU32::new(5)?))</code>. Configuration:</p>
 <table>
   <tr><th>Parameter</th><th>Value</th><th>Rationale</th></tr>
-  <tr><td>Quota</td><td>5 attempts per minute per IP</td><td>Legitimate users rarely fail auth (token is copy-pasted from URL fragment). 5/minute gives ample headroom for a fat-fingered manual paste, but caps brute-force at approximately 7200 attempts per day per IP.</td></tr>
-  <tr><td>Burst</td><td>5 (implicit from <code>per_minute(5)</code>)</td><td>Allows a fresh client a small flurry of retries (browser reloads, network blips) before throttling.</td></tr>
+  <tr><td>Quota</td><td>5 <strong>failed</strong> attempts per minute per IP</td><td>The limiter is consulted ONLY on a failed authentication (§17.5) — a correct-token request consumes nothing, so an arbitrary number of legitimate viewers behind one NAT/CGNAT egress IP are never throttled (§2 "everybody viewing"). 5/minute gives ample headroom for a fat-fingered manual paste, and caps a brute-forcer (whose every attempt is, by definition, a failure) at approximately 7200 failed attempts per day per IP.</td></tr>
+  <tr><td>Burst</td><td>5 (implicit from <code>per_minute(5)</code>)</td><td>Allows a small flurry of FAILED retries (a few fat-fingered pastes) before throttling. Browser reloads and network blips by a correct-token client cost nothing — success is never counted — so they never consume the burst.</td></tr>
   <tr><td>Tracked IP cap (soft)</td><td>8192</td><td>Matches the STUN rate limiter's bound. At approximately 64 bytes per entry: 512 kibibytes total. Enforced via periodic <code>retain_recent()</code> calls.</td></tr>
   <tr><td>Lockout duration</td><td>Implicit; ~12 seconds per refilled token</td><td>The Generic Cell Rate Algorithm bucket itself implements the lockout. After 5 failures the IP must wait 12 seconds before the next attempt is accepted.</td></tr>
 </table>
 
-<p>Brute-force resistance: a 16-character secret over a 95-character printable Asynchronous Symbolic Communication Interchange Information II (ASCII) alphabet is approximately 95<sup>16</sup> ≈ 4.4 × 10<sup>31</sup> possibilities. At 7200 attempts per day per IP, a single attacker needs approximately 10<sup>27</sup> days. Even a 10<sup>6</sup>-IP botnet cannot meaningfully dent this.</p>
+<p>Brute-force resistance: a 16-character secret over a 95-character printable Asynchronous Symbolic Communication Interchange Information II (ASCII) alphabet is approximately 95<sup>16</sup> ≈ 4.4 × 10<sup>31</sup> possibilities (a conservative floor; the recommended <code>openssl rand -hex 16</code> generator yields 128 bits ≈ 3.4 × 10<sup>38</sup>). At 7200 <strong>failed</strong> attempts per day per IP — an attacker's every attempt is a failure, so the failures-only quota caps them at exactly this rate — a single attacker needs approximately 10<sup>27</sup> days. Even a 10<sup>6</sup>-IP botnet cannot meaningfully dent this.</p>
 
 <h3>17.4 Middleware order</h3>
 <p>The axum middleware chain, in execution order (outermost first):</p>
@@ -3722,22 +3722,16 @@ This eliminates the "two ways to do the same thing" pattern AND honors the opera
 ) -&gt; Result&lt;axum::response::Response, (axum::http::StatusCode, String)&gt; {
     let ip = peer.ip();
 
-    // Pre-check rate limit BEFORE auth compare (timing-side-channel defense:
-    // any auth attempt costs at least one bucket token, regardless of outcome).
-    if let Err(not_until) = state.auth_rate_limiter.check_key(&amp;ip) {
-        use governor::clock::Clock;
-        let wait_secs = not_until.wait_time_from(governor::clock::DefaultClock::default().now())
-            .as_secs().max(1);
-        let mut resp = (
-            axum::http::StatusCode::TOO_MANY_REQUESTS,
-            format!("rate_limited: try again in {wait_secs}s")
-        ).into_response();
-        resp.headers_mut().insert(
-            axum::http::header::RETRY_AFTER,
-            axum::http::HeaderValue::from(wait_secs)
-        );
-        return Ok(resp);
-    }
+    // The per-IP rate limiter is consulted ONLY on a FAILED auth (below), never
+    // on a successful or no-credential request. Gating only FAILURES is what lets
+    // an arbitrary number of correct-token viewers behind ONE NAT/CGNAT egress IP
+    // all attach without throttling — the §2 "everybody else visiting … will also
+    // have the video stream" requirement. (The constant-time compare at §17.2
+    // already neutralizes the only timing leak the former check-before-compare
+    // guarded against; the pass/fail bit is intentionally public via the
+    // 200-vs-401 status regardless. Best practice — OWASP, and GitLab's
+    // production shared-IP Git-over-HTTPS limiter — is to gate failures, not
+    // total traffic, and not to throttle correct-credential requests by IP.)
 
     // Classify the route: WebSocket-upgrade (path "/v1/signal") versus
     // plain HTTP. The strict surface for each is then enforced.
@@ -3784,6 +3778,27 @@ This eliminates the "two ways to do the same thing" pattern AND honors the opera
     use subtle::ConstantTimeEq;
     let ok = bool::from(presented_token.ct_eq(state.auth_secret.as_bytes()));
     if !ok {
+        // FAILED auth only: charge ONE token to this IP's brute-force budget.
+        // Once the budget is empty, further WRONG-token attempts get 429 instead
+        // of 401 — capping a guesser at the same ~7200 failed attempts/day/IP the
+        // quota intends, while NEVER touching correct-token traffic (so shared-NAT
+        // viewers are never throttled). governor's RateLimiter has no peek/dry-run
+        // (verified, 0.10.4 src/state/keyed.rs:145), so calling check_key only
+        // here — not before the compare — is exactly what makes success free.
+        if let Err(not_until) = state.auth_rate_limiter.check_key(&amp;ip) {
+            use governor::clock::Clock;
+            let wait_secs = not_until.wait_time_from(governor::clock::DefaultClock::default().now())
+                .as_secs().max(1);
+            let mut resp = (
+                axum::http::StatusCode::TOO_MANY_REQUESTS,
+                format!("rate_limited: try again in {wait_secs}s")
+            ).into_response();
+            resp.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from(wait_secs)
+            );
+            return Ok(resp);
+        }
         return Err((axum::http::StatusCode::UNAUTHORIZED,
             "auth: invalid token".to_string()));
     }
