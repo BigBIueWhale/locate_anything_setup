@@ -153,9 +153,9 @@
   <li>The streamer clicks "Claim Streamer" in the SPA, which sends a WebSocket Secure (WSS) message to the demo server claiming ownership of the single available streaming slot.</li>
   <li>If granted, the SPA prompts the user to select a webcam (from any platform: Apple iPhone smartphone, Google Pixel Android smartphone, Samsung Galaxy S25 Android smartphone, Apple iPad tablet, Microsoft Windows laptop, Apple macOS desktop, etc.), and to construct a prompt from the 7 canonical templates LocateAnything-3B was trained on.</li>
   <li>The streamer's web browser captures 1280x720-pixel video at 30 frames per second via the JavaScript <code>navigator.mediaDevices.getUserMedia()</code> Application Programming Interface (API), encodes with H.264 Constrained Baseline Level 3.1, and sends it via WebRTC (Web Real Time Communication) to the demo server, which is a Selective Forwarding Unit.</li>
-  <li>The demo server has two simultaneous responsibilities for the incoming H.264 video stream: <strong>(a)</strong> re-publish the Real-time Transport Protocol (RTP) packets to all currently-connected viewer browsers, and <strong>(b)</strong> sample frames at LocateAnything-3B's calibration rate of approximately six frames per second, decode the H.264 access units to YUV color space, convert to Red-Green-Blue (RGB) color space, encode as Joint Photographic Experts Group (JPEG) images at quality 92, and send each JPEG over a WebSocket connection to the LocateAnything-3B inference server.</li>
+  <li>The demo server has two simultaneous responsibilities for the incoming H.264 video stream: <strong>(a)</strong> re-publish the Real-time Transport Protocol (RTP) packets to all currently-connected viewer browsers, and <strong>(b)</strong> sample the latest decoded frame at whatever cadence the LocateAnything-3B inference server can sustain (stop-and-wait per WebSocket: one frame in, one reply out — Section 19.1), decoding H.264 access units to YUV color space, converting to Red-Green-Blue (RGB) color space, encoding as Joint Photographic Experts Group (JPEG) images at quality 92, and sending each JPEG over a WebSocket connection to the inference server.</li>
   <li>LocateAnything-3B processes each JPEG and returns a JavaScript Object Notation (JSON) message containing bounding-box coordinates. The demo server normalizes coordinates to the floating-point range [0.0, 1.0] and forwards them over WebRTC Data Channel to the streamer and every viewer, keyed by frame identifier and RTP timestamp.</li>
-  <li>The streamer's WebAssembly frontend overlays bounding boxes on a Hypertext Markup Language (HTML) <code>&lt;canvas&gt;</code> element positioned above their own <code>&lt;video&gt;</code> element (with the understanding that the overlay is always slightly stale due to network and inference delay). The viewer browsers do the same, but with their <code>&lt;video&gt;</code> element receiving the video stream from the server through WebRTC; the boxes are synchronized to the video timeline via the <code>requestVideoFrameCallback</code> JavaScript API where supported (Google Chrome and Apple Safari), with a fallback to <code>requestAnimationFrame</code> with a latest-wins policy for Mozilla Firefox.</li>
+  <li>The streamer's WebAssembly frontend overlays bounding boxes on a Hypertext Markup Language (HTML) <code>&lt;canvas&gt;</code> element positioned above their own <code>&lt;video&gt;</code> element (with the understanding that the overlay is always stale by one LocateAnything-3B inference cycle plus the pipeline overhead — see Section 21.2 for the honest budget). The viewer browsers do the same, but with their <code>&lt;video&gt;</code> element receiving the video stream from the server through WebRTC; the boxes are synchronized to the video timeline via the <code>requestVideoFrameCallback</code> JavaScript API, which all browsers in the Section 22.1 matrix implement as of 2026-06-02 (Chrome / Safari / Chromium-on-iOS shells / Firefox 132+ desktop / Firefox for Android 150+). The WebAssembly client feature-detects rVFC at mount via <code>has_rvfc()</code> (Section 21.3); if it ever runs against a browser without rVFC, it surfaces a chained <code>anyhow::Error</code> to the user-facing error banner rather than silently falling back (Section 3.1).</li>
   <li>When the streamer disconnects (closes the browser tab, loses network, or explicitly releases ownership), the demo server's ownership finite state machine reverts cleanly to the Idle state, all viewer WebRTC peer connections are torn down, and the next person to visit the URL can claim the streamer slot.</li>
 </ol>
 
@@ -869,7 +869,7 @@ Use Bash:
   <li><code>mozjpeg::Compress::new()</code> defaults to the <code>JCP_MAX_COMPRESSION</code> profile (per <code>mozjpeg-rust-src/src/compress.rs:99-103</code> and the underlying C library <code>mozjpeg-research/jcparam.c:498-500</code>), which silently enables progressive JPEG, multipass <code>optimize_scans</code> search, and trellis quantization. This is the approximately-45-times-slower-than-libjpeg-turbo encoding path. The implementation agent must explicitly call <code>set_optimize_scans(false)</code> to fall back to baseline JPEG encoding.</li>
   <li>The Apple Security framework (used by Apple Safari on Apple iOS, Apple iPadOS, and Apple macOS, and by Google Chrome and Mozilla Firefox on Apple iOS and Apple iPadOS via WebKit-based shells) enforces an absolute 825-day maximum cert validity period for all Transport Layer Security certificates issued on or after 2020-09-01, including user-trusted self-signed certificates. There is no user-interface bypass. Empirically verified by Michal Špaček: 825-day certificate works, 826-day certificate is rejected with <code>trustd</code> error "Non-system-trusted leaf validity period longer than 825 days and issued on or after 1 July 2019".</li>
   <li><strong>The Leptos crate version <code>0.8.18</code> never existed on crates.io.</strong> Verified live 2026-06-01 via <code>curl https://crates.io/api/v1/crates/leptos/0.8.18</code> returning <code>{"errors":[{"detail":"crate 'leptos' does not have a version '0.8.18'"}]}</code>. The 0.8.x list jumps from 0.8.17 (2026-03-01) directly to <strong><code>0.8.19</code></strong> (2026-04-16). Earlier drafts of this plan had the assertion inverted ("0.8.19 does not exist; use 0.8.18") — that was a propagated mistake. Use <code>=0.8.19</code>.</li>
-  <li>The <code>requestVideoFrameCallback</code> Hypertext Markup Language Video Element method is <em>not</em> bound in <code>web-sys</code> crate version 0.3.99 (verified by reading <code>wasm-bindgen-0.2.122/crates/web-sys/src/features/gen_HtmlVideoElement.rs</code>). The implementation agent must hand-write a <code>#[wasm_bindgen(extends = HtmlVideoElement)]</code> extern declaration in the WebAssembly client crate to access this Application Programming Interface, which is needed for true per-frame bounding-box overlay synchronization on Google Chrome and Apple Safari (Mozilla Firefox does not implement <code>requestVideoFrameCallback</code> and falls back to a <code>requestAnimationFrame</code>-driven latest-wins overlay).</li>
+  <li>The <code>requestVideoFrameCallback</code> Hypertext Markup Language Video Element method is <em>not</em> bound in <code>web-sys</code> crate version 0.3.99 (verified by reading <code>wasm-bindgen-0.2.122/crates/web-sys/src/features/gen_HtmlVideoElement.rs</code>). The implementation agent must hand-write a <code>#[wasm_bindgen(extends = HtmlVideoElement)]</code> extern declaration in the WebAssembly client crate to access this Application Programming Interface, which is needed for per-frame bounding-box overlay synchronization. As of 2026-06-02, every browser in the Section 22.1 matrix implements rVFC — Mozilla Firefox shipped it to release in Firefox 132 (Bugzilla 1919367, released 2024-10-29) and to Firefox for Android in 150 — so the runtime <code>has_rvfc()</code> feature-detection (Section 21.3) is the universal entry point, with no per-browser branching.</li>
   <li>The <code>str0m</code> Internet Connectivity Establishment consent-freshness timeout is approximately 21.5 seconds, not RFC 7675's nominal 30 seconds. Math: <code>max_retransmits=9</code>; cumulative backoff per <code>str0m-src/crates/is/src/stun.rs:23-28</code> sums <code>stun_resend_delay(n)</code> for <code>n in 2..=9</code> (the n=1 step at 250ms is omitted; the algorithm starts at the second retry): 500+1000+2000+3000+3000+3000+3000+3000 = 18500 ms, plus a final 3000-ms wait at the cap = 21500 ms. The library author's comment in source: "libwebrtc uses 8000 here but we want faster detection of gone peers".</li>
   <li>The <code>str0m</code> 0.20 library has no <code>IceConnectionState::Failed</code> variant in the public enumeration. The variant is commented out in <code>str0m-src/crates/is/src/agent.rs:212</code> with the comment "the failed and closed state doesn't really have a mapping in this implementation. We never end trickle ICE and it's always possible to come back if more remote candidates are added". The implementation agent watches <code>IceConnectionState::Disconnected</code> events instead.</li>
   <li>The Debian Trixie (Debian version 13) operating system ships FFmpeg version 7.1.4 with <code>libavcodec61</code> shared object name (Application Binary Interface). The <code>ffmpeg-next</code> Rust crate version 8.1.0 requires FFmpeg version 8 headers. The implementation must use <code>ffmpeg-next</code> version <strong>7.1.0</strong> instead (released September 2024). Alternatives — mixing Debian Sid Application Package Tool sources into Trixie, or using Debian Sid for the entire base — were rejected as brittle. Ubuntu 26.04 LTS as the base was rejected as too new (6 weeks old as of 2026-06-01).</li>
@@ -1150,6 +1150,7 @@ Concurrently:
   <tr><td><code>hyper</code></td><td><code>=1.10.1</code></td><td><code>default-features = false, features = ["http1", "client"]</code>. Used only by the boot-time <code>/v1/capabilities</code> GET; the LocateAnything-3B WebSocket goes through <code>tokio-tungstenite</code> which embeds its own hyper handshake. <strong>NOT a transitive runtime dependency of <code>tokio-tungstenite</code> 0.29.0</strong> — that crate lists hyper only under <code>[dev-dependencies]</code>. This pin adds a real new runtime crate plus its transitive deps. Verified live against crates.io on 2026-06-01.</td></tr>
   <tr><td><code>hyper-util</code></td><td><code>=0.1.20</code></td><td><code>default-features = false, features = ["client", "client-legacy", "http1", "tokio"]</code>. Provides <code>legacy::Client</code> for the one-shot boot-time HTTP GET. The <code>client-legacy</code> feature is required because the hyper 1.x maintainers reshaped <code>Client</code> as a "legacy" API while higher-level alternatives (still under development) take shape. Adds roughly 10–15 crates to the dependency graph (the new HTTP/1.1 client surface and its primitives — <code>http</code>, <code>http-body</code>, <code>socket2</code>, etc.). Verified live against crates.io on 2026-06-01.</td></tr>
   <tr><td><code>http-body-util</code></td><td><code>=0.1.3</code></td><td><code>default-features = false</code>. Provides <code>BodyExt::collect()</code> for reading the response body into a single <code>Bytes</code> blob. Verified live against crates.io on 2026-06-01.</td></tr>
+  <tr><td><code>socket2</code></td><td><code>=0.6.4</code></td><td><code>default-features = false</code>. Used by Section 19.4.1 to set <code>TCP_KEEPALIVE</code> + <code>TCP_USER_TIMEOUT</code> on the LocateAnything-3B WebSocket's underlying TCP stream (defense against hung-but-TCP-alive LA replies; latency-agnostic, transport-level only). Already pulled in transitively by <code>hyper-util</code>, but we declare it as an explicit runtime pin since we call its API directly. Verified live against crates.io on 2026-06-02 — 0.6.4 is the latest stable.</td></tr>
 </table>
 
 <h3>7.5 Rust workspace dependencies — WebAssembly client crate</h3>
@@ -1187,7 +1188,7 @@ Concurrently:
   <li><code>ca-certificates</code> — for HTTPS connections from <code>cargo</code> to crates.io during the initial <code>cargo fetch</code> (only network step; everything after is offline).</li>
   <li><code>git</code> — in case any Cargo dependency has a git-url source (defensive; should not be needed if all deps come from crates.io).</li>
   <li><code>pkg-config</code> — for <code>ffmpeg-next</code> to locate the libav* development headers.</li>
-  <li><code>nasm</code> — Netwide Assembler, required by <code>mozjpeg-sys</code> for Single Instruction Multiple Data assembly compilation. (Without nasm, mozjpeg builds successfully via a non-SIMD fallback, but JPEG encode runs ~2-3x slower — material at our 6 FPS budget.)</li>
+  <li><code>nasm</code> — Netwide Assembler, required by <code>mozjpeg-sys</code> for Single Instruction Multiple Data assembly compilation. (Without nasm, mozjpeg builds successfully via a non-SIMD fallback, but JPEG encode runs ~2-3x slower — material on the per-frame critical path that feeds LocateAnything-3B, since mozjpeg encode sits in the stop-and-wait loop.)</li>
   <li><code>libavcodec-dev</code>, <code>libavutil-dev</code>, <code>libswscale-dev</code>, <code>libavformat-dev</code> — FFmpeg 7.1 development headers for <code>ffmpeg-next</code>.</li>
 </ul>
 <p>The C/C++ toolchain (<code>gcc</code>, <code>libc-dev</code>, <code>make</code>) is already installed in <code>rust:1.96.0-trixie</code> (which descends from <code>buildpack-deps:trixie</code>); no explicit install needed.</p>
@@ -1380,7 +1381,8 @@ Concurrently:
 │       ├── signaling.rs               # WebSocket reconnect-loop driver task (spawn_local); RwSignal<ConnState>
 │       ├── rtc.rs                     # web-sys RtcPeerConnection wrapper; set_ontrack; ondatachannel; addIceCandidate
 │       ├── camera.rs                  # enumerateDevices + getUserMedia + RTCRtpSender.replaceTrack()
-│       ├── overlay.rs                 # canvas overlay; rVFC where supported; RAF latest-wins fallback for Firefox
+│       ├── overlay.rs                 # canvas overlay synced via requestVideoFrameCallback (universal in Section 22.1 matrix);
+│       │                              # has_rvfc() feature-detect at mount surfaces anyhow::Error if absent (no RAF fallback)
 │       └── components/
 │           ├── claim_button.rs        # Leptos component; the initial "Claim Streamer" call-to-action
 │           ├── prompt_builder.rs      # 7-card grid -> per-template form -> live preview pane
@@ -1715,7 +1717,7 @@ fn canonical_templates_match_prompts_py_byte_for_byte() {
   <li><strong>JSON header fields:</strong> <code>frame_id</code>, <code>prompt</code>, <code>generation_mode</code>, <code>jpeg_len</code>. Verified against <code>/home/user/Desktop/locate_anything_setup/rust_server/src/protocol.rs:36-54</code>.</li>
   <li><strong>Reply:</strong> JSON text message. Examples: <code>{"type":"result","frame_id":...,"detections":[{"bbox_px":[...],"label":...,"score":...}, ...],"points":[...],"abstained":...,"latency_ms":...,"raw_text":"...","prompt_task":"...","model_output_truncated":...}</code> or <code>{"type":"error","frame_id":...,"code":"...","message":"..."}</code>.</li>
   <li><strong>Coordinate space in LA's reply:</strong> LA returns <code>bbox_px</code> in pixel coordinates of the source frame and <code>bbox_norm</code> in the [0, 1000] integer grid (per verified reading of <code>/home/user/Desktop/locate_anything_setup/worker/parsing.py:103, 154, 294</code>). Our demo server <strong>converts to the [0.0, 1.0] floating-point grid</strong> before forwarding to WebAssembly clients via DataChannel. Specifically: <code>x1 = bbox_norm[0] as f32 / 1000.0_f32</code>.</li>
-  <li><strong>Stop-and-wait per WebSocket connection.</strong> The LA server only handles one outstanding frame at a time per WebSocket. To get more concurrency, open more WebSockets; but for our use case one connection is enough since we only send approximately 6 frames per second.</li>
+  <li><strong>Stop-and-wait per WebSocket connection.</strong> The LA server only handles one outstanding frame at a time per WebSocket. To get more concurrency, open more WebSockets; but for our use case one connection is enough — the architecture is single-streamer (Section 11) so there is only ever one inference stream, and the natural-pace pipeline (Section 19.1) is intrinsically one-frame-in-flight regardless of LA's per-frame latency.</li>
 </ul>
 
 <hr>
@@ -1767,7 +1769,12 @@ let (fsm_tx, fsm_rx) = tokio::sync::mpsc::channel::&lt;FsmCommand&gt;(256);
 let (phase_tx, phase_rx) = tokio::sync::watch::channel(Phase::Idle);
 
 // H.264 access-unit channel: SFU → decode-pipeline task (Section 19.1).
-// Capacity 256 ≈ 8.5 s @ 30 fps; non-coalescing, in-order.
+// Capacity 256 frames; non-coalescing, in-order. Sized as "many frames",
+// not "seconds" — the producer is the browser encoder whose framerate
+// varies with thermal/battery throttle (libwebrtc QualityScaler may drop
+// from 30 fps to ~5 fps under sustained load). 256 frames absorbs any
+// transient decoder hiccup; sustained Full = the decoder has wedged and
+// loud-disconnect is the correct signal.
 let (au_tx, au_rx) = tokio::sync::mpsc::channel::&lt;std::sync::Arc&lt;[u8]&gt;&gt;(256);
 
 // RGB frame channel: decode-pipeline → LA-WS-client task (Section 19.1).
@@ -1970,7 +1977,9 @@ pub struct Sfu {
     pub stun_rate_limiter:   RateLimiter&lt;IpAddr, DashMapStateStore&lt;IpAddr&gt;, DefaultClock&gt;,
     /// Sender side of the bounded H.264 access-unit channel to the
     /// decode-pipeline task (Section 19.1 step 1). The matching Receiver
-    /// is owned exclusively by that task. Capacity 256 (~8.5 s at 30 fps).
+    /// is owned exclusively by that task. Capacity 256 frames — sized as
+    /// "many frames" rather than seconds because the encoder framerate
+    /// varies with thermal/battery throttle on mobile producers.
     /// `try_send` returns `Err(Full)` if the decoder is wedged; the SFU
     /// propagates this as anyhow::Error per the no-fallback rule.
     pub au_tx:               tokio::sync::mpsc::Sender&lt;std::sync::Arc&lt;[u8]&gt;&gt;,
@@ -2134,8 +2143,8 @@ impl Sfu {
         // reference-count bump, not a byte-copy.
         self.au_tx.try_send(data.data.clone())
             .with_context(|| format!(
-                "AU mpsc push (cap=256) for streamer {} — Full means the \
-                 decode pipeline has wedged for ≳8.5 s; disconnecting streamer",
+                "AU mpsc push (cap=256 frames) for streamer {} — Full means the \
+                 decode pipeline failed to drain 256 access units; disconnecting streamer",
                 streamer_id
             ))?;
         Ok(())
@@ -3190,7 +3199,7 @@ HEALTHCHECK --interval=30s \
 --log-opt max-file=3 \
 --log-opt compress=true</code></pre>
 
-<p>At 6 frames per second sampling × ~120 bytes per <code>tracing</code> JSON log line per box message, worst-case ~720 KiB/hour. Three 10-MiB files rotate at ~14 hours of log per cycle, ~42 hours total before rotation drops the oldest. Plenty.</p>
+<p>At the inference cadence the LocateAnything-3B server can sustain (~1.3 fps hybrid as of 2026-06-02 per <code>/home/user/Desktop/locate_anything_setup/docs/DRONE_DETECTION.md:113-117</code>; depends entirely on the model and chosen <code>generation_mode</code>), with ~120 bytes per <code>tracing</code> JSON log line per box message, worst-case is well under 1 MiB/hour. Three 10-MiB files rotate at days of log per cycle. A future faster model would scale this proportionally; the 30 MiB total rotation cap absorbs anything plausible.</p>
 
 <p><strong>journald alternative rejected.</strong> Host is Ubuntu 24.04 LTS with systemd, so <code>--log-driver journald</code> is available, but: (a) <code>docker logs</code> against a journald-backed container requires Docker to consult the journal API, which loses the ability to read logs after <code>docker rm</code> without <code>--volume</code>-binding <code>/var/log/journal</code>; (b) the project's discipline is "the container is the artifact" — log inspection via <code>docker logs</code> should always work without consulting host services. Stick with <code>json-file</code>.</p>
 
@@ -3673,7 +3682,7 @@ Without this sequence, the browser learns of disconnect only via ICE consent-fre
 
 <p>The pipeline is structured so that LocateAnything-3B naturally pulls a frame at its own pace:</p>
 <ol>
-  <li><strong>SFU → decoder feed (non-coalescing).</strong> The Selective Forwarding Unit's <code>on_streamer_media_data</code> handler does two things on every <code>Event::MediaData</code> from the streamer: (a) re-publish the access unit (AU) to every viewer via <code>str0m::Writer</code> (Section 11.7, unchanged); (b) push the AU into a bounded <code>tokio::sync::mpsc::channel(256)</code> toward the decode-pipeline task. The capacity is roughly 8.5 seconds of frames at 30 fps — a safety margin against transient decoder stalls. <strong>In-order delivery, no coalescing.</strong> The H.264 reference chain across P-frames is preserved end-to-end. On <code>try_send</code> returning <code>Err(Full)</code>, the SFU surfaces an <code>anyhow::Error</code> up to its supervising task, which disconnects the streamer per the strict no-fallback rule (Section 3); a chronic Full condition indicates the decode pipeline has wedged and silent backpressure would only mask the bug.</li>
+  <li><strong>SFU → decoder feed (non-coalescing).</strong> The Selective Forwarding Unit's <code>on_streamer_media_data</code> handler does two things on every <code>Event::MediaData</code> from the streamer: (a) re-publish the access unit (AU) to every viewer via <code>str0m::Writer</code> (Section 11.7, unchanged); (b) push the AU into a bounded <code>tokio::sync::mpsc::channel(256)</code> toward the decode-pipeline task. The capacity is sized in <em>frames</em>, not seconds — the producer-side framerate is whatever the browser encoder happens to be emitting (the WebRTC capture target is 30 fps but libwebrtc's QualityScaler may drop it under mobile thermal or battery-save throttle); 256 access units is a generous safety margin against any transient decoder stall regardless of the live encoder rate. <strong>In-order delivery, no coalescing.</strong> The H.264 reference chain across P-frames is preserved end-to-end. On <code>try_send</code> returning <code>Err(Full)</code>, the SFU surfaces an <code>anyhow::Error</code> up to its supervising task, which disconnects the streamer per the strict no-fallback rule (Section 3); a chronic Full condition indicates the decode pipeline has wedged and silent backpressure would only mask the bug.</li>
   <li><strong>Decoder (stateful, long-lived).</strong> One <code>ffmpeg_next::codec::context::Context</code> with an open H.264 decoder lives for the entire streaming session. The task calls <code>decoder.send_packet(&amp;packet)</code> and <code>decoder.receive_frame(&amp;mut yuv_frame)</code> per AU. <strong>libavcodec naturally suppresses output before the H.264 recovery flag is set</strong> (verified at upstream <code>libavcodec/h264_slice.c:1376-1383</code>: without <code>AV_CODEC_FLAG_OUTPUT_CORRUPT</code>, output is held until <code>out-&gt;recovered = true</code>, set on IDR at line 1664 or on an SEI recovery-point message). Therefore: a fresh decoder attaching mid-stream on a P-frame DOES NOT emit corrupt pixels — it stays silent until the recovery IDR arrives. Cold-start before the very first IDR is correct by construction. Mid-stream Sequence Parameter Set changes (e.g., the streamer's camera changing resolution via <code>RTCRtpSender.replaceTrack</code> in Section 21.6) are handled by libavcodec's automatic re-init path at <code>h264_slice.c:1080-1090</code>.</li>
   <li><strong>Packet-loss recovery is event-driven.</strong> str0m's depacketizer holds packets for up to 30 frames (~1 second at 30 fps; default at <code>str0m 0.20.0 src/config.rs:639</code>) waiting for Negative-Acknowledgement-driven retransmission via the 3-second StreamTx cache (<code>src/streams/send.rs:38, 275</code>). When that hold-back window expires without recovery, str0m emits <code>MediaData.contiguous = false</code>. The decode-pipeline task, on observing this, calls <code>decoder.flush()</code> to clear the Decoded Picture Buffer AND emits one <code>KeyframeRequestKind::Pli</code> upstream to the streamer via the FSM. This is the str0m reference pattern (<code>examples/chat.rs:442-445</code>) verbatim — event-driven, not periodic.</li>
   <li><strong>YUV → RGB conversion (long-lived swscale Context).</strong> Each successfully-decoded YUV420P frame goes through libswscale via <code>ffmpeg_next::software::scaling::Context</code> with <code>Flags::BICUBIC</code> and an explicit <code>sws_setColorspaceDetails</code> call (BT.709 source coefficients, limited→full range — see Section 19.3 for the unsafe FFI shape and rationale). The swscale Context is long-lived across the streaming session; it is reconstructed only when the decoded frame's dimensions change (the libavcodec auto-reinit signal at <code>h264_slice.c:1080-1090</code>).</li>
@@ -3803,7 +3812,7 @@ LA WebSocket client task (the natural-rate driver):
   <li><code>compress.set_use_scans_in_trellis(false)</code> — already false by default but be explicit.</li>
   <li><code>compress.set_smoothing_factor(0)</code> — disables edge-smoothing pre-pass; smoothing hurts detection edge crispness.</li>
 </ul>
-Result: approximately 8 to 15 milliseconds per 720p frame at quality 92 on a typical x86_64 server core. Out of LocateAnything-3B's 166-millisecond frame budget (at 6 frames per second), JPEG encode is approximately 8.5 percent — abundant headroom.
+Result: approximately 8 to 15 milliseconds per 720p frame at quality 92 on a typical x86_64 server core. mozjpeg encode sits on the per-frame critical path that the LA WebSocket client task drains — adding ~10 ms to whatever the upstream inference latency is. Even against LocateAnything-3B's fastest mode (point_to at ~210 ms per <code>docs/DRONE_DETECTION.md:113-117</code>) that is &lt; 5 % of the cycle; against hybrid (~785 ms) it is &lt; 2 %. The design tolerates much faster models too — if a future LocateAnything variant runs at ~50 ms inference, mozjpeg becomes ~20 % of the cycle, still acceptable.
 </div>
 
 <h3>19.3 libswscale colorspace — BT.709 limited→full applied explicitly</h3>
@@ -3842,6 +3851,49 @@ loop {
     }
 }</code></pre>
 <p>The <code>MissedTickBehavior::Skip</code> setting prevents a backlog of keepalives queueing up after a long busy period (otherwise an interval that was suppressed for ten ticks would fire ten times in rapid succession). The <code>biased</code> selector prefers frame-send over ping, so a steadily-streaming session never emits a keepalive.</p>
+
+<h4>19.4.1 OS-level TCP keepalive on the LocateAnything-3B socket — defense against hung-but-alive replies</h4>
+
+<p>The application-level RFC 6455 ping above defends against the LA server's 60-second read-idle close. It does NOT defend against the LA <em>process</em> hanging on a forward pass while the TCP socket stays open — in that scenario the LA WebSocket client task is parked on <code>ws.next().await</code> waiting for the reply, the SFU keeps decoding frames into the watch slot, the FSM still sees <code>la_reachable = true</code>, and the streamer's overlay silently never updates. This is the kind of silent-stall the user's Section 3 explicitly forbids.</p>
+
+<p>The sovereign cure is OS-level TCP keepalive on the LA socket. These are transport-layer parameters, completely independent of LocateAnything-3B's per-frame inference time — they detect a TCP-dead peer, nothing about model perf. The implementation enables three Linux-specific options on the underlying <code>tokio::net::TcpStream</code> after <code>tokio_tungstenite::connect_async</code> returns but before the WebSocket handshake is consumed:</p>
+
+<pre><code>use std::time::Duration;
+use socket2::{SockRef, TcpKeepalive};
+
+// Reach the underlying TcpStream through tokio's MaybeTlsStream → TcpStream
+// chain. tokio-tungstenite 0.29 exposes the inner stream via
+// `WebSocketStream::get_ref()`. For plain ws:// (our LA endpoint, per
+// docs/SECURITY.md), `MaybeTlsStream::Plain(TcpStream)` is the inner.
+let tcp_stream: &amp;tokio::net::TcpStream = match ws.get_ref() {
+    tokio_tungstenite::MaybeTlsStream::Plain(s) =&gt; s,
+    _ =&gt; anyhow::bail!("LA WS unexpectedly wrapped in TLS; design is ws:// per docs/SECURITY.md"),
+};
+let sock_ref = SockRef::from(tcp_stream);
+
+// Idle 10 s, then probe every 5 s, fail after 3 unanswered probes.
+// Worst-case TCP-dead detection: 10 + 3*5 = 25 s. No LA-perf coupling.
+let keepalive = TcpKeepalive::new()
+    .with_time(Duration::from_secs(10))
+    .with_interval(Duration::from_secs(5))
+    .with_retries(3);
+sock_ref.set_tcp_keepalive(&amp;keepalive)
+    .context("set_tcp_keepalive on LA WS socket")?;
+
+// Bound transmit-stall on the send side: if the kernel cannot get any TCP
+// ACK for an in-flight segment within 25 s, the next write/read on this
+// socket returns ETIMEDOUT. Linux-specific (`TCP_USER_TIMEOUT`, RFC 5482).
+sock_ref.set_tcp_user_timeout(Some(Duration::from_secs(25)))
+    .context("set_tcp_user_timeout on LA WS socket")?;
+</code></pre>
+
+<p>Properties of this design:</p>
+<ul>
+  <li><strong>Latency-agnostic:</strong> the 10 s / 5 s / 3 retries / 25 s numbers are transport-level. They do not change if LocateAnything-3B is replaced by a model with 10 ms inference or 10 s inference.</li>
+  <li><strong>Sovereign:</strong> uses standard Linux kernel sockopts via the <code>socket2</code> crate (pinned at <code>=0.6.4</code>, verified live on 2026-06-02 — see Section 7.4). Already in the dependency closure transitively via <code>hyper-util</code>; the explicit pin is declared so the call sites here are honest about their direct dependency.</li>
+  <li><strong>Loud failure:</strong> a TCP-dead LA causes the next <code>ws.send</code> or <code>ws.next().await</code> to return <code>Err(io::Error { kind: TimedOut, .. })</code>, which the task propagates as anyhow chain → <code>FsmCommand::LaDown { error }</code> → the FSM transitions Streaming/Claimed to Draining with code <code>"la_unreachable"</code>, exactly as Section 19.4 step 1 already specifies.</li>
+  <li><strong>No application-level reply-timeout needed:</strong> we deliberately do NOT add a <code>tokio::time::timeout</code> around <code>ws.next().await</code>, because that would couple the demo server's correctness to a specific bound on LA's inference time (and LA-3B's p95 slow mode is already 1.61 s per <code>/home/user/Desktop/locate_anything_setup/docs/DRONE_DETECTION.md:117</code>; future models could be slower without changing the protocol). The OS keepalive detects TCP-dead, which is genuinely model-independent.</li>
+</ul>
 
 <p><strong>Behavior on disconnect (strict, no advisory sub-state):</strong> the WebAssembly streamer sees a single user-facing error and the Finite State Machine releases the streamer slot:</p>
 
@@ -4481,10 +4533,10 @@ fn App() -&gt; impl IntoView {
 <p>The video display has two structurally different paths depending on the user's role:</p>
 <dl>
   <dt>Streamer path</dt>
-  <dd>The user's own browser captures via <code>getUserMedia</code>; the resulting MediaStream is assigned to a local <code>&lt;video&gt;</code> element via <code>HtmlMediaElement::set_src_object</code>. Display latency is essentially zero (browser-internal pipeline). The bounding-box overlay arriving via DataChannel is always stale by approximately 200-500 milliseconds (network round-trip plus LocateAnything-3B inference time). To honor this honestly, render streamer overlays in a desaturated red (<code>#dd5050</code>) and show a small badge with the running median round-trip-time in the corner.</dd>
+  <dd>The user's own browser captures via <code>getUserMedia</code>; the resulting MediaStream is assigned to a local <code>&lt;video&gt;</code> element via <code>HtmlMediaElement::set_src_object</code>. Display latency is essentially zero (browser-internal pipeline). The bounding-box overlay arriving via DataChannel is always stale by approximately <em>one full inference cycle</em> — for LocateAnything-3B this is the hybrid-mode mean of ~785 ms plus the demo server's pipeline overhead of ~10–15 ms, so roughly ~800 ms typical and up to ~1.3 s at the p95 of slow mode (per <code>/home/user/Desktop/locate_anything_setup/docs/DRONE_DETECTION.md:113-117</code>). The exact value depends entirely on the upstream model and the operator's chosen <code>generation_mode</code>; if the model is replaced or its latency changes, this staleness changes one-for-one and the rest of the design is invariant. To honor this honestly, render streamer overlays in a desaturated red (<code>#dd5050</code>) and show a small badge with the running median round-trip-time in the corner (this value is computed live, never hardcoded).</dd>
 
   <dt>Viewer path</dt>
-  <dd>The user's browser receives a MediaStream from the server via <code>RTCPeerConnection.set_ontrack</code> callback's <code>RtcTrackEvent.streams[0]</code>; this stream is assigned to a local <code>&lt;video&gt;</code> element. Display latency includes the server's SFU processing plus the viewer's WebRTC pipeline (approximately 100-200 milliseconds total typically). Bounding-box overlay arrives via DataChannel and is synchronized to the video timeline via the <code>requestVideoFrameCallback</code> JavaScript API where supported (Google Chrome and Apple Safari): the callback's <code>metadata.rtpTimestamp</code> field gives the RTP timestamp of the currently-presenting frame; we look it up in a <code>BTreeMap&lt;rtp_ts, BoxMessage&gt;</code> keyed by the DataChannel's incoming <code>rtp_ts</code> field. Render in saturated red (<code>#ff3030</code>). For Mozilla Firefox, which does not implement <code>requestVideoFrameCallback</code>, fall back to <code>requestAnimationFrame</code> with latest-wins policy (render whatever the most recently arrived BoxMessage said, accepting up to ~200ms drift; show a "best-effort sync" badge).</dd>
+  <dd>The user's browser receives a MediaStream from the server via <code>RTCPeerConnection.set_ontrack</code> callback's <code>RtcTrackEvent.streams[0]</code>; this stream is assigned to a local <code>&lt;video&gt;</code> element. End-to-end streamer-camera → viewer-screen latency is the sum of the streamer's encoder (libwebrtc default ~30–80 ms), LAN/Internet transit (~5–50 ms), the SFU re-publish (sub-ms), the viewer browser's adaptive jitter buffer (~20–150 ms typical), and viewer decode/render (~30 ms) — roughly ~120–300 ms typical for a real-time link. The bounding-box overlay arrives via DataChannel and is synchronized to the video timeline via the <code>requestVideoFrameCallback</code> JavaScript API: the callback's <code>metadata.rtpTimestamp</code> field gives the RTP timestamp of the currently-presenting video frame; we look it up in a <code>BTreeMap&lt;rtp_ts, BoxMessage&gt;</code> keyed by the DataChannel's incoming <code>rtp_ts</code> field, so the box is matched to the exact frame the inference saw (regardless of LA's per-frame latency). Render in saturated red (<code>#ff3030</code>). All current browsers in the Section 22.1 matrix implement rVFC (Chrome, Safari, Chromium-on-iOS shells, Firefox 132+ desktop, Firefox for Android 150+); the <code>has_rvfc()</code> feature-detect at mount surfaces a chained <code>anyhow::Error</code> to the user-facing banner if the binding is ever absent — strict no-silent-fallback per Section 3.1.</dd>
 </dl>
 
 <h3>21.3 The <code>requestVideoFrameCallback</code> extern declaration</h3>
@@ -4584,7 +4636,7 @@ pub fn has_rvfc(video: &amp;web_sys::HtmlVideoElement) -&gt; anyhow::Result&lt;b
     ))?;
 </code></pre>
 
-<p>The error banner displays the chained string; the overlay pipeline halts; the video continues to play (this is a sync-only failure, not a video-decode failure). No silent fallback to <code>requestAnimationFrame</code>-latest-wins on Chrome and Safari — that path is reserved for browsers without rVFC at all (notably Mozilla Firefox as of 2026-06-01), where the <code>has_rvfc()</code> feature-detection at startup sets a different code path from the outset rather than running into a sudden <code>None</code> mid-stream.</p>
+<p>The error banner displays the chained string; the overlay pipeline halts; the video continues to play (this is a sync-only failure, not a video-decode failure). <strong>There is no silent fallback to <code>requestAnimationFrame</code>-latest-wins anywhere</strong>. All browsers in the Section 22.1 matrix support rVFC as of 2026-06-02 (Firefox 132+ desktop, Firefox for Android 150+), so a missing-rVFC outcome from <code>has_rvfc()</code> means an unexpected browser environment — surfaced as a chained <code>anyhow::Error</code> at startup rather than continued execution under a degraded sync policy, strictly per Section 3.1.</p>
 
 <p>Source-level verification for the reliability claim: Chromium <code>third_party/blink/renderer/modules/video_rvfc/video_frame_callback_requester_impl.cc:297-303</code> sets the <code>rtpTimestamp</code> attribute whenever the underlying <code>media::VideoFrameMetadata::rtp_timestamp</code> has a value AND the value fits in <code>uint32_t</code> (both conditions hold for inbound WebRTC tracks because <code>webrtc::VideoFrame::rtp_timestamp()</code> returns the 32-bit RTP header field directly). Apple WebKit <code>Source/WebCore/platform/mediastream/RealtimeIncomingVideoSource.cpp:141-142</code> uses the same gating: <code>if (isInBounds&lt;uint32_t&gt;(frame.rtp_timestamp())) metadata.rtpTimestamp = frame.rtp_timestamp();</code>. RFC 3550 fixes the WebRTC video clock at 90 kHz; the value is monotonically increasing modulo 2<sup>32</sup>.</p>
 
@@ -4985,12 +5037,12 @@ loop {
   <tr><td>Apple iPhone or iPad</td><td>Google Chrome for Apple iOS (WebKit-based shell)</td><td>Session-only</td><td>Yes</td><td>Yes</td><td>Yes</td></tr>
   <tr><td>Apple iPhone or iPad</td><td>Mozilla Firefox for Apple iOS (WebKit-based shell)</td><td>Session-only</td><td>Yes</td><td>Yes</td><td>Yes</td></tr>
   <tr><td>Samsung Galaxy S25 Android smartphone (or any modern Android smartphone)</td><td>Google Chrome for Android</td><td>Persistent until cache clear</td><td>Yes</td><td>Yes</td><td>Yes</td></tr>
-  <tr><td>Same Android device</td><td>Mozilla Firefox for Android</td><td>Persistent</td><td>Yes</td><td>Yes</td><td><strong>No</strong> (fallback to RAF)</td></tr>
+  <tr><td>Same Android device</td><td>Mozilla Firefox for Android</td><td>Persistent</td><td>Yes</td><td>Yes</td><td>Yes (Firefox for Android 150+)</td></tr>
   <tr><td>Microsoft Windows laptop or desktop</td><td>Google Chrome desktop</td><td>Persistent per profile</td><td>Yes</td><td>Yes</td><td>Yes</td></tr>
-  <tr><td>Microsoft Windows laptop or desktop</td><td>Mozilla Firefox desktop</td><td>Persistent via <code>cert_override.txt</code></td><td>Yes</td><td>Yes</td><td><strong>No</strong></td></tr>
+  <tr><td>Microsoft Windows laptop or desktop</td><td>Mozilla Firefox desktop</td><td>Persistent via <code>cert_override.txt</code></td><td>Yes</td><td>Yes</td><td>Yes (Firefox 132+)</td></tr>
   <tr><td>Apple macOS desktop</td><td>Apple Safari</td><td>Per-tab/session</td><td>Yes</td><td>Yes</td><td>Yes</td></tr>
   <tr><td>Apple macOS desktop</td><td>Google Chrome desktop</td><td>Persistent</td><td>Yes</td><td>Yes</td><td>Yes</td></tr>
-  <tr><td>Apple macOS desktop</td><td>Mozilla Firefox desktop</td><td>Persistent</td><td>Yes</td><td>Yes</td><td><strong>No</strong></td></tr>
+  <tr><td>Apple macOS desktop</td><td>Mozilla Firefox desktop</td><td>Persistent</td><td>Yes</td><td>Yes</td><td>Yes (Firefox 132+)</td></tr>
 </table>
 
 <h3>22.2 Critical compatibility notes</h3>
@@ -4998,7 +5050,7 @@ loop {
   <li>Apple iOS Safari's "Show Details → visit this website" cert click-through is <strong>session-only</strong>. Lost on tab close, app switch (long enough for WebKit to reclaim the session), or browser restart. The only durable trust mechanism on Apple iOS is installing a Configuration Profile (<code>.mobileconfig</code> file) under Settings → General → About → Certificate Trust Settings, which is outside the basic flow.</li>
   <li>Every browser loses the cert trust decision when our cert is regenerated (cert fingerprint changes). This will happen approximately every 27 months at the operator's discretion when the cert approaches its 824-day notAfter.</li>
   <li>Google Chrome desktop running under enterprise management with <code>SSLErrorOverrideAllowed=false</code> policy <strong>cannot reach the demo at all</strong>: the "Proceed (Insecure)" link is hidden and the hidden <code>thisisunsafe</code> keystroke bypass is also disabled. Document this for IT-admin awareness in the operator-facing README.</li>
-  <li>Mozilla Firefox does not implement <code>requestVideoFrameCallback</code> as of 2026-06-01 (verified via Browser Compatibility Database at caniuse.com). Fallback path: render box overlays in a <code>requestAnimationFrame</code>-driven loop with the most-recently-arrived BoxMessage; accept approximately 200 milliseconds of overlay-to-video drift; show a small "best-effort sync" badge.</li>
+  <li>All current browsers in the Section 22.1 matrix implement <code>requestVideoFrameCallback</code>: Chrome / Safari / Chromium-on-iOS / Firefox 132+ desktop (released October 2024, Bugzilla 1919367) / Firefox for Android 150+. The WebAssembly client still feature-detects via <code>has_rvfc()</code> (Section 21.3) at mount time — if it ever runs against a browser without rVFC (an older Firefox or a future browser variant), it propagates a chained <code>anyhow::Error</code> to the user-facing error banner instead of silently falling back. Strict no-silent-fallback per Section 3.</li>
   <li>Apple iOS Safari's <code>enumerateDevices()</code> returns empty <code>MediaDeviceInfo.label</code> strings until a successful <code>getUserMedia</code> call grants permission. The camera-picker pattern in Section 21.6 accommodates this with the two-stage "Detect cameras" call-to-action.</li>
   <li>WebRTC over self-signed origins works on every browser in the matrix after the user clicks through the cert warning. <code>window.isSecureContext</code> evaluates to true once the page loads over HTTPS, regardless of cert-validation outcome (per the Web Hypertext Application Technology Working Group Secure Contexts specification: the algorithm checks the URL scheme, not the cert validation status).</li>
 </ul>
@@ -6306,7 +6358,7 @@ echo "scripts/lint/no_hardcoded_secrets.sh: clean."
 <p>These are the items that genuinely could not be resolved from cloned source and require empirical verification or operational experience.</p>
 
 <ul>
-  <li><strong>mozjpeg encode latency at 720p on the target host.</strong> Estimated 8 to 15 milliseconds based on extrapolation from libjpeg-turbo benchmarks. Run a microbenchmark in continuous-integration on the target box to confirm. If the actual number exceeds 30 milliseconds (approximately 18 percent of the LocateAnything-3B frame budget), reconsider the quality setting.</li>
+  <li><strong>mozjpeg encode latency at 720p on the target host.</strong> Estimated 8 to 15 milliseconds based on extrapolation from libjpeg-turbo benchmarks. Run a microbenchmark in continuous-integration on the target box to confirm. If the actual number exceeds 30 milliseconds, reconsider the quality setting — at that point mozjpeg starts to be a meaningful fraction of LocateAnything-3B's fastest mode (point_to at ~210 ms), and a non-trivial fraction of any plausibly-faster successor model.</li>
   <li><strong>str0m drain timer of 5 seconds for Real-time Transport Control Protocol Bye flush.</strong> The reference <code>chat.rs</code> uses no drain; 5 seconds is our defensive choice. The Real-time Transport Control Protocol Bye message and the SCTP shutdown chunk may not have flushed within 5 seconds under heavy congestion. Empirical observation will tell.</li>
   <li><strong>Apple iOS 26-specific behavior.</strong> No Apple release notes documenting changes to the 825-day cert cap, click-through persistence, or WebRTC behavior versus iOS 17-18 baseline. Assumed continuous. Verify on a real Apple iPhone 17 device when one is available.</li>
   <li><strong>Per-viewer SCTP pacing under N=100 viewer load.</strong> str0m's single-thread model may bottleneck before SCTP send buffers fill. Untested at scale. The expected demo audience is small (single-digit to low-double-digit viewers), so this is unlikely to bite in practice.</li>
