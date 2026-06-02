@@ -1548,7 +1548,7 @@ pub enum SignalMessage {
 <div class="note note-critical">
 <strong>DataChannel reliability config (verified by source-level research on 2026-06-01):</strong> <code>ordered: false, reliability: Reliability::MaxRetransmits { retransmits: 0 }</code>. <em>NOT</em> the previously-drafted <code>ordered: true, max_retransmits: None</code> (reliable+ordered) — that config is wrong for our use case.
 
-<p><strong>Why unordered + zero retransmits is strictly correct:</strong> BoxMessages are inherently time-stamped (the <code>rtp_ts</code> field below identifies the video frame the boxes correspond to); the WebAssembly viewer re-sorts arriving messages by <code>rtp_ts</code> into a <code>BTreeMap</code> keyed by the rVFC metadata's RTP timestamp (Section 21.3). Therefore receive-order is irrelevant.</p>
+<p><strong>Why unordered + zero retransmits is strictly correct:</strong> Each BoxMessage carries an <code>rtp_ts</code> field identifying the video frame it was inferred from. The WebAssembly client uses Strategy A (latest-wins, §21.2): a single <code>latest_box: RwSignal&lt;Option&lt;BoxMessage&gt;&gt;</code> slot holds the most-recent inference result, with wrap-aware "newer-rtp_ts wins" comparison on the rare case a DataChannel reorder delivers an older box after a newer one (§21.3.1). Therefore receive-order is irrelevant — the freshest box always wins, the box overlay is always at most one inference cycle stale (a property the user has explicitly accepted).</p>
 
 <p>If we used <code>Reliable</code> + <code>ordered</code>, SCTP would retransmit lost packets AND hold back subsequent packets until the lost one is delivered (head-of-line blocking) — then deliver the now-stale BoxMessage. That is exactly the failure mode Section 10.7.1 warns against. The <code>Channel::write</code> <code>Ok(false)</code> drop-on-backpressure only handles local 128-kibibyte SCTP buffer pressure; it does NOT prevent in-flight retransmissions causing stale delivery. Unordered+zero-retransmits eliminates the head-of-line stall and guarantees that any datagram arriving at the client is either the freshest available or simply absent.</p>
 
@@ -4659,15 +4659,30 @@ fn App() -&gt; impl IntoView {
 }
 </code></pre>
 
-<h3>21.2 Two display paths</h3>
-<p>The video display has two structurally different paths depending on the user's role:</p>
+<h3>21.2 Two display paths — independent latency goals</h3>
+
+<p>Video and bounding-box overlays travel on two independent paths with different latency goals:</p>
+
+<ul>
+  <li><strong>Video path</strong> (streamer → SFU → viewer): low-latency live stream. WebRTC over UDP/SRTP, with the SFU re-publishing RTP packets verbatim (no decode, no re-encode). End-to-end target: 120–300 ms typical streamer-camera-to-viewer-screen. This is dramatically lower than YouTube Live (~3–10 s buffer).</li>
+  <li><strong>Boxes path</strong> (streamer → SFU → LocateAnything-3B → SFU → ALL peers via DataChannel): one full inference cycle of unavoidable latency, dominated by the upstream model. Boxes go to the streamer AND to every viewer in parallel, so the streamer's box latency is not penalized by viewer fan-out.</li>
+</ul>
+
+<p>Because these are independent paths, slow LA inference does NOT slow the live video stream, and fast video does NOT speed up the boxes. The user's stated goals — "video to viewers ASAP without stutter, boxes for the streamer ASAP" — are met by keeping the two flows architecturally separate, which they already are.</p>
+
+<p>The user has explicitly granted that boxes do NOT need to be displayed on the exact video frame they were inferred from: <em>"no need for the bounding boxes to come in at the same time as the frame being presented."</em> The plan honors this with <strong>Strategy A — latest-wins overlay</strong>: every browser (streamer and viewer alike) draws the most recent BoxMessage on whatever frame is currently being presented. The box always represents a scene ~one inference cycle in the past relative to the live video on screen; this is irreducible (physics) and consistent with the user's framing.</p>
+
 <dl>
   <dt>Streamer path</dt>
-  <dd>The user's own browser captures via <code>getUserMedia</code>; the resulting MediaStream is assigned to a local <code>&lt;video&gt;</code> element via <code>HtmlMediaElement::set_src_object</code>. Display latency is essentially zero (browser-internal pipeline). The bounding-box overlay arriving via DataChannel is always stale by approximately <em>one full inference cycle</em> — for LocateAnything-3B this is the hybrid-mode mean of ~785 ms plus the demo server's pipeline overhead of ~10–15 ms, so roughly ~800 ms typical and up to ~1.3 s at the p95 of slow mode (per <code>/home/user/Desktop/locate_anything_setup/docs/DRONE_DETECTION.md:113-117</code>). The exact value depends entirely on the upstream model and the operator's chosen <code>generation_mode</code>; if the model is replaced or its latency changes, this staleness changes one-for-one and the rest of the design is invariant. To honor this honestly, render streamer overlays in a desaturated red (<code>#dd5050</code>) and show a small badge with the running median round-trip-time in the corner (this value is computed live, never hardcoded).</dd>
+  <dd>The user's own browser captures via <code>getUserMedia</code>; the resulting MediaStream is assigned to a local <code>&lt;video&gt;</code> element via <code>HtmlMediaElement::set_src_object</code>. Display latency is essentially zero (browser-internal pipeline). The bounding-box overlay is drawn via <code>requestAnimationFrame</code> (NOT rVFC — rVFC's <code>metadata.rtpTimestamp</code> is absent for local <code>getUserMedia</code> tracks per WICG video-rvfc spec, since local sources have no RTP timeline). On each RAF tick the canvas reads <code>latest_box</code> via <code>RwSignal::with_untracked</code> (no Leptos reactive subscription — pure pull) and renders the most-recent BoxMessage's rectangles. Color: desaturated red <code>#dd5050</code>. A small corner badge displays the running median round-trip-time (live-computed from each box's <code>rtp_ts</code> compared to the streamer-side wall-clock at receive time), so the streamer knows exactly how stale their overlay is. The staleness is the LA cycle plus pipeline overhead — ~785 ms hybrid, ~937 ms slow, ~210 ms point_to as of LA-3B (per <code>/home/user/Desktop/locate_anything_setup/docs/DRONE_DETECTION.md:113-117</code>); a model swap changes this one-for-one without architectural change.</dd>
 
   <dt>Viewer path</dt>
-  <dd>The user's browser receives a MediaStream from the server via <code>RTCPeerConnection.set_ontrack</code> callback's <code>RtcTrackEvent.streams[0]</code>; this stream is assigned to a local <code>&lt;video&gt;</code> element. End-to-end streamer-camera → viewer-screen latency is the sum of the streamer's encoder (libwebrtc default ~30–80 ms), LAN/Internet transit (~5–50 ms), the SFU re-publish (sub-ms), the viewer browser's adaptive jitter buffer (~20–150 ms typical), and viewer decode/render (~30 ms) — roughly ~120–300 ms typical for a real-time link. The bounding-box overlay arrives via DataChannel and is synchronized to the video timeline via the <code>requestVideoFrameCallback</code> JavaScript API: the callback's <code>metadata.rtpTimestamp</code> field gives the RTP timestamp of the currently-presenting video frame; we look it up in a <code>BTreeMap&lt;rtp_ts, BoxMessage&gt;</code> keyed by the DataChannel's incoming <code>rtp_ts</code> field, so the box is matched to the exact frame the inference saw (regardless of LA's per-frame latency). Render in saturated red (<code>#ff3030</code>). All current browsers in the Section 22.1 matrix implement rVFC (Chrome, Safari, Chromium-on-iOS shells, Firefox 132+ desktop, Firefox for Android 150+); the <code>has_rvfc()</code> feature-detect at mount surfaces a chained <code>anyhow::Error</code> to the user-facing banner if the binding is ever absent — strict no-silent-fallback per Section 3.1.</dd>
+  <dd>The user's browser receives a MediaStream from the server via <code>RTCPeerConnection.set_ontrack</code> callback's <code>RtcTrackEvent.streams[0]</code>; this stream is assigned to a local <code>&lt;video&gt;</code> element. End-to-end streamer-camera → viewer-screen latency is the sum of the streamer's encoder (libwebrtc default ~30–80 ms), LAN/Internet transit (~5–50 ms), the SFU re-publish (sub-ms, verified at <code>str0m 0.20.0 src/media/writer.rs:137-181</code> — no buffering, immediate drain via <code>already_happened</code> sentinel at <code>src/util/time_tricks.rs:52-54</code>), the viewer browser's adaptive jitter buffer (default ~20–150 ms; <strong>lowered via <code>RTCRtpReceiver.jitterBufferTarget = 50</code> in §21.2.1 below where supported</strong>), and viewer decode/render (~30 ms) — roughly ~120–250 ms typical with the jitter-buffer hint applied. The overlay is drawn via <code>requestVideoFrameCallback</code> when supported (it is, across the entire Section 22.1 matrix); the callback's frame-presentation tick is exactly when we want to redraw the canvas. Inside the callback, read <code>latest_box</code> via <code>RwSignal::with_untracked</code> and render. Color: saturated red <code>#ff3030</code>. The box arrives ~one LA cycle after the frame it describes was captured; by the time it lands at the viewer, the viewer's video is presenting a frame ~25 frames downstream — the rendered box is therefore drawn on a different frame than it was inferred from, which is exactly what the user permits.</dd>
 </dl>
+
+<p><strong>Why not just RAF on both paths?</strong> Using rVFC on the viewer path lets the canvas redraw tick match the actual video-frame-presentation cadence (which can be lower than 60 Hz under congestion or thermal throttle on mobile), avoiding wasted draws and visible canvas-vs-video mismatch during low-framerate playback. On the streamer path the local video has effectively no jitter buffer and runs at the camera's actual cadence, so RAF (which fires at display-refresh rate) is the natural fit; rVFC offers no advantage AND has the spec-mandated <code>rtpTimestamp == undefined</code> for local sources.</p>
+
+<p>The legacy strict-no-fallback rule on missing <code>metadata.rtpTimestamp</code> (a previous draft rejected the overlay loudly) is repurposed in §21.3 to apply only to the viewer path — and even there, it is now diagnostic only (the rtp_ts is used for ordering boxes on the receive side, not for sync).</p>
 
 <h3>21.3 The <code>requestVideoFrameCallback</code> extern declaration</h3>
 <p>The <code>requestVideoFrameCallback</code> method is not bound in <code>web-sys</code> version 0.3.99 (verified by reading <code>wasm-bindgen-0.2.122/crates/web-sys/src/features/gen_HtmlVideoElement.rs</code>). The WebAssembly client declares the binding manually. The complete extern includes the <code>VideoFrameCallbackMetadata</code> dictionary type with all ten fields per the WICG <em>HTMLVideoElement.requestVideoFrameCallback()</em> draft specification (verified live on 2026-06-01):</p>
@@ -4754,21 +4769,67 @@ pub fn has_rvfc(video: &amp;web_sys::HtmlVideoElement) -&gt; anyhow::Result&lt;b
 }
 </code></pre>
 
-<p><strong>Strict policy on missing <code>rtpTimestamp</code> (per the user's "no fallbacks" requirement):</strong> The viewer-path overlay sync key is the RTP timestamp. If <code>metadata.rtp_timestamp()</code> returns <code>None</code> on the first callback, the overlay pipeline returns a chained <code>anyhow::Error</code> up to the user interface:</p>
+<p><strong>The <code>metadata.rtpTimestamp</code> field is no longer load-bearing for overlay rendering.</strong> Under Strategy A (§21.2 latest-wins), the rVFC callback simply pulls the most-recent <code>BoxMessage</code> from <code>latest_box</code> at frame-presentation time and draws it; no lookup by RTP timestamp is performed. <code>metadata.rtpTimestamp</code> is now used only for diagnostics (e.g., the streamer's "running median round-trip-time" badge in §21.2). For the streamer path, rVFC is replaced by <code>requestAnimationFrame</code> entirely, because the local <code>getUserMedia</code> source has no RTP timeline (WICG video-rvfc spec: "absent" for non-WebRTC sources).</p>
 
-<pre><code>let rtp_ts = meta.rtp_timestamp()
-    .ok_or_else(|| anyhow::anyhow!(
-        "requestVideoFrameCallback metadata.rtpTimestamp absent — browser does \
-         not expose RTP timestamps for this video source; overlay sync is not \
-         possible. (This should not occur for inbound WebRTC video tracks on \
-         Apple Safari 15.4+, Google Chrome with rVFC support, or any modern \
-         libwebrtc-based receiver.)"
-    ))?;
+<p>On the viewer path, the rVFC callback shape is:</p>
+<pre><code>// Inside the rVFC callback closure (called per presented video frame):
+let latest = latest_box.with_untracked(|opt| opt.clone());
+if let Some(msg) = latest {
+    draw_boxes(&amp;ctx, &amp;msg, css_w, css_h, color);
+}
+// Optionally, if meta.rtp_timestamp() is Some(ts), update a diagnostic
+// signal for the badge UI. NOT load-bearing — purely observability.
+if let Some(rtp_ts) = meta.rtp_timestamp() {
+    let _ = current_frame_rtp_ts.set_untracked(Some(rtp_ts));
+}
+// Schedule the next callback (rVFC is one-shot per registration).
+video.request_video_frame_callback(callback.as_ref().unchecked_ref());
 </code></pre>
 
-<p>The error banner displays the chained string; the overlay pipeline halts; the video continues to play (this is a sync-only failure, not a video-decode failure). <strong>There is no silent fallback to <code>requestAnimationFrame</code>-latest-wins anywhere</strong>. All browsers in the Section 22.1 matrix support rVFC as of 2026-06-02 (Firefox 132+ desktop, Firefox for Android 150+), so a missing-rVFC outcome from <code>has_rvfc()</code> means an unexpected browser environment — surfaced as a chained <code>anyhow::Error</code> at startup rather than continued execution under a degraded sync policy, strictly per Section 3.1.</p>
+<p>Source-level verification for diagnostic-availability: Chromium <code>third_party/blink/renderer/modules/video_rvfc/video_frame_callback_requester_impl.cc:297-303</code> sets the <code>rtpTimestamp</code> attribute whenever the underlying <code>media::VideoFrameMetadata::rtp_timestamp</code> has a value AND the value fits in <code>uint32_t</code> (both conditions hold for inbound WebRTC tracks because <code>webrtc::VideoFrame::rtp_timestamp()</code> returns the 32-bit RTP header field directly). Apple WebKit <code>Source/WebCore/platform/mediastream/RealtimeIncomingVideoSource.cpp:141-142</code> uses the same gating. RFC 3550 fixes the WebRTC video clock at 90 kHz; the value is monotonically increasing modulo 2<sup>32</sup>. So on inbound WebRTC tracks the field is always present in practice; on local <code>getUserMedia</code> tracks it is always absent per spec.</p>
 
-<p>Source-level verification for the reliability claim: Chromium <code>third_party/blink/renderer/modules/video_rvfc/video_frame_callback_requester_impl.cc:297-303</code> sets the <code>rtpTimestamp</code> attribute whenever the underlying <code>media::VideoFrameMetadata::rtp_timestamp</code> has a value AND the value fits in <code>uint32_t</code> (both conditions hold for inbound WebRTC tracks because <code>webrtc::VideoFrame::rtp_timestamp()</code> returns the 32-bit RTP header field directly). Apple WebKit <code>Source/WebCore/platform/mediastream/RealtimeIncomingVideoSource.cpp:141-142</code> uses the same gating: <code>if (isInBounds&lt;uint32_t&gt;(frame.rtp_timestamp())) metadata.rtpTimestamp = frame.rtp_timestamp();</code>. RFC 3550 fixes the WebRTC video clock at 90 kHz; the value is monotonically increasing modulo 2<sup>32</sup>.</p>
+<p>The strict no-fallback rule still applies to <code>has_rvfc()</code> at mount time (viewer path only): if the browser lacks rVFC entirely, the WebAssembly client surfaces a chained <code>anyhow::Error</code> rather than silently degrading. All browsers in the §22.1 matrix support rVFC as of 2026-06-02; absence indicates an unexpected browser environment.</p>
+
+<h4>21.2.1 RTCRtpReceiver.jitterBufferTarget — lower the viewer's playout-delay buffer where supported</h4>
+
+<p>libwebrtc's adaptive jitter buffer on the receiver side targets ~80–150 ms by default, growing under observed loss/jitter. For our low-latency-live-streaming goal, the viewer should hint a lower target. The <code>RTCRtpReceiver.jitterBufferTarget</code> property (WICG WebRTC Extensions) accepts a number in milliseconds and is a hint, not a strict cap — libwebrtc still adapts upward if network conditions demand. Setting it to 50 ms typically saves 50–100 ms of end-to-end latency on healthy links.</p>
+
+<p>Browser support as of 2026-06-02:</p>
+<ul>
+  <li><strong>Chrome 124+</strong> (Apr 2024) — shipped stable.</li>
+  <li><strong>Firefox 115+</strong> (Jul 2023) — shipped stable.</li>
+  <li><strong>Edge 124+</strong> (Apr 2024) — shipped stable.</li>
+  <li><strong>Safari (macOS/iOS/iPadOS) — NOT in any stable Safari release yet.</strong> Added to Safari Technology Preview 242 in April 2026; expected in Safari 26.2+ stable.</li>
+</ul>
+
+<p>We feature-detect via <code>Reflect::has</code> and apply if present:</p>
+<pre><code>use wasm_bindgen::{JsCast, JsValue};
+use js_sys::Reflect;
+
+/// Apply the jitter-buffer-target hint to a freshly-attached inbound video
+/// receiver. No-op if the property is absent (Safari today). Idempotent.
+/// Not a silent fallback per Section 3.1 — this is a feature-detected
+/// optimization hint where absence-of-support is the documented platform
+/// posture, not a silent failure.
+pub fn apply_jitter_buffer_target(receiver: &amp;web_sys::RtcRtpReceiver) -&gt; anyhow::Result&lt;()&gt; {
+    let key = JsValue::from_str("jitterBufferTarget");
+    let has = Reflect::has(receiver.as_ref(), &amp;key)
+        .map_err(crate::extern_js::js_err("Reflect::has(receiver, 'jitterBufferTarget')"))?;
+    if has {
+        // 50 ms target. Hint only; libwebrtc adapts upward under observed jitter.
+        Reflect::set(receiver.as_ref(), &amp;key, &amp;JsValue::from_f64(50.0))
+            .map_err(crate::extern_js::js_err("set jitterBufferTarget=50"))?;
+        tracing::info!("applied jitterBufferTarget=50 ms on inbound video receiver");
+    } else {
+        tracing::info!("jitterBufferTarget not supported by this browser; using libwebrtc default");
+    }
+    Ok(())
+}
+</code></pre>
+
+<p>Call site: in the WebAssembly client's <code>on_track</code> handler (the <code>set_ontrack</code> callback on the viewer's <code>RtcPeerConnection</code>), immediately after binding the inbound video <code>MediaStreamTrack</code>. The handler has the <code>RtcRtpReceiver</code> via <code>RtcTrackEvent::receiver()</code>.</p>
+
+<p><strong>Why not also <code>playoutDelayHint</code>?</strong> <code>playoutDelayHint</code> is the older Chrome-specific name for the same concept; <code>jitterBufferTarget</code> is the WICG-standardized successor (Chrome 124+ supports both). For a forward-looking design, hint via <code>jitterBufferTarget</code> only; the older name will eventually be deprecated.</p>
 
 <h3>21.3.1 DataChannel "boxes" receive path on the WebAssembly client</h3>
 
@@ -4788,16 +4849,24 @@ pub struct DcState {
     pub _msg:               wasm_bindgen::closure::Closure&lt;dyn FnMut(web_sys::MessageEvent)&gt;,
     pub _close:             wasm_bindgen::closure::Closure&lt;dyn FnMut(web_sys::CloseEvent)&gt;,
     pub _err:               wasm_bindgen::closure::Closure&lt;dyn FnMut(web_sys::Event)&gt;,
-    /// The arrival buffer keyed by RTP timestamp (32-bit, wraps modulo 2^32).
-    /// Read by the rVFC callback in overlay.rs which looks up the box for
-    /// the currently-presenting video frame.
-    pub box_buffer:         RwSignal&lt;BTreeMap&lt;u32, BoxMessage&gt;&gt;,
+    /// The single latest BoxMessage. Strategy A (latest-wins) per §21.2:
+    /// LA inference takes ~800 ms hybrid; by the time a box for frame X
+    /// arrives, the video has advanced ~25 frames past X. Per-frame
+    /// timestamp matching would mean the box for X never finds the frame
+    /// it describes — viewers would see no boxes at all. Instead we always
+    /// render the most recent BoxMessage on whatever frame is currently
+    /// being presented, exactly as the user's stated goal allows ("no need
+    /// for bounding boxes to come in at the same time as the frame being
+    /// presented"). The `rtp_ts` field on BoxMessage is retained for
+    /// diagnostics and for ordering (newer rtp_ts wins on the rare DC
+    /// reorder), not for sync.
+    pub latest_box:         RwSignal&lt;Option&lt;BoxMessage&gt;&gt;,
 }
 
 // Attaching the channel:
 pub fn attach_boxes_dc(
     dc: web_sys::RtcDataChannel,
-    box_buffer: RwSignal&lt;BTreeMap&lt;u32, BoxMessage&gt;&gt;,
+    latest_box: RwSignal&lt;Option&lt;BoxMessage&gt;&gt;,
     last_error: RwSignal&lt;Option&lt;String&gt;&gt;,
 ) -&gt; DcState {
     // The "boxes" channel is always JSON text frames. Set binary_type defensively
@@ -4805,7 +4874,7 @@ pub fn attach_boxes_dc(
     // we explicitly reject.
     dc.set_binary_type(web_sys::RtcDataChannelType::Arraybuffer);
 
-    let buf_for_msg = box_buffer;
+    let buf_for_msg = latest_box;
     let err_for_msg = last_error;
     let on_msg = wasm_bindgen::closure::Closure::&lt;dyn FnMut(web_sys::MessageEvent)&gt;::new(
         move |event: web_sys::MessageEvent| {
@@ -4826,19 +4895,28 @@ pub fn attach_boxes_dc(
                     return;
                 }
             };
-            // Eviction: keep at most ~5 seconds of history at the 90 kHz RTP
-            // clock (5 * 90_000 = 450_000 ticks). Account for u32 wrap with
-            // wrapping_sub. The rVFC callback reads recent entries; older ones
-            // are unreachable because the video has moved past them.
-            buf_for_msg.update(|map| {
-                map.insert(msg.rtp_ts, msg.clone());
-                let now_ts = msg.rtp_ts;
-                let cutoff = now_ts.wrapping_sub(450_000);
-                map.retain(|&amp;k, _| {
-                    // Keep entries within 5 s window upstream of `now_ts`,
-                    // handling u32 wrap with wrapping_sub.
-                    now_ts.wrapping_sub(k) &lt;= 450_000
-                });
+            // Strategy A: keep the latest BoxMessage only. On the rare case
+            // a reordered datagram delivers an older box AFTER a newer one
+            // (unordered DataChannel, unreliable), `wrapping_sub` lets us
+            // detect this and reject — newer-rtp_ts wins, never overwrite
+            // backwards. Note that under stop-and-wait LA + LAN transport,
+            // reordering is essentially impossible; this guard is defense.
+            buf_for_msg.update(|slot| {
+                let accept = match slot {
+                    None =&gt; true,
+                    Some(cur) =&gt; {
+                        // Treat msg as "newer" if (msg.rtp_ts - cur.rtp_ts)
+                        // mod 2^32 is in the forward half (≤ 2^31). This is
+                        // RFC 3550 §A.1 sequence-comparison logic adapted
+                        // for u32 RTP timestamps; tolerates the ~13-hour
+                        // wrap-around cleanly.
+                        let diff = msg.rtp_ts.wrapping_sub(cur.rtp_ts);
+                        diff != 0 &amp;&amp; diff &lt; 0x8000_0000
+                    }
+                };
+                if accept {
+                    *slot = Some(msg);
+                }
             });
         }
     );
@@ -4864,11 +4942,13 @@ pub fn attach_boxes_dc(
     });
     dc.set_onerror(Some(on_err.as_ref().unchecked_ref()));
 
-    DcState { dc, _open: on_open, _msg: on_msg, _close: on_close, _err: on_err, box_buffer }
+    DcState { dc, _open: on_open, _msg: on_msg, _close: on_close, _err: on_err, latest_box }
 }
 </code></pre>
 
-<p><strong>Buffer eviction rule.</strong> The <code>BTreeMap&lt;u32, BoxMessage&gt;</code> is keyed by the 32-bit RTP timestamp (90 kHz). Without eviction the map leaks memory and, after ~13 hours of streaming, the RTP timestamp wraps modulo 2^32 producing key collisions and misordered overlays. The eviction rule above keeps a sliding 5-second window upstream of the most recent arrival; entries outside the window are dropped on every insert. <code>u32::wrapping_sub</code> handles the wrap correctly: <code>now_ts.wrapping_sub(k) ≤ 450_000</code> selects timestamps that are at most 450 000 ticks "before" <code>now_ts</code> in mod-2^32 arithmetic.</p>
+<p><strong>Why latest-wins instead of frame-keyed lookup.</strong> The user explicitly granted permission for boxes and frames to be desynchronized: "no need for the bounding boxes to come in at the same time as the frame being presented." Under that constraint, frame-keyed lookup is over-engineered AND broken at realistic LA latency: LocateAnything-3B's hybrid mode takes ~785 ms; by the time the box for frame X arrives at the viewer, the video has advanced ~24 frames past X. An exact-rtp_ts <code>BTreeMap::get</code> would never find a match — boxes would pile up unused and viewers would see nothing. Latest-wins draws the most-recent inference result on whatever frame the rVFC callback (or RAF, for the streamer's local source) is currently presenting; the staleness is honestly one full inference cycle.</p>
+
+<p><strong>Wrap-aware comparison.</strong> The 32-bit RTP timestamp at 90 kHz wraps modulo 2^32 every ~13.25 hours. The accept-newer-only guard uses RFC 3550 §A.1's sequence-comparison logic: <code>(new - current) mod 2^32 &lt; 2^31</code> means "new is forward of current in the cyclic order". This handles the wrap edge correctly without needing an explicit "did we wrap" flag.</p>
 
 <p><strong>Protocol-violation policy.</strong> Any binary frame on the "boxes" channel surfaces a loud error to the user and tears down the connection (in the receive callback above, we surface to <code>last_error</code> but do not actively close the channel from JS; the reconnect loop will pick that up on next signaling cycle). Any frame that fails JSON parsing surfaces the chained-anyhow parse error. Neither is silently dropped.</p>
 
