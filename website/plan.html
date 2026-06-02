@@ -4106,7 +4106,7 @@ the !Send libswscale Context). Sync fn run via std::thread (Section 11.3):
       // Built once at thread entry; live for the whole streaming session.
       let mut decoder = CodecContext::new().decoder().open_as(CodecId::H264)
           .context("opening H.264 decoder via libavcodec")?;
-      let mut scaler_slot: Option&lt;ffmpeg_next::software::scaling::Context&gt; = None; // rebuilt on dim change (ensure_scaler_for, §19.3)
+      let mut scaler_slot: Option&lt;ffmpeg_next::software::scaling::Context&gt; = None; // built/rebuilt on dim change by ensure_scaler_for (below)
       let mut rgb_frame = ffmpeg_next::frame::Video::empty();   // RGB24 output scratch (reused)
       let mut yuv       = ffmpeg_next::frame::Video::empty();   // decoder output scratch (reused)
       loop {
@@ -4143,12 +4143,55 @@ the !Send libswscale Context). Sync fn run via std::thread (Section 11.3):
           // flag would be cross-thread state to keep in sync for no real saving
           // (Section 3 — no overengineering). The 1-slot watch coalesces, so LA
           // still samples only the freshest frame at its own pace.
-          ensure_scaler_for(&amp;mut scaler_slot, yuv.width(), yuv.height())?;
-          scaler_slot.as_mut().unwrap().run(&amp;yuv, &amp;mut rgb_frame)
+          let scaler = ensure_scaler_for(&amp;mut scaler_slot, yuv.width(), yuv.height())?;
+          scaler.run(&amp;yuv, &amp;mut rgb_frame)
               .context("libswscale run YUV420P→RGB24")?;
           rgb_tx.send(Some(rgb_frame.clone()))
               .context("rgb watch channel closed")?;
       }
+  }
+
+  // The long-lived YUV420P→RGB24 libswscale Context, built lazily and rebuilt
+  // ONLY when the source frame dimensions change (the libavcodec mid-stream
+  // resolution-switch case above). Hands back the live &amp;mut Context, so the
+  // caller holds no Option across the hot path — no unwrap/expect/panic
+  // (Section 4.1).
+  fn ensure_scaler_for(
+      slot: &amp;mut Option&lt;ffmpeg_next::software::scaling::Context&gt;,
+      w:    u32,
+      h:    u32,
+  ) -&gt; anyhow::Result&lt;&amp;mut ffmpeg_next::software::scaling::Context&gt; {
+      use ffmpeg_next::format::Pixel;
+      use ffmpeg_next::software::scaling::{Context as Scaler, Flags};
+
+      // Compare against the scaler's OWN source Definition (Context::input(),
+      // ffmpeg-next 7.1.0 src/software/scaling/context.rs:121) — no shadow
+      // (w, h) field to keep in sync (Section 3 — no overengineering).
+      let fresh = matches!(slot.as_ref(),
+          Some(s) if s.input().width == w &amp;&amp; s.input().height == h);
+      if !fresh {
+          // Context::get is fallible (Err on a null sws_getContext); propagate,
+          // never unwrap. ffmpeg-next 7.1.0 src/software/scaling/context.rs:36.
+          let mut scaler = Scaler::get(
+              Pixel::YUV420P, w, h,
+              Pixel::RGB24,   w, h,
+              Flags::BICUBIC,
+          )
+          .with_context(|| format!("build libswscale YUV420P→RGB24 Context for {w}x{h}"))?;
+          // BT.709 source coefficients, limited(TV)→full(PC) range, applied via
+          // sws_setColorspaceDetails through scaler.as_mut_ptr() — most reliable
+          // AFTER Context::get(). Section 19.3 gives the SWS_CS_ITU709 source
+          // coefficients and the limited→full range arguments.
+          apply_bt709_limited_to_full(&amp;mut scaler)
+              .context("sws_setColorspaceDetails (BT.709 limited→full)")?;
+          *slot = Some(scaler);
+      }
+      // Some on every path (just assigned, or already-fresh). Lift the
+      // logically unreachable None to a chained error, never a panic
+      // (Section 4.3).
+      slot.as_mut()
+          .ok_or_else(|| anyhow::anyhow!(
+              "swscale Context slot empty immediately after ensure — unreachable"))
   }
         │
         ▼
@@ -4203,7 +4246,7 @@ Result: approximately 8 to 15 milliseconds per 720p frame at quality 92 on a typ
 </div>
 
 <h3>19.3 libswscale colorspace — BT.709 limited→full applied explicitly</h3>
-<p>libswscale defaults to BT.601 (Recommendation BT.601 from the International Telecommunication Union) for unspecified colorspace input. Webcam-sourced H.264 overwhelmingly signals BT.709 in its Video Usability Information (VUI) parameters across the browser matrix (modern device convention), but <code>str0m::media::MediaData</code> does NOT pass VUI through. The implementation therefore reaches through <code>Context::as_mut_ptr()</code> to call <code>sws_setColorspaceDetails</code> with BT.709 source coefficients (<code>SWS_CS_ITU709</code>) + limited (TV) source range + full (PC) RGB destination range. See the code block above in Section 19.1.</p>
+<p>libswscale defaults to BT.601 (Recommendation BT.601 from the International Telecommunication Union) for unspecified colorspace input. Webcam-sourced H.264 overwhelmingly signals BT.709 in its Video Usability Information (VUI) parameters across the browser matrix (modern device convention), but <code>str0m::media::MediaData</code> does NOT pass VUI through. The implementation therefore reaches through <code>Context::as_mut_ptr()</code> to call <code>sws_setColorspaceDetails</code> with BT.709 source coefficients (<code>SWS_CS_ITU709</code>) + limited (TV) source range + full (PC) RGB destination range. It is applied by the <code>apply_bt709_limited_to_full</code> helper that <code>ensure_scaler_for</code> calls immediately after <code>Context::get()</code> (Section 19.1).</p>
 <p><strong>Why this matters for detection quality, and why it does NOT defeat the JFIF round-trip property:</strong> the LocateAnything-3B worker (<code>worker/inference.py</code>) decodes incoming JPEGs through PIL with full-range RGB output, and the worker explicitly assumes the model is trained on sRGB inputs (sRGB shares the same primaries as BT.709, not BT.601). The mozjpeg encode step further down the pipeline applies BT.601 full-range YCbCr coefficients internally (JFIF default) and the worker's PIL decode applies the matching inverse — that round-trip is matrix-consistent on its own and is independent of which matrix we used at the YUV→RGB step. The earlier "BT.601 matches JFIF default" reasoning conflated those two layers; sourcing the RGB tensor via BT.709 (matching the actual camera-produced source YUV) is strictly more correct because the JFIF round-trip on the downstream side does not care which matrix produced the RGB it sees.</p>
 <p><strong>Cost:</strong> zero on the per-frame fast path. <code>sws_setColorspaceDetails</code> is a one-time setup call per Context construction (which is itself per-dimension-change); the libswscale SIMD kernels selected are identical regardless of the matrix coefficients. Verified against ffmpeg-sys-next's exposed signature and the FFmpeg cvslog guidance that the call is most-reliable after <code>sws_init_context</code>/<code>Context::get()</code>.</p>
 
@@ -5029,7 +5072,7 @@ fn App() -&gt; impl IntoView {
   <dt>Streamer path</dt>
   <dd>The user's own browser captures via <code>getUserMedia</code>; the resulting MediaStream is assigned to a local <code>&lt;video&gt;</code> element via <code>HtmlMediaElement::set_src_object</code>. Display latency is essentially zero (browser-internal pipeline). The bounding-box overlay is drawn via <code>requestAnimationFrame</code> (NOT rVFC — rVFC's <code>metadata.rtpTimestamp</code> is absent for local <code>getUserMedia</code> tracks per WICG video-rvfc spec, since local sources have no RTP timeline). On each RAF tick the canvas reads <code>latest_box</code> via <code>RwSignal::with_untracked</code> (no Leptos reactive subscription — pure pull) and renders the most-recent BoxMessage's rectangles. Color: desaturated red <code>#dd5050</code>. A small corner badge displays the running median overlay staleness (computed as below), so the streamer knows roughly how far behind live the overlay is. The staleness is the LA cycle plus pipeline overhead — ~785 ms hybrid, ~937 ms slow, ~210 ms point_to as of LA-3B (per <code>/home/user/Desktop/locate_anything_setup/docs/DRONE_DETECTION.md:113-117</code>); a model swap changes this one-for-one without architectural change.
 
-  <p><strong>Staleness-badge construction (buildable, no <code>getStats</code>).</strong> The badge answers "how far behind live is my overlay?" — which, under latest-wins plus LocateAnything-3B's stop-and-wait pipeline, is essentially one inference cycle. Measure it directly and locally: on each <code>BoxMessage</code> arrival (in the "boxes" DataChannel <code>onmessage</code> closure, §21.3.1) push <code>web_sys::window().unwrap().performance().unwrap().now()</code> — a monotonic <code>DOMHighResTimeStamp</code> in milliseconds — into a small <code>VecDeque&lt;f64&gt;</code> capped at ~16 entries; the badge shows the running median of the consecutive-arrival deltas. No <code>getStats</code> poll loop, no RTP-timestamp correlation, no extra dependency.</p>
+  <p><strong>Staleness-badge construction (buildable, no <code>getStats</code>).</strong> The badge answers "how far behind live is my overlay?" — which, under latest-wins plus LocateAnything-3B's stop-and-wait pipeline, is essentially one inference cycle. Measure it directly and locally: resolve a <code>web_sys::Performance</code> handle ONCE at streamer-overlay mount — <code>window().ok_or_else(|| anyhow::anyhow!("no window"))?.performance().ok_or_else(|| anyhow::anyhow!("no Performance API"))?</code> (a one-time fail-loud lift, no <code>.unwrap()</code> — §4.1/§4.3) — and move that handle into the "boxes" DataChannel <code>onmessage</code> closure (§21.3.1). On each <code>BoxMessage</code> arrival the closure pushes <code>perf.now()</code> — a monotonic <code>DOMHighResTimeStamp</code> in milliseconds — into a small <code>VecDeque&lt;f64&gt;</code> capped at ~16 entries; the badge shows the running median of the consecutive-arrival deltas. Resolving once also keeps the per-message path free of a redundant window/Performance lookup. No <code>getStats</code> poll loop, no RTP-timestamp correlation, no extra dependency.</p>
   <p><strong>Why not a true send→box round-trip from <code>getStats</code>.</strong> A genuine "frame T sent → box for T returned" RTT would require mapping a returned box back to the wall-clock instant the streamer sent that frame — but the WebRTC statistics model exposes <strong>no outbound RTP timestamp</strong>: <code>RTCOutboundRtpStreamStats</code> (and the <code>RTCSentRtpStreamStats</code> / <code>RTCRtpStreamStats</code> it extends) carry no current-RTP-timestamp field to correlate against, and the local <code>getUserMedia</code> source has no RTP timeline at all (which is also why the streamer overlay uses <code>requestAnimationFrame</code>, not rVFC). The inter-arrival median captures the dominant term (inference latency, ~785 ms hybrid) honestly; the few-tens-of-milliseconds network legs it omits are noise at this scale. (<code>RTCRemoteInboundRtpStreamStats.roundTripTime</code> does exist, but it measures only the streamer↔SFU network hop, not the box pipeline — the wrong number for this badge.)</p></dd>
 
   <dt>Viewer path</dt>
