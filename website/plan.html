@@ -1733,7 +1733,12 @@ fn canonical_templates_match_prompts_py_byte_for_byte() {
   <li><strong>Idle.</strong> No streamer is active. Any user can claim the slot. Viewers may or may not be connected, but they will see no video until a streamer claims.</li>
   <li><strong>Claimed.</strong> A user has just sent <code>SignalMessage::Claim</code>; the server has accepted and is awaiting the Session Description Protocol offer and the first Real-time Transport Protocol packet. Timeout: 10 seconds.</li>
   <li><strong>Streaming.</strong> Real-time Transport Protocol packets are flowing from the streamer; the Selective Forwarding Unit is republishing to viewers; the decode/JPEG/LA pipeline is producing bounding boxes that fan out via DataChannel. Watchdog timeouts: no Real-time Transport Protocol for 5 seconds → Draining; signaling WebSocket keepalive miss → Draining; Interactive Connectivity Establishment Disconnected → Draining.</li>
-  <li><strong>Draining.</strong> The streamer is leaving. The server is sending a "bye" DataChannel message to each connected peer, pumping <code>poll_output</code> a few times to flush, then calling <code>Rtc::disconnect()</code> on each. New <code>Claim</code> messages are rejected with <code>SignalMessage::Error(code: "draining")</code> during this window. Timeout: 5 seconds, after which all peer state is cleared and the FSM transitions back to Idle.</li>
+  <li><strong>Draining.</strong> The streamer is leaving. On entry the server writes a "bye" DataChannel message to every connected peer, pumps <code>poll_output</code> a few times to flush, then calls <code>Rtc::disconnect()</code> on each — <strong>viewers are torn down immediately</strong> (they cannot watch a gone streamer; their own reconnect loops re-attach them once a streamer is live again — §1 data-flow item 9). The server RETAINS only the streamer slot (<code>owner</code> + <code>session_id</code>) so a <code>ResumeSession</code> can validate against it. New <code>Claim</code> messages are rejected with <code>SignalMessage::Error(code: "draining")</code> throughout. <strong>Two-class timeout</strong> (the deciding bit is <code>drain_resume_eligible</code>, set on entry — §11.5):
+    <ul>
+      <li><strong>Unintentional streamer drop</strong> (5 s RTP gap / ICE Disconnected / keepalive miss / bare network WS-close): resume-eligible. Held for <code>DRAIN_TIMEOUT</code> (30 s). A <code>ResumeSession</code> matching the retained <code>session_id</code> cancels the drain and re-enters <strong>Claimed</strong> (Option α rebuilds the <code>RTCPeerConnection</code>, so a fresh offer + first-RTP handshake follows — §11.8); if 30 s elapses with no matching resume, <code>owner</code> + <code>session_id</code> are cleared and the FSM goes to Idle.</li>
+      <li><strong>Intentional release</strong> (explicit <code>Bye</code>/Release, prompt-rejection auto-release), <strong>CLAIM_TIMEOUT</strong> (claimer never streamed), and <strong>LaDown</strong>: NOT resume-eligible. Draining lasts only the bye-flush (~800 ms, §18.2), then → Idle, freeing the slot promptly. A <code>ResumeSession</code> in this window returns <code>ResumeExpired</code>.</li>
+    </ul>
+    "All peers dropped" is NOT itself an Idle trigger — peer drop is the normal Draining state; only the deadline (or a matching resume cancelling it) ends Draining.</li>
 </ol>
 
 <h3>11.2 Transition triggers and timeouts</h3>
@@ -1743,11 +1748,11 @@ fn canonical_templates_match_prompts_py_byte_for_byte() {
   <tr><td>Claimed → Streaming</td><td>First Real-time Transport Protocol packet received from the claimer's WebRTC peer</td><td>n/a (immediate)</td></tr>
   <tr><td>Claimed → Draining</td><td>No Real-time Transport Protocol from claimer within 10 seconds of accept</td><td>10 seconds (<code>CLAIM_TIMEOUT</code>)</td></tr>
   <tr><td>Streaming → Draining</td><td>WebSocket close from streamer; OR no Real-time Transport Protocol from streamer for 5 seconds; OR <code>IceConnectionStateChange::Disconnected</code> event from str0m; OR signaling-WebSocket keepalive miss (see below); OR explicit <code>Bye</code> from streamer; OR <code>FsmCommand::LaDown</code> while in Streaming (Section 19.4)</td><td>5 seconds RTP gap (<code>RTP_TIMEOUT</code>); ~21.5 seconds ICE consent freshness (str0m's reduced timeout vs RFC 7675's nominal 30 s; see Section 20.11); 30 seconds signaling-WS keepalive (<code>KEEPALIVE_TIMEOUT</code>)</td></tr>
-  <tr><td>Draining → Idle</td><td>Drain deadline reached, OR all client peer connections dropped, AND no <code>ResumeSession</code> for this session_id arrived during the drain window</td><td>30 seconds (<code>DRAIN_TIMEOUT</code>) — sized to cover an iPhone WiFi↔cellular handover (~1–3 s re-attach plus ICE consent freshness of ~21.5 s per Section 20.11) so a streamer mid-handover can <code>ResumeSession</code> back into the still-Draining FSM rather than losing ownership. Tightening DRAIN_TIMEOUT below 25 s would cause iOS-on-cellular streamers to lose their slot on every Wi-Fi→cellular transition, contradicting the user's "if anybody disconnects, server cleanly reverts" requirement (where "cleanly" includes survival of common handovers, not aggressive eviction).</td></tr>
+  <tr><td>Draining → Idle</td><td>The drain <code>deadline</code> is reached with no matching <code>ResumeSession</code> having arrived (a matching resume cancels the drain instead — see Draining state in §11.1). <strong>"All client peer connections dropped" is NOT a trigger</strong> — peer drop is the normal Draining state (we disconnect viewers on entry, and the streamer's peer is the one that dropped); only the deadline ends Draining.</td><td>Resume-eligible drains (unintentional streamer drop): <strong>30 s (<code>DRAIN_TIMEOUT</code>)</strong> — sized to cover an iPhone WiFi↔cellular handover (~1–3 s re-attach plus ICE consent freshness of ~21.5 s per Section 20.11) so a streamer mid-handover can <code>ResumeSession</code> back into the still-Draining FSM rather than losing ownership. Tightening DRAIN_TIMEOUT below 25 s would cause iOS-on-cellular streamers to lose their slot on every Wi-Fi→cellular transition, contradicting the user's "if anybody disconnects, server cleanly reverts" requirement (where "cleanly" includes survival of common handovers). Non-resume-eligible drains (explicit Bye/Release, prompt-rejection auto-release, CLAIM_TIMEOUT, LaDown): a short bye-flush budget only (~800 ms, §18.2), then Idle — so a clean release frees the slot for the next claimant promptly rather than blocking it for 30 s.</td></tr>
 </table>
 
 <h4>11.2.1 Signaling-WebSocket keepalive protocol</h4>
-<p>The streamer's WebAssembly client sends <code>SignalMessage::Keepalive {}</code> over the signaling WebSocket every <strong>15 seconds</strong> while in the <code>Claimed</code> or <code>Streaming</code> state. The server responds with the same message. The server tolerates a maximum of <strong>30 seconds</strong> (twice the interval, plus a small jitter margin) of streamer-side silence before treating the keepalive as missed and transitioning the Finite State Machine to <code>Draining</code>. Viewers also send keepalives at the same interval, but a viewer-side keepalive miss only disconnects that viewer; it does not affect the Finite State Machine's ownership state.</p>
+<p>The streamer's WebAssembly client sends <code>SignalMessage::Keepalive {}</code> over the signaling WebSocket every <strong>15 seconds</strong> while in the <code>Claimed</code> or <code>Streaming</code> state. The server responds with the same message. The server tolerates a maximum of <strong>30 seconds</strong> (exactly twice the 15-second interval — no extra margin) of streamer-side silence before treating the keepalive as missed and transitioning the Finite State Machine to <code>Draining</code>. For the STREAMER this keepalive is a backstop, not the primary watchdog — the 5-second RTP gap (in <code>Streaming</code>) and the 10-second <code>CLAIM_TIMEOUT</code> (in <code>Claimed</code>) trip first; its main job is culling application-silent VIEWERS. Viewers also send keepalives at the same interval, but a viewer-side keepalive miss only disconnects that viewer; it does not affect the Finite State Machine's ownership state.</p>
 
 <p><strong>Why 15 seconds:</strong> short enough that a missed keepalive is detected within 30 seconds (faster than the 22-second str0m ICE-consent-freshness signal in many cases), long enough that a temporary 1-2 second network blip during the 5 AM router cycle's tail doesn't trip an extra disconnect just before the cycle ends. The interval is not exposed as a Command-Line Interface argument; it is a fixed protocol constant in the <code>protocol</code> crate (<code>pub const KEEPALIVE_INTERVAL_MS: u32 = 15_000;</code>), matched on both client and server.</p>
 
@@ -1813,9 +1818,11 @@ tokio::spawn(run_la_client(rgb_rx, fsm_tx.clone(), /* la host:port, prompt, mode
     let mut sfu = Sfu {
         phase:              Phase::Idle,
         owner:              None,
+        session_id:         None,
         claim_deadline:     None,
         rtp_deadline:       None,
         drain_deadline:     None,
+        drain_resume_eligible: false,
         clients:            Vec::new(),
         la_reachable:       true,
         la_last_error:      None,
@@ -1871,7 +1878,8 @@ tokio::spawn(run_la_client(rgb_rx, fsm_tx.clone(), /* la host:port, prompt, mode
 //       if self.phase == Idle {
 //           self.phase = Claimed { owner: A, deadline: now+10s };
 //           self.owner = Some(A);
-//           // … construct session_id …
+//           // … mint a random session_id …
+//           self.session_id = Some(session_id.clone()); // authoritative copy for handle_resume
 //           oA.send(ClaimResult::Granted{ session_id }).expect("...");
 //           // No .await between phase check and phase set: TOCTOU-free.
 //       } else {
@@ -1963,9 +1971,27 @@ pub enum Phase {
 pub struct Sfu {
     pub phase:               Phase,
     pub owner:               Option&lt;PeerId&gt;,
+    /// Authoritative session identifier for the current owner. Minted at
+    /// Claim-grant (ClaimResult::Granted), HELD across the Draining window so
+    /// `handle_resume` can validate an incoming ResumeSession against it, and
+    /// cleared (with `owner`) on the transition back to Idle. `Some` exactly
+    /// when `owner` is `Some`. The `Phase` enum deliberately does NOT carry
+    /// session_id — this `Sfu` working field is the single authoritative copy
+    /// (mirrors `owner`), so the broadcast `Phase` (and the integration test's
+    /// phase matchers) stay shape-only.
+    pub session_id:          Option&lt;String&gt;,
     pub claim_deadline:      Option&lt;Instant&gt;,
     pub rtp_deadline:        Option&lt;Instant&gt;,
     pub drain_deadline:      Option&lt;Instant&gt;,
+    /// True only while in Draining AND the drain was caused by an UNINTENTIONAL
+    /// streamer drop (5 s RTP gap / ICE Disconnected / keepalive miss / bare
+    /// network WS-close) — i.e., a ResumeSession matching `session_id` may
+    /// cancel the drain (30 s window). False for intentional releases (explicit
+    /// Bye, prompt-rejection auto-release), CLAIM_TIMEOUT, and LaDown, which
+    /// drain fast (bye-flush only) and refuse resume. Set by
+    /// `transition_to_draining_with`; read by `handle_resume` and by the
+    /// `drive()` drain-deadline logic.
+    pub drain_resume_eligible: bool,
     pub clients:             Vec&lt;Client&gt;,
     pub la_reachable:        bool,             // orthogonal bit; toggled by LaDown/LaUp commands
     pub la_last_error:       Option&lt;String&gt;,   // for /v1/health and /v1/info
@@ -2033,7 +2059,13 @@ pub struct Sfu {
     /// `IceConnectionState::Disconnected` source) up through every layer.
     /// `&'static str` would have made this a compile-time literal and silently
     /// truncated runtime context — chained anyhow::Error is required.
-    Disconnect { peer_id: PeerId, reason: anyhow::Error },
+    /// `intentional`: true for an explicit streamer Bye/Release (→ fast drain,
+    /// NOT resume-eligible); false for a bare socket close / network error
+    /// (→ 30 s resume-eligible Draining). Viewer disconnects ignore it (the
+    /// viewer is culled with no phase change). FSM-internal drains (the
+    /// RTP/ICE/keepalive watchdogs in `drive()`, CLAIM_TIMEOUT, and LaDown) do
+    /// NOT flow through this command — they set resume-eligibility directly.
+    Disconnect { peer_id: PeerId, reason: anyhow::Error, intentional: bool },
     /// LocateAnything-3B WebSocket dropped — see also the la_client task in `la_client.rs`.
     /// On Streaming/Claimed: transition to Draining with code "la_unreachable".
     /// On Idle: just toggle the reachability bit; refuse subsequent Claim.
@@ -2255,15 +2287,26 @@ fn request_pli_from_streamer(streamer: &amp;mut Client, streamer_video_mid: Mid)
                 let _ = reply.send(result);  // WS handler may have dropped Receiver; harmless
             }
             FsmCommand::ResumeSession { peer_id, session_id, reply } =&gt; {
-                // handle_resume semantics (specified):
-                //   Phase::Streaming { owner, .. } if session_id matches → Ok (still-active session)
-                //   Phase::Claimed   { owner, .. } if session_id matches → Ok (mid-handshake session)
-                //   Phase::Draining  { .. }        if session_id matches → Ok AND cancel drain:
-                //       self.phase = Phase::Streaming { owner: peer_id, last_rtp: now };
+                // handle_resume semantics (specified). The incoming session_id is
+                // validated against self.session_id (the authoritative copy minted
+                // at Claim-grant). ALL accept-paths additionally require
+                // self.la_reachable (resuming into a dead LA is pointless — refuse):
+                //   Phase::Streaming if session_id == self.session_id → Ok (still-active)
+                //   Phase::Claimed   if session_id == self.session_id → Ok (mid-handshake)
+                //   Phase::Draining  if session_id == self.session_id AND
+                //                       self.drain_resume_eligible → Ok AND cancel drain,
+                //                       re-entering CLAIMED (NOT Streaming):
+                //       self.phase = Phase::Claimed { owner: peer_id, deadline: now + CLAIM_TIMEOUT };
                 //       self.drain_deadline = None;
                 //       broadcast new Phase on phase_tx.
-                //     This is the iPhone-handover case (Section 11.2 DRAIN_TIMEOUT rationale).
-                //   Phase::Idle, or any phase with a mismatched session_id → Expired.
+                //     Claimed (not Streaming) is correct: Option α (§11.8) rebuilds the
+                //     RTCPeerConnection, so the client follows ResumeOk with a fresh
+                //     SdpOffer and the FSM must await the first post-resume RTP before
+                //     Streaming — exactly the state AttachStreamer (§11.8 step 7) sets,
+                //     so the two now agree. This is the iPhone-handover case (§11.2).
+                //   Phase::Draining with !self.drain_resume_eligible (intentional release /
+                //     CLAIM_TIMEOUT / LaDown), Phase::Idle, !self.la_reachable, or any
+                //     session_id mismatch → Expired.
                 let result = self.handle_resume(peer_id, session_id);
                 let _ = reply.send(result);
             }
@@ -2276,8 +2319,12 @@ fn request_pli_from_streamer(streamer: &amp;mut Client, streamer_video_mid: Mid)
             FsmCommand::GotRtp { peer_id } =&gt; {
                 self.on_got_rtp(peer_id);  // Claimed -&gt; Streaming transition
             }
-            FsmCommand::Disconnect { peer_id, reason } =&gt; {
-                self.on_disconnect(peer_id, &amp;reason);
+            FsmCommand::Disconnect { peer_id, reason, intentional } =&gt; {
+                // on_disconnect: if peer_id == self.owner, enter Draining with
+                // resume_eligible = !intentional (intentional Bye → fast, no
+                // resume); otherwise the peer is a viewer — cull it, no phase
+                // change.
+                self.on_disconnect(peer_id, &amp;reason, intentional);
             }
             FsmCommand::AddRemoteCandidate { peer_id, candidate } =&gt; {
                 if let Some(c) = self.clients.iter_mut().find(|c| c.id == peer_id) {
@@ -2293,7 +2340,10 @@ fn request_pli_from_streamer(streamer: &amp;mut Client, streamer_video_mid: Mid)
                 // (the streamer's session cannot continue without LA reachable).
                 // From Idle, just toggle the bit; refuse new Claims while it is off.
                 if matches!(self.phase, Phase::Streaming { .. } | Phase::Claimed { .. }) {
-                    self.transition_to_draining_with("la_unreachable", &amp;error);
+                    // LaDown drains FAST and is NOT resume-eligible: resuming into a
+                    // dead LA is pointless, and §19.4 already requires the streamer to
+                    // re-claim once LA returns.
+                    self.transition_to_draining_with("la_unreachable", &amp;error, /* resume_eligible = */ false);
                 }
             }
             FsmCommand::LaUp =&gt; {
@@ -2330,7 +2380,7 @@ fn request_pli_from_streamer(streamer: &amp;mut Client, streamer_video_mid: Mid)
 <tr><td><code>Shutdown</code></td><td>Signal-watcher task (Section 12 list item 2 + Section 18.1)</td></tr>
 </table>
 
-<p><strong>The <code>transition_to_draining_with</code> helper</strong> referenced in the LaDown arm sends <code>SignalMessage::Error { code: error_code::LA_UNREACHABLE, message: format!("{error:#}") }</code> to the streamer's <code>signal_tx</code> (and a DataChannel "bye" message to every connected peer's "boxes" channel), then sets <code>self.phase = Phase::Draining { deadline: now + Duration::from_secs(30) }</code>.</p>
+<p><strong>The <code>transition_to_draining_with(code, error, resume_eligible)</code> helper</strong> sends <code>SignalMessage::Error { code, message: format!("{error:#}") }</code> to the streamer's <code>signal_tx</code>, writes a DataChannel "bye" to every connected peer's "boxes" channel, and immediately disconnects every VIEWER's <code>Rtc</code> (viewers cannot watch a gone streamer; their own reconnect loops re-attach them later — §1 data-flow item 9). It RETAINS <code>self.owner</code> and <code>self.session_id</code> (so a <code>ResumeSession</code> can validate), sets <code>self.drain_resume_eligible = resume_eligible</code>, and sets the deadline: <code>self.phase = Phase::Draining { deadline: now + DRAIN_TIMEOUT }</code> with <code>DRAIN_TIMEOUT = 30 s</code> when <code>resume_eligible</code>, or a short bye-flush budget (~800 ms, matching §18.2) when not. The <code>drive()</code> tick transitions Draining → Idle when the deadline is reached with no matching <code>ResumeSession</code> (clearing <code>owner</code> + <code>session_id</code>); "all peers dropped" is NOT itself an Idle trigger. <strong>Caller resume-eligibility:</strong> the unintentional-drop callers (the RTP/ICE/keepalive watchdogs in <code>drive()</code>, and the bare-socket-close <code>Disconnect{intentional:false}</code>) pass <code>resume_eligible = true</code>; the intentional-release callers (explicit <code>Bye</code> <code>Disconnect{intentional:true}</code>, the prompt-rejection auto-release, the <code>CLAIM_TIMEOUT</code> never-streamed case, and <code>LaDown</code>) pass <code>false</code>.</p>
 
 <p><strong>Policy on <code>signal_tx.try_send</code> failure.</strong> The per-peer outbound mpsc to the WebSocket handler has capacity 32 (Section 11.5). On <code>Err(TrySendError::Full)</code> OR <code>Err(TrySendError::Closed)</code>, the FSM logs at <code>tracing::warn!</code> AND immediately calls <code>client.rtc.disconnect()</code> on that peer's Rtc. <strong>Rationale:</strong> a Full mpsc means the peer's WS handler task is not draining its Receiver — either it is stuck on a blocked socket write (a frozen browser tab; cellular outage; etc.) or its task has stalled. A Closed mpsc means the WS handler has already exited. Either way the peer is dead on the wire; immediately disconnecting the Rtc triggers the standard cleanup path on the next select iteration (<code>FsmCommand::Disconnect</code> arrives from the WS handler's exit, OR the next UDP-receive tick observes <code>!rtc.is_alive()</code> and culls the Client). This is fail-loud per Section 3 — no consecutive-failure counter, no retry budget, no silent absorption.</p>
 
@@ -2463,6 +2513,12 @@ match self.clients.iter_mut().find(|c| c.id == peer_id) {
     }
 }
 self.owner = Some(peer_id);
+// self.session_id is NOT minted or cleared here — it was set at Claim-grant
+// (§11.4.1) and is PRESERVED across a resume (handle_resume keeps it).
+// AttachStreamer only swaps in the freshly-built Rtc. On the resume path,
+// handle_resume has already cancelled the drain and set Phase::Claimed; this
+// AttachStreamer re-confirms Claimed with a fresh CLAIM_TIMEOUT to await the
+// first post-Option-α RTP — consistent with handle_resume (both land in Claimed).
 self.phase = Phase::Claimed { owner: peer_id, deadline: std::time::Instant::now() + Duration::from_secs(10) };
 let _ = self.phase_tx.send(self.phase.clone());</code></pre>
     <strong>AttachViewer</strong> follows the same find-or-insert pattern but does NOT touch <code>self.owner</code> or <code>self.phase</code>.</li>
@@ -2507,12 +2563,12 @@ let _ = self.phase_tx.send(self.phase.clone());</code></pre>
           <li><code>ResumeSession</code> → <code>FsmCommand::ResumeSession</code> (oneshot reply).</li>
           <li><code>SdpOffer</code> → the WS handler builds a fresh <code>str0m::Rtc</code> per Section 11.8 steps 3-6, sends the <code>SdpAnswer</code> back over the WS, then emits <strong>either <code>FsmCommand::AttachStreamer</code> or <code>FsmCommand::AttachViewer</code> depending on the peer's current role</strong>. Role determination: the WS handler tracks whether THIS peer's prior <code>Claim</code> received <code>Granted</code>; if yes, send <code>AttachStreamer</code>; if no (this peer never Claimed, or its Claim was Rejected, or it never sent a Claim — viewer-only peers skip Claim entirely and send SdpOffer directly), send <code>AttachViewer</code>.</li>
           <li><code>IceCandidate</code> received after AttachStreamer/AttachViewer → <code>FsmCommand::AddRemoteCandidate { peer_id, candidate }</code>. The FSM calls <code>client.rtc.add_remote_candidate(candidate)</code>.</li>
-          <li><code>Bye</code> → <code>FsmCommand::Disconnect { peer_id, reason: anyhow::anyhow!("peer sent Bye") }</code>; then send <code>SignalMessage::Bye {}</code> reply; then close the WS with code 1000.</li>
+          <li><code>Bye</code> → <code>FsmCommand::Disconnect { peer_id, reason: anyhow::anyhow!("peer sent Bye"), intentional: true }</code> (intentional release → fast drain, NOT resume-eligible — §11.1); then send <code>SignalMessage::Bye {}</code> reply; then close the WS with code 1000.</li>
           <li><code>Keepalive</code> → reply <code>SignalMessage::Keepalive {}</code>.</li>
         </ul>
       </li>
       <li>On the receiving side from the FSM: a per-peer <code>tokio::sync::mpsc::Receiver&lt;SignalMessage&gt;</code> (the FSM sends BoxMessage-equivalent error replies, ResumeOk/Expired, etc.). The WS handler forwards these to the WebSocket as JSON text frames.</li>
-      <li>On WS close (peer closed, network error, or our own shutdown): the handler sends <code>FsmCommand::Disconnect { peer_id, reason }</code> with a chained-anyhow context describing the reason (peer 1000-close, network error, keepalive timeout, etc.) and returns from the handler task.</li>
+      <li>On WS close (peer closed, network error, or our own shutdown): the handler sends <code>FsmCommand::Disconnect { peer_id, reason, intentional: false }</code> with a chained-anyhow context describing the reason (peer 1000/1001-close, network error, keepalive timeout, etc.). A raw socket close — even a clean 1000 — is treated as an UNINTENTIONAL drop (30 s resume-eligible for the streamer, covering a handover); intentionality is signaled ONLY by an explicit <code>SignalMessage::Bye</code> (the arm above, which sets <code>intentional: true</code>). The handler then returns from the task.</li>
       <li>On shutdown notification (<code>state.shutdown.notified()</code>): send <code>SignalMessage::Bye {}</code>, close WS with code 1001 (Going Away), return.</li>
       <li>Auth has already been validated at upgrade time (Section 17.5); the handler does not re-check.</li>
     </ul>
@@ -3718,7 +3774,7 @@ pub fn apply_keepalive(tcp: &amp;TcpStream) -&gt; anyhow::Result&lt;()&gt; {
 <p>Properties:</p>
 <ul>
   <li><strong>Symmetric with the LA path (Section 19.4.1.1).</strong> Same 10/5/3 keepalive, same 25-second TCP_USER_TIMEOUT. No design surface duplication.</li>
-  <li><strong>Catches the 5 AM router cycle.</strong> When the LAN switch loses power for 90 s, the per-peer WS handler's <code>recv()</code> on a dead TCP connection returns <code>ETIMEDOUT</code> at ~25 s post-disconnect (not Linux's 7200 s default). The chain propagates <code>FsmCommand::Disconnect { peer_id, reason }</code> to the FSM; the WS handler returns; tokio reclaims the task. No 50-viewer task leak.</li>
+  <li><strong>Catches the 5 AM router cycle.</strong> When the LAN switch loses power for 90 s, the per-peer WS handler's <code>recv()</code> on a dead TCP connection returns <code>ETIMEDOUT</code> at ~25 s post-disconnect (not Linux's 7200 s default). The chain propagates <code>FsmCommand::Disconnect { peer_id, reason, intentional: false }</code> to the FSM (a router-cycle TCP timeout is an unintentional drop); the WS handler returns; tokio reclaims the task. No 50-viewer task leak.</li>
   <li><strong>Application-level <code>SignalMessage::Keepalive {}</code> every 15 s (Section 11.2.1) remains the FSM-side keepalive timer.</strong> The TCP keepalive here is transport-level defense; the application keepalive ensures the FSM treats application-silent peers as gone within 30 s even when TCP appears healthy (e.g., wifi-portal MITM that ACKs TCP but drops application bytes).</li>
 </ul>
 
@@ -5107,7 +5163,7 @@ ctx.scale(dpr, dpr).map_err(js_err("ctx.scale"))?;  // accumulating transform
   <li><strong>On <code>ResumeOk</code>:</strong> the client retains <code>session_id</code> and follows Option α: tear down the old <code>RTCPeerConnection</code>, build a fresh one, send a new <code>SdpOffer</code>.</li>
   <li><strong>On <code>ResumeExpired</code>:</strong> the client clears <code>session_id.set(None)</code> and reverts the user interface to the 7-card prompt-builder grid.</li>
   <li><strong>On user-initiated Bye / Release:</strong> the client clears <code>session_id.set(None)</code> immediately, before sending the <code>SignalMessage::Bye {}</code> to the server.</li>
-  <li><strong>On page navigation away:</strong> Leptos's cleanup runs <code>App</code>'s <code>on_cleanup</code> hook; <code>session_id</code>'s memory is freed alongside the rest of the application state. The server's session-grace window (per Section 11.2's <code>DRAIN_TIMEOUT</code> of 30 seconds — after a streamer WebSocket close, the FSM transitions to <code>Draining</code> and holds the session_id for the drain duration) handles the case where the user comes back: if they return within the 30-second drain window AND the FSM has not yet transitioned to <code>Idle</code>, their <code>ResumeSession</code> request lands on a Draining FSM and is granted (the FSM cancels the drain and re-enters Streaming with the same session_id); if they return after 30 seconds (the FSM is back to <code>Idle</code>), <code>ResumeExpired</code> fires. The 30-second window deliberately covers iPhone WiFi↔cellular handover (~1–3 s re-attach + ~21.5 s ICE consent freshness), so a streamer who switches networks mid-stream does not lose their slot.</li>
+  <li><strong>On page navigation away:</strong> Leptos's cleanup runs <code>App</code>'s <code>on_cleanup</code> hook; <code>session_id</code>'s memory is freed alongside the rest of the application state. The server's session-grace window (per Section 11.2's <code>DRAIN_TIMEOUT</code> of 30 seconds — after a streamer WebSocket close, the FSM transitions to <code>Draining</code> and holds the session_id for the drain duration) handles the case where the user comes back: if they return within the 30-second drain window AND the FSM has not yet transitioned to <code>Idle</code>, their <code>ResumeSession</code> request lands on a Draining FSM and is granted (the FSM cancels the drain and re-enters <code>Claimed</code> with the same session_id, awaiting the fresh post-Option-α RTP — §11.6.1); if they return after 30 seconds (the FSM is back to <code>Idle</code>), <code>ResumeExpired</code> fires. The 30-second window deliberately covers iPhone WiFi↔cellular handover (~1–3 s re-attach + ~21.5 s ICE consent freshness), so a streamer who switches networks mid-stream does not lose their slot.</li>
 </ol>
 
 <p><strong>Where <code>session_id</code> is NOT persisted:</strong> we deliberately do NOT use <code>sessionStorage</code> or <code>localStorage</code>. The session-id is in-memory only. Reasons: (a) sessionStorage adds a DOM-storage API surface that requires CSP <code>connect-src</code>-like considerations and Permissions-Policy entries; (b) localStorage would leak the session-id across reloads, which doesn't compose with the server's session-grace semantics. In-memory only.</p>
@@ -6146,15 +6202,20 @@ async fn e2e_pipeline_keyframe_box_drain() -&gt; Result&lt;()&gt; {
 
     streamer.rtc.disconnect();
     streamer.drive_once().await?;
+    // Send an INTENTIONAL disconnect (intentional: true) so the FSM takes the
+    // fast-drain path (bye-flush, then Idle promptly, NOT resume-eligible) and
+    // Streaming → Draining → Idle completes within the 7 s budget. The 30 s
+    // resume-eligible path (an UNINTENTIONAL drop) is exercised by the manual
+    // browser-matrix, not this in-process smoke test — see §24.4.2.3.
     fsm_tx.send(FsmCommand::Disconnect {
-        peer_id: 1, reason: anyhow::anyhow!("test: explicit streamer disconnect"),
+        peer_id: 1, reason: anyhow::anyhow!("test: explicit streamer Bye"), intentional: true,
     }).await.context("send Disconnect")?;
 
     let mut rx = phase_rx.clone();
     let phase_seq_ok = collect_phase_sequence(&amp;mut rx, Duration::from_secs(7),
         &amp;[|p| matches!(p, Phase::Draining { .. }), |p| matches!(p, Phase::Idle)],
     ).await?;
-    assert!(phase_seq_ok, "FSM did not transition Streaming → Draining → Idle within 7s");
+    assert!(phase_seq_ok, "FSM did not transition Streaming → Draining → Idle within 7s (fast-drain path)");
 
     drop(fsm_tx);
     let _ = timeout(Duration::from_secs(2), sfu_handle).await;
@@ -6616,7 +6677,7 @@ echo "scripts/lint/no_hardcoded_secrets.sh: clean."
 
 <ul>
   <li><strong>mozjpeg encode latency at 720p on the target host.</strong> Estimated 8 to 15 milliseconds based on extrapolation from libjpeg-turbo benchmarks. Run a microbenchmark in continuous-integration on the target box to confirm. If the actual number exceeds 30 milliseconds, reconsider the quality setting — at that point mozjpeg starts to be a meaningful fraction of LocateAnything-3B's fastest mode (point_to at ~210 ms), and a non-trivial fraction of any plausibly-faster successor model.</li>
-  <li><strong>str0m drain timer of 5 seconds for Real-time Transport Control Protocol Bye flush.</strong> The reference <code>chat.rs</code> uses no drain; 5 seconds is our defensive choice. The Real-time Transport Control Protocol Bye message and the SCTP shutdown chunk may not have flushed within 5 seconds under heavy congestion. Empirical observation will tell.</li>
+  <li><strong>DataChannel "bye" flush budget (~800 ms) at shutdown / drain.</strong> The reference <code>chat.rs</code> uses no drain; the ~800 ms per-shutdown bye-flush cap (§18.2 step 3) is our defensive choice. The DataChannel "bye" payload plus the SCTP shutdown chunk may not have flushed within ~800 ms under heavy congestion. (This is the bye-FLUSH budget, distinct from the FSM Draining→Idle window — which is <code>DRAIN_TIMEOUT</code> = 30 s for an unintentional drop, or the same ~800 ms fast bye-flush for an intentional release; see §11.1/§11.2.) Empirical observation will tell.</li>
   <li><strong>Apple iOS 26-specific behavior.</strong> No Apple release notes documenting changes to the 825-day cert cap, click-through persistence, or WebRTC behavior versus iOS 17-18 baseline. Assumed continuous. Verify on a real Apple iPhone 17 device when one is available.</li>
   <li><strong>Per-viewer SCTP pacing under N=100 viewer load.</strong> str0m's single-thread model may bottleneck before SCTP send buffers fill. Untested at scale. The expected demo audience is small (single-digit to low-double-digit viewers), so this is unlikely to bite in practice.</li>
   <li><strong>The exact 720p mozjpeg-baseline encode latency on the target Docker container's specific CPU model.</strong> Order-of-magnitude bound only; could be plus or minus 2-times.</li>
