@@ -1150,7 +1150,7 @@ Concurrently:
   <tr><td><code>hyper</code></td><td><code>=1.10.1</code></td><td><code>default-features = false, features = ["http1", "client"]</code>. Used only by the boot-time <code>/v1/capabilities</code> GET; the LocateAnything-3B WebSocket goes through <code>tokio-tungstenite</code> which embeds its own hyper handshake. <strong>NOT a transitive runtime dependency of <code>tokio-tungstenite</code> 0.29.0</strong> — that crate lists hyper only under <code>[dev-dependencies]</code>. This pin adds a real new runtime crate plus its transitive deps. Verified live against crates.io on 2026-06-01.</td></tr>
   <tr><td><code>hyper-util</code></td><td><code>=0.1.20</code></td><td><code>default-features = false, features = ["client", "client-legacy", "http1", "tokio"]</code>. Provides <code>legacy::Client</code> for the one-shot boot-time HTTP GET. The <code>client-legacy</code> feature is required because the hyper 1.x maintainers reshaped <code>Client</code> as a "legacy" API while higher-level alternatives (still under development) take shape. Adds roughly 10–15 crates to the dependency graph (the new HTTP/1.1 client surface and its primitives — <code>http</code>, <code>http-body</code>, <code>socket2</code>, etc.). Verified live against crates.io on 2026-06-01.</td></tr>
   <tr><td><code>http-body-util</code></td><td><code>=0.1.3</code></td><td><code>default-features = false</code>. Provides <code>BodyExt::collect()</code> for reading the response body into a single <code>Bytes</code> blob. Verified live against crates.io on 2026-06-01.</td></tr>
-  <tr><td><code>socket2</code></td><td><code>=0.6.4</code></td><td><code>default-features = false</code>. Used by Section 19.4.1 to set <code>TCP_KEEPALIVE</code> + <code>TCP_USER_TIMEOUT</code> on the LocateAnything-3B WebSocket's underlying TCP stream (defense against hung-but-TCP-alive LA replies; latency-agnostic, transport-level only). Already pulled in transitively by <code>hyper-util</code>, but we declare it as an explicit runtime pin since we call its API directly. Verified live against crates.io on 2026-06-02 — 0.6.4 is the latest stable.</td></tr>
+  <tr><td><code>socket2</code></td><td><code>=0.6.4</code></td><td><code>features = ["all"]</code>. <strong>Correction (verified against socket2 0.6.4 source on 2026-06-02):</strong> both <code>TcpKeepalive::with_retries</code> (<code>src/lib.rs:556</code>) and <code>Socket::set_tcp_user_timeout</code> (<code>src/sys/unix.rs:2528</code>) are gated behind socket2's ONLY feature, <code>all</code> — so a <code>default-features = false</code> pin (an earlier draft) fails to compile BOTH §17.6.1 (signaling-socket acceptor) and §19.4.1.1 (LocateAnything-3B WebSocket socket). Used to set <code>TCP_KEEPALIVE</code> + <code>TCP_USER_TIMEOUT</code> on those sockets (zombie-WS-task reaping / hung-but-TCP-alive defense; latency-agnostic, transport-level only). It is pulled in transitively by <code>hyper-util</code>, but that transitive pull does NOT enable <code>all</code> (Cargo features are additive, but no other crate requests it), so this explicit <code>features = ["all"]</code> pin is required. Verified live against crates.io on 2026-06-02 — 0.6.4 is the latest stable.</td></tr>
 </table>
 
 <h3>7.5 Rust workspace dependencies — WebAssembly client crate</h3>
@@ -3616,7 +3616,7 @@ let ok: bool = presented_bytes.ct_eq(expected_bytes).into();
 <p>The axum middleware chain, in execution order (outermost first):</p>
 <ol>
   <li><code>SetResponseHeaderLayer</code> for each security header (Section 16).</li>
-  <li><code>tower_http::trace::TraceLayer::new_for_http()</code> (structured request logging).</li>
+  <li><code>tower_http::trace::TraceLayer::new_for_http()</code> with a custom path-only <code>make_span_with</code> — structured request logging that records <code>req.uri().path()</code>, NEVER the full <code>req.uri()</code> (whose query carries the <code>?token=</code> secret on the <code>/v1/signal</code> upgrade; see §17.5).</li>
   <li><code>axum::middleware::from_fn_with_state(state.clone(), auth_layer)</code> (the combined rate-limit-and-auth middleware).</li>
   <li>The route handler.</li>
 </ol>
@@ -3708,7 +3708,24 @@ let app = no_auth_routes
         header::SERVER,
         HeaderValue::from_static(""),
     ))
-    .layer(TraceLayer::new_for_http())
+    .layer(
+        // Record the request PATH only, never req.uri() — the latter Displays the
+        // ?token=<secret> query (DefaultMakeSpan does exactly `uri = %request.uri()`
+        // at DEBUG level, tower-http 0.6.11 src/trace/make_span.rs:98), which would
+        // put the shared secret into `docker logs` the moment RUST_LOG is raised to
+        // debug/trace. Path-only closes that footgun everywhere (§3 secret-hygiene).
+        // (The Authorization: Bearer header is already never logged — headers are
+        // off by default in DefaultMakeSpan — so the query string is the only leak
+        // surface.)
+        TraceLayer::new_for_http().make_span_with(
+            |req: &amp;axum::http::Request&lt;axum::body::Body&gt;| tracing::info_span!(
+                "request",
+                method  = %req.method(),
+                path    = %req.uri().path(),   // path() strips the ?query
+                version = ?req.version(),
+            )
+        )
+    )
     .with_state(state);</code></pre>
 <p>The <code>csp::CSP_HEADER</code> reference is a <code>OnceLock&lt;String&gt;</code> built at process startup (Section 16.5) that includes the build.rs-injected <code>CSP_SCRIPT_HASHES</code>. The Permissions-Policy literal is the verbatim Section 16.3 string. Cache-Control headers are NOT applied via SetResponseHeaderLayer because they vary by content type (Section 16.4); they are set per-handler instead (<code>tower_http::set_header::SetResponseHeaderLayer::if_not_present</code> + per-route layers, OR direct <code>HeaderMap</code> manipulation in each handler — pick one consistently at implementation time).</p>
 This eliminates the "two ways to do the same thing" pattern AND honors the operational requirement that HEALTHCHECK and external monitors reach <code>/v1/health</code> without credentials.
@@ -3851,7 +3868,7 @@ let bind_addr: SocketAddr = /* IPv4-only; see config.rs for the construction */;
 // We need the per-stream sockopt to be applied between accept() and the
 // TLS+HTTP machinery. axum-server's `Acceptor` trait is the seam.
 let acceptor = axum_server::tls_rustls::RustlsAcceptor::new(rustls_config)
-    .with_inner(KeepaliveAcceptor::default());
+    .acceptor(KeepaliveAcceptor::default());   // 0.8.0: the inner-acceptor setter is `.acceptor(...)`, NOT `with_inner`
 
 axum_server::bind(bind_addr)
     .handle(handle)
@@ -3863,7 +3880,7 @@ axum_server::bind(bind_addr)
 
 <p>Important details verified at the pinned versions on 2026-06-01:</p>
 <ul>
-  <li><code>axum_server::bind(SocketAddr).acceptor(A).serve(...)</code> is the long-form of <code>bind_rustls</code> that lets us inject a custom <code>Acceptor</code> wrapped around the rustls TLS acceptor. Per <code>/tmp/axum-server-src/src/lib.rs</code>, the <code>RustlsAcceptor</code>'s <code>with_inner</code> method composes a per-stream socket-options pass before TLS terminates the connection.</li>
+  <li><code>axum_server::bind(SocketAddr).acceptor(A).serve(...)</code> is the long-form of <code>bind_rustls</code> that lets us inject a custom <code>Acceptor</code> wrapped around the rustls TLS acceptor. Per <code>axum-server 0.8.0 src/tls_rustls/mod.rs:147-155</code>, <code>RustlsAcceptor::acceptor(inner)</code> overrides the inner acceptor (there is no <code>with_inner</code> in 0.8.0); <code>RustlsAcceptor::accept</code> runs that inner acceptor on the RAW <code>tokio::net::TcpStream</code> FIRST and only then starts the TLS handshake (<code>src/tls_rustls/future.rs:77-85</code>), so our <code>KeepaliveAcceptor</code> sets the socket options pre-TLS on the bare socket and they persist for the connection's <code>TlsStream&lt;TcpStream&gt;</code> lifetime.</li>
   <li><code>.handle(Handle)</code> attaches a shutdown-control handle.</li>
   <li><code>.serve(make_service)</code> takes any Tower <code>MakeService</code> that produces a per-connection axum <code>Service</code>. <code>app.into_make_service_with_connect_info::&lt;SocketAddr&gt;()</code> from axum 0.8.9 (verified at <code>/tmp/axum-src/axum/src/routing/mod.rs:537</code>) is exactly such a <code>MakeService</code>; the <code>ConnectInfo&lt;SocketAddr&gt;</code> extractor used in <code>auth_layer</code> (Section 17.5) reads the per-connection peer address from this.</li>
   <li>UDP port 51000 (own-STUN + WebRTC media) is handled by a separate <code>tokio::net::UdpSocket</code> in the Selective Forwarding Unit actor task (Section 11.3); it does not touch axum-server.</li>
@@ -3875,8 +3892,6 @@ axum_server::bind(bind_addr)
 <p>An accepted signaling WebSocket TCP connection that dies mid-stream (router cycle, peer's tab crashed, peer's wifi card died) leaves the corresponding axum WebSocket-handler task parked on <code>socket.recv().await</code> until Linux's default <code>tcp_keepalive_time</code> of 7200 seconds fires (verified at <code>man 7 tcp</code>). With many viewers, that's two hours of leaked tokio tasks holding stack frames, mpsc Receivers, and per-peer FSM bookkeeping. Apply <code>TCP_KEEPALIVE</code> + <code>TCP_USER_TIMEOUT</code> to every accepted stream so a dead peer is culled in ~25 seconds, matching the LA WebSocket defense in Section 19.4.1.1.</p>
 
 <pre><code>use std::time::Duration;
-use std::pin::Pin;
-use std::task::{Context, Poll};
 use std::io;
 
 use axum_server::accept::Accept;
@@ -3884,45 +3899,53 @@ use socket2::{SockRef, TcpKeepalive};
 use tokio::net::TcpStream;
 
 /// Acceptor that applies TCP_KEEPALIVE + TCP_USER_TIMEOUT to every accepted
-/// stream before passing it through. Same parameters as the LA WS socket
-/// (Section 19.4.1.1) so the maximum time from peer-vanish to handler-task
-/// reaped is bounded at ~25 s.
+/// stream, then passes it through. Same 10/5/3 + 25 s parameters as the LA WS
+/// socket (Section 19.4.1.1), so the maximum time from peer-vanish to
+/// handler-task reaped is bounded at ~25 s. Modelled on axum-server 0.8.0's
+/// built-in NoDelayAcceptor (src/accept.rs:46-65): concrete TcpStream, generic
+/// service S, mutate the sockopt, return Ready.
 #[derive(Default, Clone, Copy)]
 pub struct KeepaliveAcceptor;
 
-impl&lt;I&gt; Accept&lt;I, axum_server::service::SendService&gt; for KeepaliveAcceptor
-where
-    I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
-{
-    // axum-server 0.8's Accept trait — see /tmp/axum-server-src/src/accept.rs
-    type Stream  = I;
-    type Service = axum_server::service::SendService;
-    type Future  = std::future::Ready&lt;io::Result&lt;(I, Self::Service)&gt;&gt;;
+impl&lt;S&gt; Accept&lt;TcpStream, S&gt; for KeepaliveAcceptor {
+    // axum-server 0.8.0 Accept trait (src/accept.rs:11-23). The service slot is
+    // the concrete per-connection value (generic `S`); `SendService` is a SEALED
+    // BOUND that `serve` applies (src/server.rs:267-269), NOT a nameable type — so
+    // it must NOT appear here (the earlier `type Service = SendService` did not
+    // compile). RustlsAcceptor forwards the raw TcpStream to this inner acceptor
+    // BEFORE TLS (§17.6), so `stream` is the bare socket and socket2 can set
+    // keepalive on it; the option then persists on the resulting TlsStream.
+    type Stream  = TcpStream;
+    type Service = S;
+    type Future  = std::future::Ready&lt;io::Result&lt;(TcpStream, S)&gt;&gt;;
 
-    fn accept(&amp;self, stream: I, service: Self::Service) -&gt; Self::Future {
-        std::future::ready(Ok((stream, service)))
+    fn accept(&amp;self, stream: TcpStream, service: S) -&gt; Self::Future {
+        // ACTUALLY apply keepalive here (the earlier pass-through never did, so
+        // the zombie-reaping guarantee was silently absent). Fail loud (§3): map
+        // any sockopt error to io::Error so the connection is dropped rather than
+        // served without keepalive.
+        let res = apply_keepalive(&amp;stream).map(|()| (stream, service));
+        std::future::ready(res)
     }
 }
 
-/// Apply keepalive to a TcpStream BEFORE we hand it to the rustls acceptor.
-/// Called at `bind` time via a custom listener wrapper, OR by hooking
-/// `TcpListener::accept` in the main task before passing each stream to
-/// axum-server's builder. Either path works; both are valid against the
-/// axum-server 0.8 API. Implementation choice goes here at build time.
-pub fn apply_keepalive(tcp: &amp;TcpStream) -&gt; anyhow::Result&lt;()&gt; {
-    let sock_ref = SockRef::from(tcp);
+/// Apply TCP_KEEPALIVE + TCP_USER_TIMEOUT to a raw accepted TcpStream (pre-TLS).
+fn apply_keepalive(tcp: &amp;TcpStream) -&gt; io::Result&lt;()&gt; {
+    let sock_ref = SockRef::from(tcp);   // From&lt;&amp;S: AsFd&gt;; tokio TcpStream: AsFd on unix
 
-    // Idle 10 s, probe every 5 s, fail after 3 unanswered probes.
-    // Worst-case dead-peer detection: ~25 s. Identical to Section 19.4.1.1
-    // for symmetry; nothing in either path depends on the specific numbers.
+    // Idle 10 s, probe every 5 s, fail after 3 unanswered probes → ~25 s
+    // worst-case dead-peer detection. Identical to Section 19.4.1.1 for symmetry.
+    // NOTE: with_retries() AND set_tcp_user_timeout() are gated behind socket2's
+    // `all` feature (socket2 0.6.4 src/lib.rs:556, src/sys/unix.rs:2528) — the
+    // socket2 pin in §7.4 MUST carry features = ["all"] or this does not compile.
     let keepalive = TcpKeepalive::new()
         .with_time(Duration::from_secs(10))
         .with_interval(Duration::from_secs(5))
         .with_retries(3);
     sock_ref.set_tcp_keepalive(&amp;keepalive)
-        .context("set_tcp_keepalive on signaling WS socket")?;
+        .map_err(|e| io::Error::other(format!("set_tcp_keepalive on signaling WS socket: {e}")))?;
     sock_ref.set_tcp_user_timeout(Some(Duration::from_secs(25)))
-        .context("set_tcp_user_timeout on signaling WS socket")?;
+        .map_err(|e| io::Error::other(format!("set_tcp_user_timeout on signaling WS socket: {e}")))?;
     Ok(())
 }
 </code></pre>
