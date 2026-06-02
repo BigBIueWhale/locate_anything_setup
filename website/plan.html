@@ -4413,15 +4413,15 @@ Call sites: after adding the video track via <code>pc.add_track_0(&amp;video_tra
 <h3>20.2 Capture parameters (browser-side <code>getUserMedia</code> constraints)</h3>
 <pre><code>{
     video: {
-        width:      { ideal: 1280, max: 1920 },
-        height:     { ideal: 720,  max: 1080 },
+        width:      { ideal: 1280, max: 1280 },   // max == ideal: pinned to the Level 3.1 ceiling (§3.4, §20.1)
+        height:     { ideal: 720,  max: 720  },    // 1280x720 = 3600 macroblocks = Level 3.1 MaxFS; 1080p is unencodable at 42e01f
         frameRate:  { ideal: 30,   max: 30   },
         facingMode: { ideal: "environment" },     // prefer rear camera; user can override via deviceId
     },
     audio: false,
 }
 </code></pre>
-<p>Use <code>ideal</code>, never <code>exact</code>. Avoids <code>OverconstrainedError</code> on devices that cannot satisfy exact constraints.</p>
+<p>Use <code>ideal</code>, never <code>exact</code> — this avoids <code>OverconstrainedError</code> on devices that cannot satisfy exact constraints. The <code>max</code> is pinned to <strong>1280&times;720, identical to the <code>ideal</code></strong>: that is the H.264 Constrained Baseline Level 3.1 frame-size ceiling (3600 macroblocks; §3.4, §20.1), and any capture with width &le; 1280 AND height &le; 720 is &le; 3600 macroblocks, so it is always encodable in-level. A higher <code>max</code> would let a camera deliver frames the forced <code>42e01f</code> encoder cannot represent in-level — and libwebrtc does <strong>not</strong> downscale to the negotiated level (it leaves OpenH264 at <code>LEVEL_UNKNOWN</code>, which derives the level from the actual frame size, emitting an out-of-level bitstream), so capture time is the only safe place to enforce the ceiling. Because the constraint is <code>max</code> (not <code>exact</code>/<code>min</code>), a camera whose native modes exceed 720p is downsampled to satisfy it rather than rejected (every current browser does this; Firefox gained arbitrary crop-and-scale in v144).</p>
 
 <p>Per the W3C Media Capture and Streams specification's Fitness Distance and SelectSettings algorithms (<code>https://www.w3.org/TR/mediacapture-streams/#dfn-fitness-distance</code>), browsers behave as follows: <code>max</code> is a required upper bound (the device's settings dictionary is rejected if it exceeds the max); <code>ideal</code> contributes a finite fitness distance based on <code>|actual - ideal| / max(|actual|, |ideal|)</code>; the device's actual capabilities are queried, the closest match is returned. <strong>Cameras that cannot deliver 720p (older webcams maxing at 480p, ultra-low-end embedded cameras at 320p) return that lower resolution rather than triggering <code>OverconstrainedError</code>.</strong> The browser cannot upsample beyond native; it can downsample.</p>
 
@@ -4439,27 +4439,54 @@ let width  = settings.get_width().ok_or_else(|| anyhow!(
 let height = settings.get_height().ok_or_else(|| anyhow!(
     "MediaTrackSettings.height missing after getUserMedia"))?;
 
-const HARD_FAIL_WIDTH:  i32 = 640;   // sub-VGA: obsolete; refuse to stream
-const HARD_FAIL_HEIGHT: i32 = 360;   // 16:9 floor matching 640 width
-const WARN_WIDTH:       i32 = 1280;  // below 720p: degraded LA token density
-const WARN_HEIGHT:      i32 = 720;
-
-if width &lt; HARD_FAIL_WIDTH || height &lt; HARD_FAIL_HEIGHT {
-    // Stop the track immediately so the camera light doesn't stay on.
-    track.stop();
-    anyhow::bail!(
-        "Camera resolution {width}x{height} is below the required minimum \
-         of {HARD_FAIL_WIDTH}x{HARD_FAIL_HEIGHT}. This demo requires at \
-         least Video Graphics Array resolution to produce reliable \
-         bounding-box detections from LocateAnything-3B."
-    );
+// Single source of truth for the capture-dimension policy — the demo floor AND
+// the H.264 Level 3.1 ceiling — called here AND on the mid-call camera switch
+// (§21.6), so the two paths can never drift. On refusal, stop the track so the
+// camera light goes off; on a sub-ideal-but-acceptable capture, surface the warning.
+match check_capture_dimensions(width, height) {
+    Err(e)        =&gt; { track.stop(); return Err(e); }
+    Ok(Some(msg)) =&gt; last_warning.set(Some(msg)),
+    Ok(None)      =&gt; {}
 }
-if width &lt; WARN_WIDTH || height &lt; WARN_HEIGHT {
-    last_warning.set(Some(format!(
-        "Note: camera is providing {width}x{height}. The demo prefers \
-         {WARN_WIDTH}x{WARN_HEIGHT} for best results. Detections may be \
-         less reliable on smaller objects."
-    )));
+
+// Defined once at module scope; shared by both capture paths (initial + switch).
+fn check_capture_dimensions(width: i32, height: i32) -&gt; anyhow::Result&lt;Option&lt;String&gt;&gt; {
+    const HARD_FAIL_WIDTH:  i32 = 640;   // sub-VGA: obsolete; refuse to stream
+    const HARD_FAIL_HEIGHT: i32 = 360;   // 16:9 floor matching 640 width
+    const WARN_WIDTH:       i32 = 1280;  // below 720p: degraded LA token density
+    const WARN_HEIGHT:      i32 = 720;
+    const CEILING_WIDTH:    i32 = 1280;  // ABOVE this = out-of-level under forced 42e01f
+    const CEILING_HEIGHT:   i32 = 720;   // 1280x720 = 3600 MBs = Level 3.1 MaxFS (§3.4, §20.1)
+
+    if width &lt; HARD_FAIL_WIDTH || height &lt; HARD_FAIL_HEIGHT {
+        anyhow::bail!(
+            "Camera resolution {width}x{height} is below the required minimum \
+             of {HARD_FAIL_WIDTH}x{HARD_FAIL_HEIGHT}. This demo requires at \
+             least Video Graphics Array resolution to produce reliable \
+             bounding-box detections from LocateAnything-3B."
+        );
+    }
+    if width &gt; CEILING_WIDTH || height &gt; CEILING_HEIGHT {
+        // Defense-in-depth: the getUserMedia `max` already pins capture at the Level
+        // 3.1 ceiling, so this guards only against a user agent that ignores `max`. A
+        // frame wider than 1280 OR taller than 720 under the forced 42e01f would put
+        // an OUT-OF-LEVEL H.264 bitstream on the wire (libwebrtc does NOT downscale to
+        // the negotiated level), which the SFU and viewers would silently decode —
+        // exactly the silent anomaly Section 3 forbids. Fail loud instead.
+        anyhow::bail!(
+            "Camera delivered {width}x{height}, above the H.264 Constrained Baseline \
+             Level 3.1 ceiling of {CEILING_WIDTH}x{CEILING_HEIGHT} that the capture \
+             constraints pin. Refusing to encode an out-of-level bitstream."
+        );
+    }
+    if width &lt; WARN_WIDTH || height &lt; WARN_HEIGHT {
+        return Ok(Some(format!(
+            "Note: camera is providing {width}x{height}. The demo prefers \
+             {WARN_WIDTH}x{WARN_HEIGHT} for best results. Detections may be \
+             less reliable on smaller objects."
+        )));
+    }
+    Ok(None)
 }
 </code></pre>
 
@@ -5279,9 +5306,29 @@ pub fn attach_boxes_dc(
   <li>On page load, call <code>navigator.mediaDevices.enumerateDevices()</code>. Filter results to <code>kind === "videoinput"</code>. If all returned <code>MediaDeviceInfo.label</code> fields are empty strings (which they are before permission is granted), render the picker with placeholder text ("Camera 1", "Camera 2", ...) and a "Detect cameras" call-to-action button.</li>
   <li>On the call-to-action button, call <code>navigator.mediaDevices.getUserMedia({ video: true, audio: false })</code> with default constraints. This triggers the browser's permission prompt against the default camera.</li>
   <li>On success: re-call <code>enumerateDevices()</code> — labels are now populated. Re-render the picker with real names. <strong>Keep the obtained stream live</strong> (do not stop it); reuse it.</li>
-  <li>When the user picks a specific device from the dropdown: if the selected device identifier matches the currently-active track's device, no-op. Otherwise: call <code>getUserMedia({ video: { deviceId: { exact: selectedId } }, audio: false })</code>. Then swap the WebRTC track in-place via the Rust pattern below (the JavaScript-style <code>pc.getSenders().find(|s| s.track.kind === "video").replaceTrack(newTrack)</code> shorthand sometimes seen in docs is JS pseudocode, not valid Rust — the Rust shape is more explicit):
+  <li>When the user picks a specific device from the dropdown: if the selected device identifier matches the currently-active track's device, no-op. Otherwise: call <code>getUserMedia({ video: { deviceId: { exact: selectedId }, width: { ideal: 1280, max: 1280 }, height: { ideal: 720, max: 720 } }, audio: false })</code> — carrying the SAME Level 3.1 capture ceiling as the initial constraints (§20.2), because the forced <code>42e01f</code> binds a switched-to camera exactly as it binds the first one. Then re-validate the new track's dimensions with the SAME <code>check_capture_dimensions</code> helper (§20.2) before swapping, and swap the WebRTC track in-place via the Rust pattern below (the JavaScript-style <code>pc.getSenders().find(|s| s.track.kind === "video").replaceTrack(newTrack)</code> shorthand sometimes seen in docs is JS pseudocode, not valid Rust — the Rust shape is more explicit):
     <pre><code>use anyhow::Context;
 use wasm_bindgen::JsCast;
+
+// The deviceId-constrained getUserMedia above resolves to `new_stream`.
+let new_track: web_sys::MediaStreamTrack = new_stream
+    .get_video_tracks().get(0)
+    .dyn_into().map_err(js_err("camera-switch MediaStream has no video track"))?;
+
+// Re-run the SAME capture-dimension policy as the initial path (§20.2): the forced
+// 42e01f Level 3.1 ceiling binds the switched-to camera too. On refusal, stop the
+// NEW track and abort the switch — the existing track stays live, so the session
+// keeps streaming on the working camera while the error surfaces to the user.
+let settings = new_track.get_settings();
+let nw = settings.get_width().ok_or_else(|| anyhow::anyhow!(
+    "MediaTrackSettings.width missing after camera switch"))?;
+let nh = settings.get_height().ok_or_else(|| anyhow::anyhow!(
+    "MediaTrackSettings.height missing after camera switch"))?;
+match check_capture_dimensions(nw, nh) {
+    Err(e)        =&gt; { new_track.stop(); return Err(e); }
+    Ok(Some(msg)) =&gt; last_warning.set(Some(msg)),
+    Ok(None)      =&gt; {}
+}
 
 // Iterate pc.get_senders() (returns js_sys::Array of RtcRtpSender JsValues),
 // find the one with kind == "video", call replace_track returning Promise.
