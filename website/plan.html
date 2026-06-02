@@ -1789,9 +1789,13 @@ let (au_tx, au_rx) = tokio::sync::mpsc::channel::&lt;std::sync::Arc&lt;[u8]&gt;&
 // 1-slot watch; coalescing safe because each RGB frame is self-contained.
 let (rgb_tx, rgb_rx) = tokio::sync::watch::channel::&lt;Option&lt;RgbFrame&gt;&gt;(None);
 
-tokio::spawn(run_sfu(udp_socket, fsm_rx, phase_tx, au_tx));
-tokio::spawn(run_decode_pipeline(au_rx, rgb_tx, fsm_tx.clone()));
-tokio::spawn(run_la_client(rgb_rx, fsm_tx.clone(), /* la host:port, prompt, mode */ /* ... */));
+// Capture the JoinHandles so main can JOIN these tasks within the shutdown
+// budget (Section 18.2) — bye-flush delivery must be deterministic, not a blind
+// sleep. run_sfu returns once it processes FsmCommand::Shutdown (on_shutdown
+// flushes byes + disconnects, then the run loop breaks).
+let sfu_h    = tokio::spawn(run_sfu(udp_socket, fsm_rx, phase_tx, au_tx));
+let decode_h = tokio::spawn(run_decode_pipeline(au_rx, rgb_tx, fsm_tx.clone()));
+let la_h     = tokio::spawn(run_la_client(rgb_rx, fsm_tx.clone(), /* la host:port, prompt, mode */ /* ... */));
 </code></pre>
 
 <p>The run task:</p>
@@ -1834,8 +1838,17 @@ tokio::spawn(run_la_client(rgb_rx, fsm_tx.clone(), /* la host:port, prompt, mode
         tokio::select! {
             biased;
             cmd = rx.recv() =&gt; match cmd {
-                Some(c) =&gt; sfu.handle(c).await?,
-                None    =&gt; break,
+                // Shutdown is intercepted HERE, at the select-loop level, NOT inside
+                // handle(): on_shutdown is async (it pumps poll_output to flush the
+                // DataChannel "bye"s — §18.2 step 3), and handle()'s arms must stay
+                // .await-free for the TOCTOU-free Claim invariant (§11.4.1). Running it
+                // here and then `break`ing is what makes run_sfu RETURN on shutdown, so
+                // main's join (§18.2 step 6) completes deterministically instead of
+                // waiting out a timeout. (The integration test terminates the actor the
+                // other supported way — by dropping all fsm_tx senders → `None` → break.)
+                Some(FsmCommand::Shutdown) =&gt; { sfu.on_shutdown().await?; break; }
+                Some(c)                    =&gt; sfu.handle(c).await?,
+                None                       =&gt; break,
             },
             _ = tick.tick() =&gt; sfu.drive(std::time::Instant::now()).await?,
             r = sfu.socket.recv_from(&amp;mut buf) =&gt; {
@@ -2433,7 +2446,12 @@ fn request_pli_from_streamer(streamer: &amp;mut Client, streamer_video_mid: Mid)
                 self.on_request_streamer_pli()?;
             }
             FsmCommand::Shutdown =&gt; {
-                self.on_shutdown()?;
+                // Unreachable in practice: run_sfu's select loop (§11.3) intercepts
+                // Shutdown BEFORE dispatching to handle() — it calls the async
+                // on_shutdown() at loop level and breaks. This arm exists only to keep
+                // the match exhaustive; it never executes (no panic, per §4). on_shutdown
+                // cannot run here because it awaits (poll_output pumps), and handle()'s
+                // arms are .await-free by the §11.4.1 TOCTOU invariant.
             }
         }
         Ok(())
@@ -2671,7 +2689,7 @@ let _ = self.phase_tx.send(self.phase.kind());</code></pre>
 <p>The demo server process runs a Tokio multi-thread runtime with the following long-lived tasks:</p>
 
 <ol>
-  <li><strong>Main task</strong> (<code>tokio::main</code>): parses CLI arguments via clap, reads or generates the TLS certificate, validates wall-clock plausibility (refuses to start if <code>SystemTime::now()</code> is before 2024-01-01 or after 2040-01-01), <strong>performs the boot-time LocateAnything-3B capabilities cross-check</strong> (see Section 12.2), constructs <code>AppState</code>, spawns the helpers below, then awaits <code>axum_server::bind_rustls(addr, rustls_config).handle(handle).serve(make_service)</code> (see Section 17.6 for the exact pattern), with graceful shutdown driven via <code>Handle::graceful_shutdown(Some(Duration))</code> from a signal-watcher task, then awaits one second of grace, then exits.</li>
+  <li><strong>Main task</strong> (<code>tokio::main</code>): parses CLI arguments via clap, reads or generates the TLS certificate, validates wall-clock plausibility (refuses to start if <code>SystemTime::now()</code> is before 2024-01-01 or after 2040-01-01), <strong>performs the boot-time LocateAnything-3B capabilities cross-check</strong> (see Section 12.2), constructs <code>AppState</code>, spawns the helpers below, then awaits <code>axum_server::bind_rustls(addr, rustls_config).handle(handle).serve(make_service)</code> (see Section 17.6 for the exact pattern), with graceful shutdown driven via <code>Handle::graceful_shutdown(Some(Duration))</code> from a signal-watcher task, then JOINS the SFU / decode / LA task handles within the shutdown budget (§18.2 — a deterministic join, not a blind sleep), then exits.</li>
   <li><strong>Signal handler task</strong>: spawns a Tokio task that calls <code>tokio::select! { _ = tokio::signal::ctrl_c() =&gt; ..., _ = tokio::signal::unix::signal(SignalKind::terminate())?.recv() =&gt; ... }</code> and notifies the shutdown <code>Arc&lt;tokio::sync::Notify&gt;</code> on either signal.</li>
   <li><strong>Authentication rate-limit garbage-collection task</strong>: on a 60-second tokio::time::interval, calls <code>RateLimiter::retain_recent()</code> on the per-IP rate limiter to evict entries whose buckets have fully refilled.</li>
   <li><strong>Cert-expiry re-check task</strong>: on a 6-hour <code>tokio::time::interval</code>, re-parses the live <code>cert.pem</code> at <code>STATE_DIR/cert.pem</code> via <code>x509-parser</code> and re-runs the §14.5 three-band check against <code>SystemTime::now()</code>. <strong>If the cert has crossed into the &lt;30-day-from-expiry band</strong>, log a WARN identical to the boot-time WARN (idempotent — operator sees the same message every 6 hours regardless of how many days have elapsed). <strong>If the cert has crossed into the &lt;7-day-from-expiry band</strong>, log an ERROR at every interval AND flip a process-local <code>cert_expiring_soon: AtomicBool</code> flag that <code>/v1/health</code> reads and reports as <code>status: "degraded"</code>. The binary does NOT self-exit (existing TLS sessions stay valid); the operator monitoring <code>/v1/health</code> or <code>docker logs</code> gets a continuous loud signal. <strong>If the cert is past <code>notAfter</code></strong>, the same flag is set, plus <code>cert_valid: false</code> is reported in <code>/v1/health</code>. This closes the silent-stall window in which a binary that started with 7–30 days of cert remaining keeps running through expiry without proactive logging. The 6-hour cadence is generous (the band crossings only happen once every ~27 months in normal operation); not perf-coupled.</li>
@@ -2726,7 +2744,7 @@ let _ = self.phase_tx.send(self.phase.kind());</code></pre>
   "container_time_utc":    "2026-06-01T12:34:58Z",     // wall clock at the time of the GET
   "cert_not_after":        "2028-09-03T12:34:56Z",     // X.509 notAfter from the live cert
   "cert_subject_alt_names":["DNS:demo.example.com", "IP:203.0.113.42", "DNS:localhost", "IP:127.0.0.1"],
-  "la_reachable":          true,                       // last successful LocateAnything-3B WS connect was &lt; 60 s ago
+  "la_reachable":          true,                       // FSM reachability bit: true while the LA WebSocket is connected (last LA lifecycle command was LaUp, not LaDown); see §19.4. NOT a time window.
   "la_last_error":         null                        // OR the chained-anyhow String from the most recent failure
 }
 </code></pre>
@@ -2965,9 +2983,9 @@ For Punycode encoding of IDN hostnames, a Rust crate such as <code>idna</code> w
   <li><strong>Time-to-expiry policy (strict, three bands; fail-loud at boundary):</strong>
     <ul>
       <li><strong><code>notAfter &lt; now</code> (already expired):</strong> regenerate immediately. Operator likely intended this by leaving an old cert on disk; producing a fresh one is the correct boot behavior. Log <code>regenerating cert: previous cert expired at {notAfter}</code>.</li>
-      <li><strong><code>notAfter &lt; now + 7 days</code>:</strong> <strong>refuse to start.</strong> Exit the process with a chained anyhow error string: <code>cert.pem at {state-dir} expires in N days ({notAfter}); run ./setup.sh --regenerate-cert from the project root, or extend manually before restarting</code>. This forces the operator to confront the cert situation rather than relying on log scraping. Docker's <code>--restart unless-stopped</code> will loop the container; the operator sees the failure in <code>docker logs</code> and acts.</li>
+      <li><strong><code>notAfter &lt; now + 7 days</code>:</strong> log a LOUD ERROR at process start (and on every <code>/v1/health</code> probe), flip the process-local <code>cert_expiring_soon</code> flag so <code>/v1/health</code> reports <code>status: "degraded"</code>, and <strong>START and serve</strong> — the cert is still cryptographically valid, so refusing to serve it would itself be the outage. Message: <code>cert.pem at {state-dir} expires in N days ({notAfter}); regenerate NOW via ./setup.sh --regenerate-cert</code>. <strong>This is the SAME behavior the running-binary cert-expiry re-check applies once it crosses the &lt;7-day band (§12.1 item 4)</strong> — startup and the running check now agree, so a routine restart (host reboot, kernel update, crash, the 5 AM router cycle) during this ~23-day window does NOT convert a still-valid cert into a hard outage. That alignment is required by the "must survive restart" requirement (§2); the three loud channels (boot ERROR, 6-hourly ERROR, <code>/v1/health: degraded</code>) satisfy fail-loud (§3.2) without a self-inflicted refusal-to-serve. No auto-regen — it would silently change the cert fingerprint and break cached browser trust (§14.8); operator-witnessed regen via <code>./setup.sh --regenerate-cert</code> is the discipline.</li>
       <li><strong><code>notAfter &lt; now + 30 days</code>:</strong> log a loud WARN at process start (and on every <code>/v1/health</code> probe): <code>cert.pem expires in N days; plan a regeneration window — run ./setup.sh --regenerate-cert when convenient</code>. Continue starting; no auto-regen. Justification: auto-regen on expiry-approaching changes the cert fingerprint silently, breaking any cached browser trust; operator-witnessed regen is the discipline.</li>
-      <li><strong>Otherwise:</strong> load and serve. The same WARN-on-near-expiry policy means the operator is gently nagged starting at 30 days out, then hard-stopped at 7 days out — giving 23 days of explicit notice before the binary refuses to run.</li>
+      <li><strong>Otherwise:</strong> load and serve. With this policy the binary NEVER refuses to start over certificate expiry: a cert ≥ 30 days out serves silently, &lt; 30 days serves with a WARN, &lt; 7 days serves with an ERROR + <code>/v1/health: degraded</code>, and an already-expired cert is regenerated (the first branch above). The hard line is "the cert physically cannot complete a handshake" (expired → regenerate), never "the cert is merely close to expiry" — so the service always comes up, honoring "must survive restart" (§2) while staying escalatingly loud (§3.2).</li>
     </ul>
   </li>
 </ol>
@@ -3615,7 +3633,7 @@ let ok: bool = presented_bytes.ct_eq(expected_bytes).into();
 {
     "status":        "ok" | "degraded",
     "cert_valid":    true | false,        // cert.pem parses and notAfter &gt; now
-    "la_reachable":  true | false         // last successful LA WS connect within 60 s
+    "la_reachable":  true | false         // FSM reachability bit (LaUp/LaDown toggle, §19.4); NOT a time window
 }
 </code></pre>
 The detailed chained-anyhow last-error string is reserved for the authenticated <code>/v1/info</code> endpoint (Section 12.3).</li>
@@ -3925,7 +3943,7 @@ pub fn apply_keepalive(tcp: &amp;TcpStream) -&gt; anyhow::Result&lt;()&gt; {
   </li>
   <li>The <code>axum_server::bind_rustls(...).serve(...).await</code> future returns once every per-connection task has dropped its handle. <strong>This typically returns very quickly</strong> because the per-connection HTTP task ends at the WebSocket upgrade boundary; upgraded WebSocket tasks have already dropped their handles in step 3.</li>
   <li>Outer wrapper: <code>tokio::time::timeout(Duration::from_secs(8), serve_future)</code>. On elapse, log a WARN line and continue (the underlying handler tasks have all been notified and will drain themselves; we just stop waiting). <strong>Time budget: 8 seconds.</strong></li>
-  <li><code>tokio::time::sleep(Duration::from_secs(1)).await</code> as a brief join-window for any final Close frame flushes on the loopback. <strong>Time budget: 1 second.</strong></li>
+  <li><strong>Join the long-lived tasks (deterministic, not a blind sleep).</strong> <code>tokio::time::timeout(Duration::from_secs(1), futures::future::join_all([sfu_h, decode_h, la_h])).await</code>. run_sfu's select loop intercepts <code>FsmCommand::Shutdown</code>, runs the async <code>on_shutdown</code> (per-peer DataChannel "bye" flush + <code>rtc.disconnect()</code>, step 3, ≤800 ms) and then <code>break</code>s — so <code>sfu_h</code> resolves; <code>la_h</code> and <code>decode_h</code> return on their WS/channel close. Because <code>on_shutdown</code>'s flush begins at signal time (step 2) and overlaps the serve-drain, by the time this join runs the tasks have typically already returned, so it completes near-instantly; only a pathological stall waits out the 1 s cap (then log a WARN and exit anyway — the handlers were already notified). This replaces the former blind 1-second <code>sleep</code>, closing the race where a bye-flush slower than the sleep let the process exit before the browser saw its clean goodbye (§18.3). <strong>Time budget: ≤1 second, sequential to step 5</strong> — worst-case total shutdown is 8 s (step 5's serve cap) + 1 s = 9 s, preserving a 1-second buffer under the Docker 10-second SIGTERM→SIGKILL window (§15.7.1); the realistic path (serve returns sub-second, tasks already joined) is well under 3 s.</li>
   <li>Process exits with code 0.</li>
 </ol>
 
@@ -5273,7 +5291,7 @@ ctx.scale(dpr, dpr).map_err(js_err("ctx.scale"))?;  // accumulating transform
   <li><strong>User-visible state:</strong> the application's <code>ConnState</code> reactive signal goes to <code>Reconnecting { attempt: u32, last_error: String }</code> on every retry; the connection-state banner in the user interface always shows the current retry attempt and the last chained-anyhow error message. The banner has a "Stop trying" button (rendered after attempt 5) that, if clicked, transitions <code>ConnState</code> to <code>Stopped</code> and the user has to manually click "Try again" to resume the reconnect loop. This gives the user explicit, opt-in giving up — never silent automated giving up.</li>
 </ul>
 
-<p><strong>What the user sees during the 5 AM router cycle, with this design:</strong> at 05:00:00 the connection drops. At 05:00:00.5 the WebAssembly client begins retrying. Each retry fails until connectivity returns at 05:01:30 (or whenever). At that point, the next retry succeeds; the application transitions to <code>Reconnecting { ... }</code> → <code>Connecting</code> → <code>Connected</code>; if the user had owned the streamer slot, the <code>ResumeSession</code> exchange (Section 11.5) restores their ownership and triggers a fresh <code>SdpOffer</code> per Option α (Section 11.8). The user sees "Reconnecting (attempt 12, last error: <chained>) — Stop trying" during the outage, then "Connected" immediately afterward. No "please refresh" prompt; no lost ownership during the outage window.</p>
+<p><strong>What the user sees during the 5 AM router cycle, with this design:</strong> at 05:00:00 the connection drops. At 05:00:00.5 the WebAssembly client begins retrying. Each retry fails until connectivity returns at 05:01:30 (or whenever). At that point, the next retry succeeds; the application transitions to <code>Reconnecting { ... }</code> → <code>Connecting</code> → <code>Connected</code>; the WebSocket reconnect <em>loop</em> survives the entire outage — the user sees "Reconnecting (attempt 12, last error: &lt;chained&gt;) — Stop trying" throughout, then "Connected" immediately afterward, with no "please refresh" prompt ever. <strong>Ownership, however, is a separate guarantee.</strong> The Finite State Machine reaches <code>Idle</code> roughly 35 seconds into the outage (5 s RTP_TIMEOUT → Draining, then the 30 s DRAIN_TIMEOUT → Idle, per §11.2); because the 1–3 minute router cycle far exceeds the 30 s resume window, the post-outage <code>ResumeSession</code> lands on an <code>Idle</code> FSM and returns <code>ResumeExpired</code>, so the former streamer re-claims from the 7-card prompt grid (§21.10.0 item 5). This is correct per the "if anybody disconnects, the server cleanly reverts to a mode where anybody can take ownership" requirement (§2) — a streamer who genuinely vanished for minutes does not hold the single slot hostage. <strong>Ownership survives only drops shorter than DRAIN_TIMEOUT (~30 s)</strong> — a brief blip or a Wi-Fi↔cellular handover — NOT the full router cycle.</p>
 
 <h4>21.10.0 ResumeSession lifecycle on the WebAssembly client</h4>
 
