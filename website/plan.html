@@ -920,39 +920,59 @@ Use Bash:
 │  │ ├── For incoming H.264 NAL Unit (Network Abstraction Layer Unit)   │  │
 │  │ │     access units from streamer's MediaData:                      │  │
 │  │ │       (a) republish RTP to every viewer's StreamTx               │  │
-│  │ │       (b) IDR-only gate: pass keyframe access units to the       │  │
-│  │ │           LA path via a 1-slot bounded mpsc (loud-drop on        │  │
-│  │ │           overrun, NOT silent coalesce). P-frames are            │  │
-│  │ │           re-published to viewers but dropped on the LA side.    │  │
-│  │ └── PLI (Picture Loss Indication) keyframe requests:               │  │
-│  │       proactive on new viewer attach (~1 RTT saved on viewer's     │  │
-│  │       first-frame), AND periodic upstream PLI paced at LA's        │  │
-│  │       /v1/capabilities.calibration.median_latency_ms cadence       │  │
-│  │       (forces IDR emission to drive the LA sampling rate;          │  │
-│  │       throttled at the 1-second-per-(mid,rid) floor).              │  │
+│  │ │       (b) push the AU into a bounded mpsc::channel(256) toward   │  │
+│  │ │           the decode-pipeline task; in-order delivery, NO        │  │
+│  │ │           coalescing — the H.264 reference chain across          │  │
+│  │ │           P-frames is preserved end-to-end.                      │  │
+│  │ └── PLI (Picture Loss Indication) keyframe requests, event-driven  │  │
+│  │       only — NO periodic scheduler, NO hardcoded interval:         │  │
+│  │       (i) proactive on new-viewer attach (~1 RTT saved on the      │  │
+│  │       viewer's first-frame); (ii) on MediaData.contiguous=false    │  │
+│  │       from the decode task on packet-loss recovery (str0m chat.rs  │  │
+│  │       reference pattern). Wire-rate is structurally bounded by     │  │
+│  │       str0m's per-50-ms TWCC pass coalescing the pending_request_  │  │
+│  │       keyframe field AND by libwebrtc's kMinKeyframeSendInterval   │  │
+│  │       Ms=300 encoder-side floor; no application-level throttle    │  │
+│  │       is needed on top of those two structural caps.               │  │
 │  └────────────────────────────────────────────────────────────────────┘  │
 │  ┌────────────────────────────────────────────────────────────────────┐  │
-│  │ Decode + JPEG-encode pipeline task (tokio task)                    │  │
-│  │ Reads from watch channel (latest H.264 access unit)                │  │
-│  │ → ffmpeg-next 7.1.0 H.264 software decoder → YUV420 frame          │  │
+│  │ Decode pipeline task (tokio task)                                  │  │
+│  │ Drains AUs in arrival order from the bounded mpsc::channel(256).   │  │
+│  │ Holds ONE long-lived ffmpeg-next 7.1.0 H.264 decoder Context for   │  │
+│  │ the entire streaming session; libavcodec maintains the H.264       │  │
+│  │ reference chain across P-frames. Output is held until recovered    │  │
+│  │ (libavcodec/h264_slice.c:1376-1383 — no AV_CODEC_FLAG_OUTPUT_      │  │
+│  │ CORRUPT means corrupt frames are NEVER emitted by default), so     │  │
+│  │ cold-start before the first IDR is naturally silent.               │  │
+│  │ On MediaData.contiguous=false: decoder.flush() + emit one          │  │
+│  │ event-driven KeyframeRequestKind::Pli upstream.                    │  │
+│  │ → YUV420P frame                                                    │  │
 │  │ → ffmpeg-next libswscale Pixel::YUV420P → Pixel::RGB24,            │  │
-│  │   Flags::BICUBIC (verified-safe per browser-matrix sub-agent;      │  │
-│  │   sub-token chroma-upsampling improvement at 8×8 block edges),     │  │
-│  │   BT.709 colorspace matrix via sws_setColorspaceDetails             │  │
-│  │   (limited→full range; matches modern-webcam VUI signaling)        │  │
-│  │ → mozjpeg 0.10.13 Compress::new(ColorSpace::JCS_EXT_RGB) →         │  │
-│  │   set_optimize_scans(false), set_optimize_coding(true),            │  │
-│  │   set_use_scans_in_trellis(false), set_smoothing_factor(0),        │  │
-│  │   set_quality(92.0), chroma 4:2:0 default → in-memory Vec&lt;u8&gt;      │  │
-│  │ → LA-sender task                                                   │  │
+│  │   Flags::BICUBIC, BT.709 colorspace via sws_setColorspaceDetails   │  │
+│  │   (limited→full range; matches modern-webcam VUI signaling).       │  │
+│  │   Scaling Context is long-lived; reconstructed only on a frame-    │  │
+│  │   dimensions change (libavcodec auto-reinit at h264_slice.c:1080). │  │
+│  │ → publish RGB frame to tokio::sync::watch::Sender&lt;Option&lt;RgbFrame&gt; │  │
+│  │   (1-slot, latest-wins; coalescing is SAFE here because each RGB   │  │
+│  │   frame is self-contained — no cross-frame state)                  │  │
 │  └────────────────────────────────────────────────────────────────────┘  │
 │  ┌────────────────────────────────────────────────────────────────────┐  │
-│  │ LA WebSocket client task (tokio task)                              │  │
+│  │ LA WebSocket client task (tokio task) — the natural-rate driver    │  │
 │  │ tokio-tungstenite 0.29.0, default features (TLS not on by default) │  │
 │  │ ws://&lt;la-host&gt;:&lt;la-port&gt;/v1/stream                                 │  │
 │  │ Wire frame: [4-byte BE u32 = header_len][header_len JSON][JPEG]    │  │
 │  │ JSON: {frame_id, prompt, generation_mode, jpeg_len}                │  │
-│  │ Stop-and-wait per connection (LA enforces).                        │  │
+│  │ Loop:                                                              │  │
+│  │   jpeg_rx.changed().await    // park if no new frame from decoder  │  │
+│  │   frame = jpeg_rx.borrow_and_update().clone()   // latest wins     │  │
+│  │   jpeg = mozjpeg encode at quality 92 (set_optimize_scans(false),  │  │
+│  │     set_use_scans_in_trellis(false), set_smoothing_factor(0),      │  │
+│  │     set_optimize_coding(true), chroma 4:2:0 default)               │  │
+│  │   ws.send(wire) ; reply = ws.next().await                          │  │
+│  │   forward reply to FSM (LaBoxResult / LaErrorResult)               │  │
+│  │ Stop-and-wait per connection (LA enforces). LA's natural latency   │  │
+│  │ (~785 ms hybrid, ~937 ms slow per DRONE_DETECTION.md:113-117) is   │  │
+│  │ the sampling cadence — no scheduler, no hardcoded interval.        │  │
 │  │ Reconnect on close: exponential backoff 500ms..10s.                │  │
 │  │ Replies received: forward to FSM, then DataChannel-fanout to peers │  │
 │  └────────────────────────────────────────────────────────────────────┘  │
@@ -1883,7 +1903,8 @@ pub struct Client {
     /// `None` until str0m emits `Event::ChannelOpen` for this peer.
     pub boxes_cid:           Option&lt;ChannelId&gt;,
     /// Wall-clock instant when `video_mid` was set; used for diagnostics
-    /// and for new-viewer PLI throttling (1/second per (mid, rid) tuple).
+    /// (e.g., "how long since this viewer's outbound video was negotiated
+    /// before the first keyframe arrived").
     pub media_added_at:      Option&lt;Instant&gt;,
     /// Wall-clock instant when `boxes_cid` was set. Reserved for future
     /// observability; not load-bearing for current flow.
@@ -2007,6 +2028,13 @@ pub struct Sfu {
     /// forwards it via this command; the FSM calls
     /// `client.rtc.add_remote_candidate(candidate)`.
     AddRemoteCandidate { peer_id: PeerId, candidate: str0m::Candidate },
+    /// Decoder-loss recovery: the decode-pipeline task observed
+    /// `MediaData.contiguous == false` from str0m (the depacketizer's
+    /// hold-back window expired without NACK/RTX recovering the lost
+    /// packet). The FSM, on receiving this, calls
+    /// `streamer.rtc.writer(video_mid).request_keyframe(None, Pli)`.
+    /// Event-driven, never periodic — see Section 20.6.
+    RequestStreamerPli,
     /// Process-wide shutdown signal received; drain everything.
     Shutdown,
 }
@@ -2224,6 +2252,11 @@ fn request_pli_from_streamer(streamer: &amp;mut Client, streamer_video_mid: Mid)
             FsmCommand::LaErrorResult { frame_id, code, message } =&gt; {
                 self.on_la_error_result(frame_id, code, message)?;
             }
+            FsmCommand::RequestStreamerPli =&gt; {
+                // Forward an event-driven PLI to the streamer's encoder.
+                // Decoder-loss-recovery path; see Sections 19.1 and 20.6.
+                self.on_request_streamer_pli()?;
+            }
             FsmCommand::Shutdown =&gt; {
                 self.on_shutdown()?;
             }
@@ -2239,6 +2272,7 @@ fn request_pli_from_streamer(streamer: &amp;mut Client, streamer_video_mid: Mid)
 <tr><td><code>Claim</code>, <code>ResumeSession</code>, <code>AttachStreamer</code>, <code>AttachViewer</code>, <code>Disconnect</code>, <code>AddRemoteCandidate</code></td><td>WebSocket handler task (Section 12 list item 7)</td></tr>
 <tr><td><code>GotRtp</code></td><td>SFU actor task itself, emitted inline from the UDP-demux <code>Event::MediaData</code> arm when the owner is in <code>Phase::Claimed</code>. NOT cross-task — same task self-dispatches via re-entrancy on the next select! iteration. (Could equivalently be a direct method call; the variant exists for symmetry and observability.)</td></tr>
 <tr><td><code>LaDown</code>, <code>LaUp</code>, <code>LaBoxResult</code>, <code>LaErrorResult</code></td><td>LocateAnything-3B WebSocket client task (Section 12 list item 4)</td></tr>
+<tr><td><code>RequestStreamerPli</code></td><td>Decode-pipeline task (Section 12 list item 6) on observing <code>MediaData.contiguous == false</code>.</td></tr>
 <tr><td><code>Shutdown</code></td><td>Signal-watcher task (Section 12 list item 2 + Section 18.1)</td></tr>
 </table>
 
@@ -2389,7 +2423,7 @@ let _ = self.phase_tx.send(self.phase.clone());</code></pre>
   <li><strong>The <code>ChannelOpen</code> window:</strong> after the new Rtc is constructed and the channel is queued via <code>add_channel_with_config</code>, the channel is unusable until <code>Event::ChannelOpen</code> fires. <code>rtc.channel(cid)</code> returns <code>None</code> until then. The box-dispatch loop MUST skip a peer whose <code>boxes_cid</code> is <code>None</code>. BoxMessages generated for this peer during the window are dropped (a single peer in mid-reconnect would otherwise hold up the inference pipeline; dropping is strict-correctness for this transient state).</li>
   <li><strong>SCTP stream-id cooldown</strong> (irrelevant under Option α but worth knowing): when a channel is closed, str0m holds its stream id in a 2-second cooldown (<code>/tmp/str0m-src/src/channel.rs:193, 369-372</code>). This affects close-then-immediately-reopen patterns on the SAME <code>Rtc</code>; under Option α the whole <code>Rtc</code> is dropped, so the cooldown is irrelevant.</li>
   <li><strong>Viewers' <code>Rtc</code> instances are unaffected by the streamer's reconnect.</strong> Each <code>Rtc</code> is an independent state machine with no shared state (verified by source-level review of <code>/tmp/str0m-src/src/lib.rs:869-891</code>). When the streamer reconnects, viewers' Rtcs keep polling normally; the forwarder simply has nothing to feed into them for the brief gap. No viewer-side signaling action is needed; viewers do NOT re-negotiate their own Session Description Protocol.</li>
-  <li><strong>Picture Loss Indication after reconnect:</strong> as soon as the new streamer's <code>MediaAdded</code> arrives, the SFU should call <code>request_pli_from_streamer(streamer_video_mid)</code> (Section 11.7) so the streamer's encoder emits a keyframe; viewers' decoders pick up the stream cleanly. The PLI throttle (Section 20.6, 1/second per (mid, rid) tuple) is per-Rtc, so it does not interfere across reconnects.</li>
+  <li><strong>Picture Loss Indication after reconnect:</strong> as soon as the new streamer's <code>MediaAdded</code> arrives, the SFU should call <code>request_pli_from_streamer(streamer_video_mid)</code> (Section 11.7) so the streamer's encoder emits a keyframe; viewers' decoders pick up the stream cleanly. PLI emission is fully event-driven (Section 20.6); the new Rtc is a fresh state machine and any prior in-flight requests on the old Rtc are dropped with it.</li>
 </ul>
 
 <p>An identical sequence applies to a VIEWER's reconnect (a viewer's WebSocket dies, its WASM client rebuilds the <code>RTCPeerConnection</code>, the server receives a fresh offer with a new DTLS fingerprint). Only the role-filtering in step 8 differs (viewer accepts <code>SendOnly | SendRecv</code> direction; no streamer-side PLI generation needed because the streamer's encoder hasn't reset).</p>
@@ -2402,9 +2436,9 @@ let _ = self.phase_tx.send(self.phase.clone());</code></pre>
   <li><strong>Main task</strong> (<code>tokio::main</code>): parses CLI arguments via clap, reads or generates the TLS certificate, validates wall-clock plausibility (refuses to start if <code>SystemTime::now()</code> is before 2024-01-01 or after 2040-01-01), <strong>performs the boot-time LocateAnything-3B capabilities cross-check</strong> (see Section 12.2), constructs <code>AppState</code>, spawns the helpers below, then awaits <code>axum_server::bind_rustls(addr, rustls_config).handle(handle).serve(make_service)</code> (see Section 17.6 for the exact pattern), with graceful shutdown driven via <code>Handle::graceful_shutdown(Some(Duration))</code> from a signal-watcher task, then awaits one second of grace, then exits.</li>
   <li><strong>Signal handler task</strong>: spawns a Tokio task that calls <code>tokio::select! { _ = tokio::signal::ctrl_c() =&gt; ..., _ = tokio::signal::unix::signal(SignalKind::terminate())?.recv() =&gt; ... }</code> and notifies the shutdown <code>Arc&lt;tokio::sync::Notify&gt;</code> on either signal.</li>
   <li><strong>Authentication rate-limit garbage-collection task</strong>: on a 60-second tokio::time::interval, calls <code>RateLimiter::retain_recent()</code> on the per-IP rate limiter to evict entries whose buckets have fully refilled.</li>
-  <li><strong>LocateAnything-3B WebSocket client task</strong>: maintains a reconnecting <code>tokio-tungstenite</code> connection to <code>ws://&lt;la-host&gt;:&lt;la-port&gt;/v1/stream</code>; pulls JPEG bytes from a <code>tokio::sync::watch&lt;Option&lt;LatestFrame&gt;&gt;</code> channel; writes frame headers + JPEG body per the LA wire format; reads JSON replies; emits <code>FsmCommand::LaBoxResult { msg: BoxMessage }</code> on <code>type:"result"</code> replies, <code>FsmCommand::LaErrorResult { frame_id, code, message }</code> on <code>type:"error"</code> replies, <code>FsmCommand::LaDown { error }</code> on WebSocket-drop, and <code>FsmCommand::LaUp</code> on reconnect-success into the FSM via the FsmCommand channel.</li>
-  <li><strong>Selective Forwarding Unit actor task</strong>: see <a href="#sec-fsm">Section 11</a>. Owns the UDP socket and the <code>Vec&lt;Client&gt;</code>. Drives <code>str0m::Rtc</code> instances. Handles own-STUN binding-request demultiplexing.</li>
-  <li><strong>Decode + JPEG encode pipeline task</strong>: drains the H.264 access unit watch channel that the SFU populates; calls <code>ffmpeg-next</code> to decode H.264 NALU buffers to YUV420 frames; calls <code>libswscale</code> via <code>ffmpeg-next::software::scaling::Context</code> to convert to RGB24; calls <code>mozjpeg::Compress</code> to encode as JPEG; publishes the result into the LA-sender watch channel.</li>
+  <li><strong>LocateAnything-3B WebSocket client task</strong>: maintains a reconnecting <code>tokio-tungstenite</code> connection to <code>ws://&lt;la-host&gt;:&lt;la-port&gt;/v1/stream</code>; reads the latest RGB frame from a <code>tokio::sync::watch::Receiver&lt;Option&lt;RgbFrame&gt;&gt;</code> via the canonical <code>changed().await</code> + <code>borrow_and_update()</code> idiom; encodes JPEG via <code>mozjpeg::Compress</code> at quality 92 per the knob discipline in Section 19.2; writes frame headers + JPEG body per the LA wire format; reads one JSON reply (stop-and-wait per LA's enforcement); emits <code>FsmCommand::LaBoxResult { msg: BoxMessage }</code> on <code>type:"result"</code> replies, <code>FsmCommand::LaErrorResult { frame_id, code, message }</code> on <code>type:"error"</code> replies, <code>FsmCommand::LaDown { error }</code> on WebSocket-drop, and <code>FsmCommand::LaUp</code> on reconnect-success into the FSM. LA's per-frame latency is the natural sampling cadence; the loop runs forever as fast as LA can chew through frames.</li>
+  <li><strong>Selective Forwarding Unit actor task</strong>: see <a href="#sec-fsm">Section 11</a>. Owns the UDP socket and the <code>Vec&lt;Client&gt;</code>. Drives <code>str0m::Rtc</code> instances. Handles own-STUN binding-request demultiplexing. Pushes every streamer-video <code>MediaData</code> access unit into a bounded <code>tokio::sync::mpsc::channel(256)</code> toward the decode-pipeline task in arrival order — no coalescing.</li>
+  <li><strong>Decode pipeline task</strong>: drains the bounded mpsc of H.264 access units in arrival order; holds ONE long-lived <code>ffmpeg-next 7.1.0</code> H.264 decoder <code>Context</code> across the entire streaming session; libavcodec maintains the H.264 reference chain across P-frames and naturally suppresses output until <code>recovered=true</code> after the first IDR (verified at upstream <code>libavcodec/h264_slice.c:1376-1383</code>). On <code>MediaData.contiguous == false</code>: calls <code>decoder.flush()</code> AND emits one event-driven <code>KeyframeRequestKind::Pli</code> upstream. Decoded YUV420 frames flow through a long-lived <code>ffmpeg-next::software::scaling::Context</code> (BICUBIC, BT.709 limited→full per Section 19.3, reconstructed only on a frame-dimensions change) into RGB24, and the RGB frame is published to a <code>tokio::sync::watch::Sender&lt;Option&lt;RgbFrame&gt;&gt;</code> for the LA client task to pull. JPEG encoding lives in the LA client task (Section 12.1 list item 4) so that frames the LA task never sees are never JPEG-encoded.</li>
   <li><strong>Per-HTTP-connection task</strong>: spawned automatically by <code>axum_server</code>'s underlying hyper service. Each one handles one HTTP request, or upgrades to a long-lived WebSocket. WebSocket handler tasks (the <code>/v1/signal</code> upgrade route) drive a per-peer state machine on top of the FsmCommand channel:
     <ul>
       <li>Read <code>SignalMessage</code>s from the wire and dispatch:
@@ -3597,132 +3631,135 @@ Without this sequence, the browser learns of disconnect only via ICE consent-fre
 
 <h2 id="sec-video-pipeline">19. Server-Side Video Pipeline <a class="anchor" href="#sec-video-pipeline">#</a></h2>
 
-<h3>19.1 Pipeline diagram — IDR-only sampling, driven by periodic PLI</h3>
+<h3>19.1 Pipeline diagram — natural-pace sampling driven by LocateAnything-3B's stop-and-wait cadence</h3>
 
-<div class="note note-critical">
-<strong>Sampling strategy (corrected by source-level research on 2026-06-02):</strong> the demo server samples the streamer's H.264 stream <strong>only on Instantaneous Decoder Refresh (IDR) access units</strong>, paced by a periodic Picture Loss Indication (PLI) sent upstream to the streamer's encoder. Reasons (verified):
-<ul>
-  <li><strong>WebRTC encoders do NOT insert periodic IDRs by default.</strong> Per RFC 6184 §5.4 and the H.264 standard, an IDR is emitted only on (a) stream start, (b) explicit RTCP PLI from a recipient, (c) parameter change. In steady state an h264-over-WebRTC stream can run for minutes between IDRs.</li>
-  <li><strong>A `tokio::sync::watch` channel coalesces.</strong> Verified at <code>https://docs.rs/tokio/1.52.3/src/tokio/sync/watch.rs.html#961-1000</code>: if the producer writes A→B→C while the consumer is processing X, the consumer's next <code>changed().await</code> returns with the version pointing at C and A and B are unobservable. Earlier drafts of this plan used this "freshest wins" pattern; combined with the IDR cadence above it produces silent decoder-state corruption: the libavcodec H.264 decoder receives P-frames it has no reference chain for, and either returns AVERROR_INVALIDDATA or (worse) silently produces frames with <code>AV_FRAME_FLAG_CORRUPT</code> set + garbage pixels (gray macroblocks + bleed-through). Either way the JPEG fed to LocateAnything-3B is garbage, and LA happily detects "objects" in noise.</li>
-  <li><strong>LA's measured throughput is the actual bottleneck</strong>, not the watch channel. Per <code>/home/user/Desktop/locate_anything_setup/docs/DRONE_DETECTION.md:113-117</code>: ~1.3 fps hybrid on 1080p drone JPEGs, ~1.07 fps slow, ~4.8 fps for the point_to calibration target. The plan's earlier "6 fps sampling" target is aspirational and not achievable end-to-end. Throttling sampling to IDR cadence does NOT lose throughput we ever had.</li>
-</ul>
-<strong>The fix:</strong> the SFU's <code>on_streamer_media_data</code> handler gates on <code>data.is_keyframe()</code> AND <code>data.contiguous</code> (both fields on <code>str0m::media::MediaData</code>, verified at <code>https://docs.rs/str0m/0.20.0/src/str0m/media/event.rs.html#252-298</code>). Non-keyframe access units are dropped on the floor for the LA path (they are still re-published to viewers — Section 11.7 is unchanged). A separate <code>tokio::time::interval</code> task in the SFU paces PLI requests upstream to the streamer at <code>median_inference_ms</code> cadence (read at boot from <code>/v1/capabilities.calibration.median_latency_ms</code> on the LocateAnything-3B server, fallback 800 ms if the field is absent). Each surviving IDR is self-contained; the decoder can be opened-closed per frame with no cross-frame state. The libavcodec <code>frame.is_corrupt()</code> flag is checked after every <code>receive_frame</code> and any frame with the flag set is dropped, surfaced as a counter increment.
+<div class="note note-info">
+<strong>Sampling cadence: LocateAnything-3B's stop-and-wait latency is the natural rate.</strong> The LocateAnything-3B server enforces strict one-frame-in / one-reply-out per WebSocket connection — verified at <code>/home/user/Desktop/locate_anything_setup/docs/CLIENT_PROTOCOL.md:14</code> ("strictly stop-and-wait per connection") and in code at <code>/home/user/Desktop/locate_anything_setup/worker/la_worker.py:168, 438-444</code> (an <code>asyncio.Lock()</code> held for the entire forward pass). Measured per-frame inference latency per <code>/home/user/Desktop/locate_anything_setup/docs/DRONE_DETECTION.md:113-117</code>: ~785 ms hybrid on 1080p (~1.30 fps), ~937 ms slow (~1.07 fps), ~210 ms for the point_to calibration target (~4.8 fps). The demo server's LA-side rate is whatever the per-frame latency happens to be — <strong>no scheduler, no hardcoded interval, no artificial delay anywhere in the pipeline.</strong>
 </div>
 
+<p>The pipeline is structured so that LocateAnything-3B naturally pulls a frame at its own pace:</p>
+<ol>
+  <li><strong>SFU → decoder feed (non-coalescing).</strong> The Selective Forwarding Unit's <code>on_streamer_media_data</code> handler does two things on every <code>Event::MediaData</code> from the streamer: (a) re-publish the access unit (AU) to every viewer via <code>str0m::Writer</code> (Section 11.7, unchanged); (b) push the AU into a bounded <code>tokio::sync::mpsc::channel(256)</code> toward the decode-pipeline task. The capacity is roughly 8.5 seconds of frames at 30 fps — a safety margin against transient decoder stalls. <strong>In-order delivery, no coalescing.</strong> The H.264 reference chain across P-frames is preserved end-to-end. On <code>try_send</code> returning <code>Err(Full)</code>, the SFU surfaces an <code>anyhow::Error</code> up to its supervising task, which disconnects the streamer per the strict no-fallback rule (Section 3); a chronic Full condition indicates the decode pipeline has wedged and silent backpressure would only mask the bug.</li>
+  <li><strong>Decoder (stateful, long-lived).</strong> One <code>ffmpeg_next::codec::context::Context</code> with an open H.264 decoder lives for the entire streaming session. The task calls <code>decoder.send_packet(&amp;packet)</code> and <code>decoder.receive_frame(&amp;mut yuv_frame)</code> per AU. <strong>libavcodec naturally suppresses output before the H.264 recovery flag is set</strong> (verified at upstream <code>libavcodec/h264_slice.c:1376-1383</code>: without <code>AV_CODEC_FLAG_OUTPUT_CORRUPT</code>, output is held until <code>out-&gt;recovered = true</code>, set on IDR at line 1664 or on an SEI recovery-point message). Therefore: a fresh decoder attaching mid-stream on a P-frame DOES NOT emit corrupt pixels — it stays silent until the recovery IDR arrives. Cold-start before the very first IDR is correct by construction. Mid-stream Sequence Parameter Set changes (e.g., the streamer's camera changing resolution via <code>RTCRtpSender.replaceTrack</code> in Section 21.6) are handled by libavcodec's automatic re-init path at <code>h264_slice.c:1080-1090</code>.</li>
+  <li><strong>Packet-loss recovery is event-driven.</strong> str0m's depacketizer holds packets for up to 30 frames (~1 second at 30 fps; default at <code>str0m 0.20.0 src/config.rs:639</code>) waiting for Negative-Acknowledgement-driven retransmission via the 3-second StreamTx cache (<code>src/streams/send.rs:38, 275</code>). When that hold-back window expires without recovery, str0m emits <code>MediaData.contiguous = false</code>. The decode-pipeline task, on observing this, calls <code>decoder.flush()</code> to clear the Decoded Picture Buffer AND emits one <code>KeyframeRequestKind::Pli</code> upstream to the streamer via the FSM. This is the str0m reference pattern (<code>examples/chat.rs:442-445</code>) verbatim — event-driven, not periodic.</li>
+  <li><strong>YUV → RGB conversion (long-lived swscale Context).</strong> Each successfully-decoded YUV420P frame goes through libswscale via <code>ffmpeg_next::software::scaling::Context</code> with <code>Flags::BICUBIC</code> and an explicit <code>sws_setColorspaceDetails</code> call (BT.709 source coefficients, limited→full range — see Section 19.3 for the unsafe FFI shape and rationale). The swscale Context is long-lived across the streaming session; it is reconstructed only when the decoded frame's dimensions change (the libavcodec auto-reinit signal at <code>h264_slice.c:1080-1090</code>).</li>
+  <li><strong>Decoder → LA feed (coalescing safe).</strong> Each RGB frame is published to a <code>tokio::sync::watch::Sender&lt;Option&lt;RgbFrame&gt;&gt;</code>. The watch's 1-slot coalescing semantic is <em>safe</em> here because each RGB frame is self-contained — no cross-frame state, no reference chain. The LA WebSocket client task is the sole consumer.</li>
+  <li><strong>LA WebSocket client (the natural-rate driver).</strong> The canonical Tokio watch idiom drives a strict stop-and-wait loop:
+    <pre><code>loop {
+    jpeg_rx.changed().await
+        .context("decoder pipeline closed unexpectedly")?;
+    let frame = jpeg_rx.borrow_and_update().clone();
+    let jpeg  = jpeg_encode(&amp;frame)
+        .with_context(|| format!("mozjpeg encode (size={}x{})", frame.width, frame.height))?;
+    let wire  = build_la_wire(&amp;header, &amp;jpeg);
+    ws.send(Message::Binary(wire.into())).await
+        .context("LA WS send")?;
+    let reply = ws.next().await
+        .ok_or_else(|| anyhow::anyhow!("LA closed mid-frame"))??;
+    dispatch_la_reply(reply).await?;
+}</code></pre>
+  <code>changed().await</code> parks until at least one new frame has been published since the last call. <code>borrow_and_update()</code> returns the freshest frame and marks it seen. By the time LA has replied (~785 ms hybrid), the decoder has typically overwritten the watch slot 20+ times; the next <code>changed()</code> resolves immediately with the latest. <strong>LA's natural latency is the cadence.</strong> No periodic scheduler, no <code>tokio::time::interval</code>, no hardcoded number.</li>
+</ol>
+
+<p><strong>PLI emission is fully event-driven; no application-level throttle is needed.</strong> Two structural rate-caps already sit below the SFU's application code:</p>
+<ul>
+  <li>str0m's <code>pending_request_keyframe: Option&lt;KeyframeRequestKind&gt;</code> field at <code>src/streams/receive.rs:80</code> collapses multiple <code>request_keyframe()</code> calls into one PLI per 50-millisecond TWCC pass.</li>
+  <li>libwebrtc's <code>kMinKeyframeSendIntervalMs = 300</code> at <code>video/encoder_rtcp_feedback.cc:23-24</code> drops any PLI received within 300 ms of the last emitted IDR — the streamer's encoder physically cannot produce IDRs faster than ~3.3 / second regardless of the SFU's request rate.</li>
+</ul>
+<p>An application-level throttle on top of these two structural floors would be a third redundant layer with no behavioral effect; we omit it to honor the no-overengineered-options principle of Section 3. New-viewer attach (Section 11.7) and the <code>!contiguous</code> recovery path are the only PLI emitters.</p>
+
 <pre><code>str0m streamer Rtc instance
-  └── on Event::MediaData { data: Arc&lt;[u8]&gt;, time: MediaTime, contiguous: bool, codec_extra, .. }
-        (data is an H.264 NAL Unit access unit, already depacketized)
+  └── on Event::MediaData { data: Arc&lt;[u8]&gt;, time: MediaTime, contiguous: bool, .. }
+        (data is an Annex-B framed H.264 access unit with SPS+PPS prepended on
+         IDRs; the H.264 depacketizer at /tmp/str0m-src/src/packet/h264.rs:317,350,387
+         emits start-code-framed bytes regardless of how the RTP packets were
+         aggregated on the wire. STAP-A aggregations and FU-A fragments both
+         collapse into Annex-B in the same data buffer.)
         │
         ▼
-SFU actor (in on_streamer_media_data):
-  - Always re-publish to viewers via str0m::Writer (Section 11.7) — unchanged.
-  - For the LA path: gate on the keyframe + contiguity test
-        let is_keyframe = matches!(
-            data.codec_extra,
-            str0m::format::CodecExtra::H264(h) if h.is_keyframe,
-        );
-        if !is_keyframe || !data.contiguous {
-            return;   // wait for the next IDR
-        }
-  - On keyframe: hand the AU off to the decode-pipeline task via a 1-slot
-    bounded mpsc channel (NOT a watch channel — we want loud-drop on overrun,
-    not silent coalescing). On try_send Err(Full), increment
-    la_pipeline_overrun_total counter and drop the AU; the next IDR will catch up.
+SFU actor (on_streamer_media_data):
+  - Always re-publish to viewers via str0m::Writer (Section 11.7).
+  - Push every AU into mpsc::channel(256) toward the decoder task. On Err(Full),
+    propagate anyhow::Error up; supervising task disconnects the streamer.
         │
         ▼
-Decode pipeline task drains: rx.recv().await
-        │
-        ▼
-ffmpeg_next::codec::context::Context::new() // VideoDecoder, fresh per AU
-  .codec(AVCodecID::AV_CODEC_ID_H264).open()
-  packet = Packet::copy(&amp;nalu_bytes)
-  decoder.send_packet(&amp;packet)?;
-  decoder.receive_frame(&amp;mut yuv_frame)?;
-  if yuv_frame.is_corrupt() {                   // AV_FRAME_FLAG_CORRUPT check
-      tracing::warn!(frame_id, "libavcodec marked frame corrupt; dropping");
-      return Ok(());
-  }
-  // Because every input is a self-contained IDR, the decoder is stateless
-  // across frames: no SPS-flush logic, no inter-frame reference, no DPB.
-  // We open a fresh Context per AU and let it drop at scope-end.
-        │
-        ▼
-ffmpeg_next::software::scaling::Context::get(
-    Pixel::YUV420P, yuv_frame.width(), yuv_frame.height(),
-    Pixel::RGB24,   yuv_frame.width(), yuv_frame.height(),
-    Flags::BICUBIC,
-)
-  // Force BT.709 source coefficients + full-range RGB destination (Section 19.3).
-  // ffmpeg-next 7.1.0's safe wrapper does not expose sws_setColorspaceDetails;
-  // reach through Context::as_mut_ptr() for this one-time per-Context setup call.
-  unsafe {
-      let rc = ffmpeg_next::sys::sws_setColorspaceDetails(
-          scaler.as_mut_ptr(),
-          ffmpeg_next::sys::sws_getCoefficients(ffmpeg_next::sys::SWS_CS_ITU709 as i32),
-          0,                                            // srcRange = 0 (limited / TV — H.264 default)
-          ffmpeg_next::sys::sws_getCoefficients(ffmpeg_next::sys::SWS_CS_DEFAULT as i32),
-          1,                                            // dstRange = 1 (full / PC — RGB24)
-          0,                                            // brightness
-          1 &lt;&lt; 16,                                       // contrast (1.0 in 16.16 fixed-point)
-          1 &lt;&lt; 16,                                       // saturation
-      );
-      if rc &lt; 0 {
-          anyhow::bail!("sws_setColorspaceDetails returned {rc}; libswscale rejected BT.709 setup");
+Decode pipeline task (long-lived libavcodec H.264 Context):
+  loop {
+      let pkt_bytes = au_rx.recv().await
+          .ok_or_else(|| anyhow!("SFU closed AU channel"))?;
+      let packet = ffmpeg_next::packet::Packet::copy(&amp;pkt_bytes);
+      decoder.send_packet(&amp;packet)
+          .with_context(|| format!("libavcodec send_packet (len={})", pkt_bytes.len()))?;
+      match decoder.receive_frame(&amp;mut yuv_frame) {
+          Ok(()) =&gt; {
+              if yuv_frame.is_corrupt() {              // AV_FRAME_FLAG_CORRUPT — extra-defensive
+                  tracing::warn!("libavcodec emitted corrupt frame; dropping");
+                  continue;
+              }
+              // proceed to scale + publish
+          }
+          Err(ffmpeg_next::Error::Other { errno })
+              if errno == ffmpeg_next::error::EAGAIN =&gt; {
+              // Decoder needs more input — normal during cold-start before the
+              // first IDR arrives, and benign per h264_slice.c:1376-1383
+              // (libavcodec suppresses output until recovered=true).
+              continue;
+          }
+          Err(e) =&gt; return Err(e).context("libavcodec receive_frame"),
       }
+      // If dimensions changed since the last frame, rebuild swscale Context.
+      ensure_scaler_for(&amp;mut scaler_slot, yuv_frame.width(), yuv_frame.height())?;
+      scaler_slot.as_mut().unwrap().run(&amp;yuv_frame, &amp;mut rgb_frame)
+          .context("libswscale run YUV420P→RGB24")?;
+      rgb_tx.send(Some(rgb_frame.clone()))
+          .context("rgb watch channel closed")?;
   }
-  scaler.run(&amp;yuv_frame, &amp;mut rgb_frame)?;
-  // Resolution is dynamic: the decoded YUV frame carries the actual
-  // dimensions in `width()/height()`. Cameras that cannot deliver 720p
-  // (e.g., older webcams capping at 480p) return that lower resolution
-  // from getUserMedia per W3C MediaCapture-Streams SelectSettings;
-  // libavcodec emits SPS/PPS for the actual dimensions; we honor them.
-  // With the per-AU fresh-decoder discipline above, the swscale Context
-  // is also constructed per AU; no caching, no recreation logic needed.
         │
         ▼
-mozjpeg::Compress::new(ColorSpace::JCS_EXT_RGB)
-  set_size(rgb_frame.width() as usize, rgb_frame.height() as usize);
-  // Dynamic per-decoded-frame. mozjpeg's set_size writes directly to
-  // cinfo.image_width / image_height (verified at
-  // https://docs.rs/mozjpeg/0.10.13/src/mozjpeg/compress.rs.html#332-335);
-  // a fresh Compress is constructed per frame so this is always current.
-  set_optimize_scans(false);     // CRITICAL: defaults to TRUE via JCP_MAX_COMPRESSION
-  set_use_scans_in_trellis(false);
-  set_smoothing_factor(0);
-  set_optimize_coding(true);
-  set_quality(92.0);
-  // chroma left at default 4:2:0
-  started = compress.start_compress(Vec::new())?;
-  started.write_scanlines(&amp;rgb_data)?;
-  jpeg_bytes: Vec&lt;u8&gt; = started.finish()?;
+On str0m emitting MediaData.contiguous=false:
+  decoder.flush();
+  fsm_tx.send(FsmCommand::RequestStreamerPli).await?;
+  (Section 20.6 — event-driven only, no time-based scheduler.)
         │
         ▼
-tokio-tungstenite WebSocket to ws://&lt;la-host&gt;:&lt;la-port&gt;/v1/stream
-  header_json = serde_json::to_vec(&amp;LaInferHeader {
-      frame_id, prompt, generation_mode, jpeg_len: jpeg_bytes.len(),
-  })?;
-  let mut frame = Vec::new();
-  frame.extend_from_slice(&amp;(header_json.len() as u32).to_be_bytes());
-  frame.extend_from_slice(&amp;header_json);
-  frame.extend_from_slice(&amp;jpeg_bytes);
-  ws.send(Message::Binary(frame.into())).await?;  // Vec&lt;u8&gt; -&gt; Bytes; tokio-tungstenite 0.29 Binary variant carries Bytes
-  let reply = ws.next().await
-      .ok_or_else(|| anyhow!("LA closed mid-frame"))??;
-        │
-        ▼
-parse JSON reply
-  if reply.type == "result": construct BoxMessage, send FsmCommand::LaBoxResult
-                             { msg: BoxMessage } to the FSM. The FSM's
-                             on_la_box_message in sfu.rs fans out
-                             to every connected peer's "boxes" DataChannel
-                             (streamer + viewers).
-  if reply.type == "error":  send FsmCommand::LaErrorResult
-                             { frame_id, code, message } to the FSM. The
-                             FSM constructs SignalMessage::Error and routes
-                             to the streamer via the per-peer signal_tx;
-                             the wasm-client auto-releases ownership after
-                             500 ms (client-side, in components/error_banner.rs).
+LA WebSocket client task (the natural-rate driver):
+  loop {
+      jpeg_rx.changed().await?;                          // park if no new frame
+      let frame   = jpeg_rx.borrow_and_update().clone(); // latest wins
+      let jpeg    = mozjpeg_encode_q92(&amp;frame)?;         // see Section 19.2
+      let header  = LaInferHeader { frame_id, prompt, generation_mode,
+                                    jpeg_len: jpeg.len() };
+      let mut wire = Vec::with_capacity(4 + header_json.len() + jpeg.len());
+      wire.extend_from_slice(&amp;(header_json.len() as u32).to_be_bytes());
+      wire.extend_from_slice(&amp;header_json);
+      wire.extend_from_slice(&amp;jpeg);
+      ws.send(Message::Binary(wire.into())).await?;
+      let reply = ws.next().await
+          .ok_or_else(|| anyhow!("LA closed mid-frame"))??;
+      // Dispatch reply to FSM (Section 11.7.1's fan-out path):
+      //   type:"result" -&gt; FsmCommand::LaBoxResult { msg: BoxMessage }
+      //   type:"error"  -&gt; FsmCommand::LaErrorResult { frame_id, code, message }
+  }
 </code></pre>
+
+<p><strong>End-to-end fps</strong> under this design, using the documented 1080p LA latency as a conservative upper bound for cycle time (720p inputs will execute somewhat faster due to fewer Vision Transformer tokens, but the actual 720p latency is unmeasured — see Section 27):</p>
+
+<table>
+  <tr><th>LA generation mode</th><th>LA inference time</th><th>Pipeline overhead (mozjpeg + libswscale + LAN WS RTT)</th><th>End-to-end cycle</th><th>fps</th></tr>
+  <tr><td>Hybrid</td><td>~785 ms</td><td>~10–15 ms</td><td>~800 ms</td><td>~1.25</td></tr>
+  <tr><td>Slow</td><td>~937 ms</td><td>~10–15 ms</td><td>~950 ms</td><td>~1.05</td></tr>
+  <tr><td>Point (calibration only)</td><td>~210 ms</td><td>~10–15 ms</td><td>~225 ms</td><td>~4.4</td></tr>
+</table>
+
+<p>Critical-path overhead (single x86_64 modern core, target host being the Intel Core Ultra 9 285K per Section 1; on-host measurement is the gap recorded in Section 27, but the bracket below is consistent with published benchmarks):</p>
+<ul>
+  <li><strong>mozjpeg encode at Q92 baseline 4:2:0, knobs disabled per Section 19.2:</strong> ~5–10 ms at 720p (~0.92 megapixels).</li>
+  <li><strong>libswscale BICUBIC YUV420P → RGB24 at 720p:</strong> ~3–5 ms.</li>
+  <li><strong>WebSocket send + receive over LAN:</strong> ~0.5–1 ms (1 Gbps switch, ~50–80 KiB JPEG payload at Q92).</li>
+  <li><strong>JSON reply parse + DataChannel fan-out + tokio scheduling:</strong> &lt;0.5 ms total.</li>
+</ul>
+
+<p>The decode task runs as a separate Tokio worker (Section 12.4 pins 4 workers): at 30 fps with ~6–12 ms per 720p H.264 software-decode frame plus the libswscale step, the decode task occupies roughly 18–36 % of one core sustained. Well within budget. The LA client task's critical path sees only the per-LA-cycle overhead because the decode pipeline is fully parallel; the ~2 % fps loss versus LA's native throughput (hybrid mode) is the dominant accounting term and is invariant to streamer-side frame rate.</p>
 
 <h3>19.2 mozjpeg knob discipline</h3>
 <div class="note note-critical">
@@ -3985,12 +4022,13 @@ let pc = web_sys::RtcPeerConnection::new_with_configuration(&amp;cfg)
     .map_err(js_err("RtcPeerConnection::new_with_configuration"))?;
 </code></pre>
 
-<h3>20.6 Keyframe handling</h3>
+<h3>20.6 Keyframe handling — event-driven only, no scheduler</h3>
 <ul>
   <li><strong>Use <code>KeyframeRequestKind::Pli</code></strong> (Picture Loss Indication), NOT <code>Fir</code> (Full Intra Request). FIR is reserved for mixer/composition scenarios per RFC 5104 and is explicitly disallowed for loss recovery. <strong>The str0m example file <code>examples/chat.rs:444</code> uses <code>Fir</code>; this is wrong per the RFC; the implementation agent MUST use Pli.</strong></li>
-  <li>Proactively send a Picture Loss Indication to the streamer when a new viewer's outbound video is ready, saving approximately one round-trip-time of black frames at the viewer's start. Implementation: when an <code>Event::MediaAdded</code> fires for a viewer Rtc's outbound video <code>Mid</code>, look up the streamer Rtc, find the inbound video stream, call <code>streamer_rtc.writer(STREAMER_VIDEO_MID).request_keyframe(None, KeyframeRequestKind::Pli)</code>.</li>
-  <li><strong>Periodic PLI to drive the LocateAnything-3B sampling cadence.</strong> Per Section 19.1, the demo server samples the streamer's H.264 stream only on IDR access units (not on every frame); a separate <code>tokio::time::interval</code> task in the SFU paces PLI upstream to the streamer to force IDR emission at the LocateAnything-3B inference cadence. The interval is set from <code>/v1/capabilities.calibration.median_latency_ms</code> read at boot (fallback 800 ms if absent). At LA's measured ~1.3 fps hybrid throughput on 1080p, this means ~one PLI per ~770 ms; at slow-mode throughput ~one per ~940 ms. The PLI scheduler reads <code>self.phase</code> and emits PLI only while in <code>Streaming</code> — no PLI traffic during <code>Idle</code> or <code>Draining</code>.</li>
-  <li>Throttle keyframe requests at 1 second per (mid, rid) tuple to avoid hammering the streamer's encoder when many viewers join in quick succession AND to provide a hard floor under the periodic-PLI scheduler when <code>median_latency_ms</code> is implausibly small. The throttle is the canonical place to enforce "encoder doesn't emit an IDR more than once per second" — both the new-viewer proactive PLI and the periodic PLI pass through it.</li>
+  <li><strong>PLI emitter #1 — new-viewer attach.</strong> Proactively send a Picture Loss Indication to the streamer when a new viewer's outbound video is ready, saving approximately one round-trip-time of black frames at the viewer's start. Implementation: when an <code>Event::MediaAdded</code> fires for a viewer Rtc's outbound video <code>Mid</code>, look up the streamer Rtc, find the inbound video stream, call <code>streamer_rtc.writer(STREAMER_VIDEO_MID).request_keyframe(None, KeyframeRequestKind::Pli)</code>.</li>
+  <li><strong>PLI emitter #2 — decoder-loss recovery.</strong> The decode-pipeline task (Section 19.1) observes <code>MediaData.contiguous == false</code> when str0m's depacketizer has exhausted its hold-back window without recovering a lost packet via NACK/RTX. The task calls <code>decoder.flush()</code> AND emits one <code>KeyframeRequestKind::Pli</code> upstream to the streamer via an <code>FsmCommand::RequestStreamerPli</code> to the FSM. This is the str0m reference pattern (<code>examples/chat.rs:442-445</code>) verbatim — one event-driven PLI per packet-loss recovery event.</li>
+  <li><strong>No periodic scheduler, no application-level throttle.</strong> Two structural rate caps already sit below the SFU's application code: <strong>(i)</strong> str0m's <code>pending_request_keyframe: Option&lt;KeyframeRequestKind&gt;</code> field at <code>src/streams/receive.rs:80</code> coalesces redundant <code>request_keyframe()</code> calls into one PLI per 50-millisecond TWCC pass, and <strong>(ii)</strong> libwebrtc's <code>kMinKeyframeSendIntervalMs = 300</code> at <code>video/encoder_rtcp_feedback.cc:23-24</code> drops any PLI received within 300 ms of the last emitted IDR. The streamer's encoder physically cannot produce IDRs faster than ~3.3/second regardless of how many PLIs we issue. An application-level throttle on top of these two structural floors would be a third redundant layer with no behavioral effect; omitting it honors the no-overengineered-options principle of Section 3.</li>
+  <li><strong>No periodic IDR cadence imposed by the demo server.</strong> The browser's encoder emits IDRs on its own natural cadence (libwebrtc default <code>keyFrameInterval = 3000</code> frames per <code>api/video_codecs/video_encoder.cc:36</code>, ≈ 100 seconds at 30 fps), plus on the two event-driven triggers above. Sampling to LocateAnything-3B is driven by LA's own per-frame latency via the watch-channel pattern (Section 19.1); the demo server runs no timer-driven PLI loop.</li>
 </ul>
 
 <h3>20.7 NACK and RTX</h3>
@@ -5385,7 +5423,7 @@ done
   <li><code>--security-opt no-new-privileges</code> — a <code>setuid</code> ELF can never gain privileges back.</li>
   <li><code>--user "$(id -u):$(id -g)"</code> — runs the container process as the operator's UID/GID. Files written to the bind-mount (cert.pem, key.pem, cert.metadata.json) are owned by the operator on the host, so they can be inspected/backed-up/regenerated via normal user commands without sudo. The Dockerfile creates a <code>lawebsite</code> user inside the image for file-ownership defaults at build time; the <code>--user</code> override at runtime supersedes that.</li>
   <li><code>-v "${STATE_DIR_HOST}":/var/lib/la-website</code> — bind-mounts <code>./website/.runtime/state/</code> on the host onto the binary's hardcoded <code>STATE_DIR</code> inside the container. The host-side directory was created with mode 0700 by setup.sh (Section 24.7).</li>
-  <li><code>--memory 2g</code>, <code>--pids-limit 256</code> — bounded resource limits. The 2 GiB cap is sized for: ~80 MiB baseline (Rust runtime + glibc + dlopen'd libav* shared objects + axum + tokio 4-worker stacks + tracing buffers), plus ~25 MiB transient per H.264 decoder Context (one Context per IDR per Section 19.1), plus ~4 MiB per peer's str0m::Rtc + 128 KiB SCTP buffer + small ICE state, plus ~512 KiB governor DashMap (Section 13.7), plus headroom for glibc malloc arena retention drift over multi-day uptime. Worst-case live working set at 50 concurrent viewers is ~315 MiB; the 2 GiB cap leaves ~6× headroom for the expected demo audience (single-digit to low-double-digit viewers). Earlier drafts used <code>--memory 1g</code>; bumped to 2 GiB to absorb fragmentation drift, which a glibc-malloc-based Rust process exhibits at the rate of ~30-50 MiB per 24 hours of churn on this kind of workload (per-frame Vec allocations in mozjpeg + Packet::copy + Arc bumps). The container is not allowed to grow unbounded — if it ever needs &gt; 2 GiB, the kernel OOM-killer is the loud-failure signal we want.</li>
+  <li><code>--memory 2g</code>, <code>--pids-limit 256</code> — bounded resource limits. The 2 GiB cap is sized for: ~80 MiB baseline (Rust runtime + glibc + dlopen'd libav* shared objects + axum + tokio 4-worker stacks + tracing buffers); plus ~25 MiB for the long-lived libavcodec H.264 decoder + libswscale Context owned by the decode-pipeline task (one set per streaming session — Section 19.1); plus ~4 MiB per peer's str0m::Rtc + 128 KiB SCTP buffer + small ICE state; plus ~512 KiB governor DashMap (Section 13.7); plus a 256-slot mpsc holding at most ~256 × ~50 KiB worst-case AU payloads ≈ ~13 MiB transient; plus headroom for glibc-malloc arena retention drift over multi-day uptime (~30–50 MiB per 24 hours of churn on this workload, dominated by per-frame Vec allocations in mozjpeg + Packet::copy + Arc bumps). Worst-case live working set at 50 concurrent viewers is ~330 MiB; the 2 GiB cap leaves ~6× headroom for the expected demo audience (single-digit to low-double-digit viewers). The container is not allowed to grow unbounded — if it ever needs &gt; 2 GiB, the kernel OOM-killer is the loud-failure signal we want.</li>
   <li><code>--log-driver json-file --log-opt max-size=10m --log-opt max-file=3 --log-opt compress=true</code> — caps log volume at ~30 MiB.</li>
 </ul>
 
@@ -6280,10 +6318,6 @@ echo "scripts/lint/no_hardcoded_secrets.sh: clean."
   <li>All error handling is anyhow-style chained strings. No <code>unwrap()</code>, no <code>expect()</code>, no <code>panic!()</code> in runtime code.</li>
   <li>The implementation agent can and should spawn its own research sub-agents (Agent tool with <code>subagent_type: "general-purpose"</code>) to clone pinned versions into <code>/tmp</code> for source-level verification when any detail is unclear.</li>
 </ol>
-
-<hr>
-
-<p><em>End of plan. Document length: approximately 23,000 words / 130 kilobytes of HTML. Generated by Claude Opus 4.7 on 2026-06-01 after 32 sequential research sub-agent runs across 30 distinct technical topics.</em></p>
 
 </body>
 </html>
