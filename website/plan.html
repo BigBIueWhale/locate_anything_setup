@@ -1322,7 +1322,7 @@ Concurrently:
 ├── Cargo.lock
 ├── rust-toolchain.toml                # channel = "1.96.0"; targets = ["wasm32-unknown-unknown"]
 ├── Dockerfile                         # multi-stage: rust:1.96.0-trixie builder + debian:trixie-slim runtime
-├── Trunk.toml                         # [tools] wasm_bindgen, wasm_opt; [build] dist = "dist", release = true
+├── Trunk.toml                         # [tools] wasm_bindgen, wasm_opt; [build] dist = "wasm-client/dist", release = true
 ├── setup.sh                           # orchestrates 00..03; writes .runtime/config.env
 ├── uninstall.sh                       # tiered cleanup
 ├── .runtime/                          # GITIGNORED — created by setup.sh
@@ -3196,10 +3196,11 @@ wasm_bindgen = "0.2.122"
 wasm_opt     = "version_116"
 </code></pre>
 <p>The <code>version_116</code> string format (note: not a semantic-version triplet, but the literal Binaryen project tag scheme) is required by Trunk's tool version-string parser at <code>trunk-src/src/tools.rs:209-214</code>.</p>
+<p><strong>Trunk must be invoked from the workspace root</strong> (<code>/work</code> in the Dockerfile: <code>trunk build</code>, NOT <code>cd wasm-client &amp;&amp; trunk build</code>). Trunk discovers <code>Trunk.toml</code> only in the current working directory — there is no parent-directory walk — so running it from <code>wasm-client/</code> silently falls back to <code>wasm-client/Cargo.toml</code> manifest defaults and <strong>ignores this file entirely, including the <code>[tools]</code> pins</strong>, which would defeat the wasm-bindgen↔wasm-opt version-skew protection. The <code>[build]</code> paths above are therefore relative to the workspace root (hence <code>wasm-client/index.html</code>, <code>wasm-client/dist</code>).</p>
 
 <h3>15.5 Dockerfile (multi-stage) — verified end-to-end</h3>
 
-<p>This is the canonical Dockerfile. It folds in every correction surfaced by source-level research: the cache-mount cp-binary-out-of-cache pattern, GIT_SHA/BUILD_TIME_UTC propagation through ARG → ENV → build.rs, HEALTHCHECK, STOPSIGNAL, the LABEL the smoke test reads, and the explicit ldd-per-library verification. <strong>No edits required between this Dockerfile and Section 15.7.7's revised RUN blocks — they are now the same.</strong></p>
+<p>This is the canonical Dockerfile. It folds in every correction surfaced by source-level research: the cache-mount cp-binary-out-of-cache pattern, GIT_SHA/BUILD_TIME_UTC propagation through ARG → ENV → build.rs, HEALTHCHECK, STOPSIGNAL, the LABEL the smoke test reads, and the explicit ldd-per-library verification. <strong>This is the single source of truth for the RUN blocks; §15.7.7 explains the cache sharing-mode choice and defers here rather than restating them.</strong></p>
 
 <pre><code># syntax=docker/dockerfile:1.7
 ARG LA_BUILDER_DIGEST
@@ -3207,18 +3208,6 @@ ARG LA_RUNTIME_DIGEST
 
 # ────────────────────────── Builder stage ──────────────────────────
 FROM rust:1.96.0-trixie@${LA_BUILDER_DIGEST} AS builder
-
-# Build-time-injected metadata. ARGs inside a stage are stage-local; declaring
-# them here scopes them correctly. ENV exports them into the cargo build's
-# environment so build.rs's env::var() picks them up.
-ARG LA_WEBSITE_GIT_SHA
-ARG LA_WEBSITE_BUILD_TIME_UTC
-ENV LA_WEBSITE_GIT_SHA=${LA_WEBSITE_GIT_SHA} \
-    LA_WEBSITE_BUILD_TIME_UTC=${LA_WEBSITE_BUILD_TIME_UTC}
-
-# Fail loud if the operator script didn't supply the build args.
-RUN test -n "${LA_WEBSITE_GIT_SHA}" -a -n "${LA_WEBSITE_BUILD_TIME_UTC}" \
- || { echo "FAIL: LA_WEBSITE_GIT_SHA / LA_WEBSITE_BUILD_TIME_UTC must be set via --build-arg"; exit 1; }
 
 WORKDIR /work
 
@@ -3252,11 +3241,28 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 COPY wasm-client/ wasm-client/
 COPY protocol/    protocol/
 COPY Trunk.toml   ./
+# Trunk runs from the workspace root (WORKDIR /work) — NOT `cd wasm-client` —
+# so it discovers /work/Trunk.toml (Trunk only looks in the CWD, no parent walk)
+# and enforces its [tools] wasm-bindgen/wasm-opt pins. The cache mount is the
+# WORKSPACE target (/work/target): wasm-client is a workspace member (§15.1), so
+# cargo builds it there, not in /work/wasm-client/target.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
-    --mount=type=cache,target=/work/wasm-client/target,sharing=locked \
+    --mount=type=cache,target=/work/target,sharing=locked \
     --network=none \
     TRUNK_OFFLINE=true \
-    sh -c 'cd wasm-client &amp;&amp; trunk build --release --offline'
+    trunk build --release --offline
+
+# Build-time metadata, declared HERE (after the cache-stable apt / rustup /
+# cargo-install and WASM-build layers) so a per-commit GIT_SHA change does NOT
+# invalidate those expensive layers — only the server-compile layer below is
+# rebuilt. ENV exports them so the server's build.rs env::var() picks them up.
+ARG LA_WEBSITE_GIT_SHA
+ARG LA_WEBSITE_BUILD_TIME_UTC
+ENV LA_WEBSITE_GIT_SHA=${LA_WEBSITE_GIT_SHA} \
+    LA_WEBSITE_BUILD_TIME_UTC=${LA_WEBSITE_BUILD_TIME_UTC}
+# Fail loud if the operator script didn't supply the build args.
+RUN test -n "${LA_WEBSITE_GIT_SHA}" -a -n "${LA_WEBSITE_BUILD_TIME_UTC}" \
+ || { echo "FAIL: LA_WEBSITE_GIT_SHA / LA_WEBSITE_BUILD_TIME_UTC must be set via --build-arg"; exit 1; }
 
 # Build the server binary AND copy it OUT of the cache mount in the same RUN.
 # The cache-mount layer is unmounted after the RUN ends; anything inside
@@ -3465,23 +3471,7 @@ HEALTHCHECK --interval=30s \
 
 <p>For our three cache mounts (Section 15.5): all three use <code>sharing=locked</code>. <code>locked</code> is the right choice because (a) <code>shared</code> can race on registry-index writes during simultaneous fetches; (b) <code>private</code> would silently disable cache for any concurrent build, defeating the point.</p>
 
-<p>Revised RUN blocks (replace in Section 15.5):</p>
-<pre><code># Fetch dependencies (only step that needs network).
-RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
-    cargo fetch --locked
-
-# Build WASM bundle (offline; cache shared by id with the server build).
-RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
-    --mount=type=cache,target=/work/wasm-client/target,sharing=locked \
-    --network=none \
-    TRUNK_OFFLINE=true \
-    sh -c 'cd wasm-client &amp;&amp; trunk build --release --offline'
-
-# Build server (offline).
-RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
-    --mount=type=cache,target=/work/target,sharing=locked \
-    --network=none \
-    cargo build --release --locked --frozen --offline -p la_website_server</code></pre>
+<p>All three cache mounts in the §15.5 Dockerfile already carry <code>sharing=locked</code>. <strong>That Dockerfile is the single source of truth for the RUN blocks</strong> — including the load-bearing "<code>cp</code> the binary out of the <code>/work/target</code> cache mount before the layer commits" step and the per-library <code>ldd</code> check. This subsection deliberately does NOT restate the RUN blocks: a second copy would drift out of sync with §15.5 (an earlier draft's copy here had silently lost the <code>cp</code>-out step, which would strand the binary inside the unmounted cache and produce an empty runtime image).</p>
 
 <h4>15.7.8 <code>--network host</code> consequences</h4>
 
@@ -3497,8 +3487,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 
 <h4>15.7.9 Image-build flags for reproducibility</h4>
 
-<p>In <code>scripts/01_build_image.sh</code>:</p>
-<pre><code>DOCKER_BUILDKIT=1 docker build \
+<p>In <code>scripts/01_build_image.sh</code> (the two digest build-args are asserted non-empty FIRST, so a malformed or unsourced <code>versions.sh</code> fails loud with a named error instead of Docker's cryptic <code>invalid reference format</code> from an empty <code>FROM …@</code>):</p>
+<pre><code>: "${DOCKER_BUILDER_DIGEST:?versions.sh: DOCKER_BUILDER_DIGEST is empty or unset}"
+: "${DOCKER_RUNTIME_DIGEST:?versions.sh: DOCKER_RUNTIME_DIGEST is empty or unset}"
+
+DOCKER_BUILDKIT=1 docker build \
     --build-arg LA_BUILDER_DIGEST="${DOCKER_BUILDER_DIGEST}" \
     --build-arg LA_RUNTIME_DIGEST="${DOCKER_RUNTIME_DIGEST}" \
     --build-arg LA_WEBSITE_GIT_SHA="$(git -C "$repo_root" rev-parse HEAD)" \
@@ -6956,7 +6949,7 @@ echo "scripts/lint/no_hardcoded_secrets.sh: clean."
   <li><strong>Own-STUN handler.</strong> Write <code>server/src/stun_handler.rs</code> per Section 13. Hook into the SFU actor's UDP receive loop. Verify: a STUN client tool (e.g., <code>stunclient</code>) pointed at <code>stun:127.0.0.1:51000</code> receives an XOR-MAPPED-ADDRESS response matching the source IP.</li>
   <li><strong>str0m integration.</strong> Add <code>str0m::Rtc</code> handling to the SFU actor. Wire SDP offer/answer flow through <code>signaling.rs</code>. Implement viewer fan-out via re-publishing MediaData. Verify: two browser tabs can establish WebRTC connections (one streamer, one viewer); video flows from streamer to viewer.</li>
   <li><strong>LA WebSocket client + decode pipeline.</strong> Write <code>server/src/la_client.rs</code>, <code>server/src/decode.rs</code>, <code>server/src/jpeg.rs</code> per Section 19. Verify: the demo server connects to a running LocateAnything-3B instance, sends sampled JPEGs, receives bounding-box results, forwards via DataChannel.</li>
-  <li><strong>WebAssembly client.</strong> Write the Leptos application incrementally: <code>wasm-client/src/lib.rs</code> (Leptos mount), <code>wasm-client/src/auth.rs</code> (read hash token), <code>wasm-client/src/extern_js.rs</code> (extern bindings), <code>wasm-client/src/signaling.rs</code> (WebSocket reconnect driver per Section 21.10), <code>wasm-client/src/rtc.rs</code>, <code>wasm-client/src/camera.rs</code>, <code>wasm-client/src/overlay.rs</code>, then the components in <code>wasm-client/src/components/</code>. Verify: <code>cd wasm-client &amp;&amp; trunk build --release</code> succeeds; the resulting <code>dist/index.html</code> contains a single <code>&lt;script type="module"&gt;</code> block (sanity check for the CSP hash injection).</li>
+  <li><strong>WebAssembly client.</strong> Write the Leptos application incrementally: <code>wasm-client/src/lib.rs</code> (Leptos mount), <code>wasm-client/src/auth.rs</code> (read hash token), <code>wasm-client/src/extern_js.rs</code> (extern bindings), <code>wasm-client/src/signaling.rs</code> (WebSocket reconnect driver per Section 21.10), <code>wasm-client/src/rtc.rs</code>, <code>wasm-client/src/camera.rs</code>, <code>wasm-client/src/overlay.rs</code>, then the components in <code>wasm-client/src/components/</code>. Verify: <code>trunk build --release</code> (run from the workspace root so <code>Trunk.toml</code>'s <code>[tools]</code> pins apply — never <code>cd wasm-client</code>, §15.4) succeeds; the resulting <code>wasm-client/dist/index.html</code> contains a single <code>&lt;script type="module"&gt;</code> block (sanity check for the CSP hash injection).</li>
   <li><strong>End-to-end on host (no Docker yet).</strong> Run the server binary on the host, open <code>https://127.0.0.1:8443/#supersecrettoken123</code> in Apple Safari and Google Chrome desktop, click through the cert warning, verify the streamer claim flow works, verify viewer fan-out works, verify bounding-box overlays render in both roles.</li>
   <li><strong>Dockerfile.</strong> Write the multi-stage Dockerfile per Section 15.5. Write <code>website/scripts/01_build_image.sh</code>. Verify: <code>bash scripts/01_build_image.sh</code> produces a runnable image; <code>docker run la-website:&lt;version&gt; --help</code> prints clap help text.</li>
   <li><strong>Operator scripts.</strong> Write <code>website/scripts/00_validate_host.sh</code>, <code>website/scripts/02_start_service.sh</code>, <code>website/scripts/03_smoke_test.sh</code>, <code>website/setup.sh</code>, <code>website/uninstall.sh</code>. Verify: the full <code>bash setup.sh</code> orchestration completes cleanly.</li>
