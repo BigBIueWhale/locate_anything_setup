@@ -5777,7 +5777,6 @@ sha256sum seed_h264.bin | awk '{print $1}' &gt; seed_h264.bin.sha256
 // for the integration-only seams (DirectApi credentials exchange, etc.).
 
 use std::net::SocketAddr;
-use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -5963,6 +5962,12 @@ async fn e2e_pipeline_keyframe_box_drain() -&gt; Result&lt;()&gt; {
 
     let (fsm_tx, fsm_rx) = tokio::sync::mpsc::channel::&lt;FsmCommand&gt;(256);
     let (phase_tx, phase_rx) = watch::channel(Phase::Idle);
+    // spawn_sfu_for_test wires the entire three-task pipeline internally
+    // (SFU + decode + LA client) using the same channel topology as
+    // production §11.3, with la_host/la_port/etc. routed through TestCfg.
+    // Returns a single JoinHandle that resolves when ALL THREE tasks are
+    // done. The au_tx/au_rx and rgb_tx/rgb_rx channels live entirely inside
+    // the helper; the test does not need to construct them.
     let sfu_handle: JoinHandle&lt;Result&lt;()&gt;&gt; = tokio::spawn(spawn_sfu_for_test(
         sfu_udp, fsm_rx, phase_tx, TestCfg {
             la_host:     "127.0.0.1".into(),
@@ -6077,7 +6082,7 @@ async fn collect_phase_sequence(
 
 <p>The module exposes:</p>
 <ul>
-  <li><code>spawn_sfu_for_test(socket: UdpSocket, fsm_rx, phase_tx, cfg: TestCfg) -&gt; impl Future&lt;Result&lt;()&gt;&gt;</code>: the same as <code>run_sfu</code> but routes the LA host/port/auth-secret/public-host through an explicit struct rather than parsing them from clap.</li>
+  <li><code>spawn_sfu_for_test(socket: UdpSocket, fsm_rx, phase_tx, cfg: TestCfg) -&gt; impl Future&lt;Output = anyhow::Result&lt;()&gt;&gt; + Send + 'static</code>: this helper wires the ENTIRE three-task production pipeline (SFU actor + decode-pipeline + LA WebSocket client per §11.3) using the same channel topology as production — the AU mpsc and the RGB watch live inside the helper. Routes LA host/port/auth-secret/public-host through an explicit struct rather than parsing them from clap. The returned Future joins all three internal tasks (e.g., via <code>tokio::try_join!</code>) so a failure in ANY of them propagates as the helper's <code>anyhow::Result</code>. <strong>The <code>Send + 'static</code> bound is load-bearing</strong> — <code>tokio::spawn</code> requires it even under <code>flavor = "current_thread"</code> (verified at <code>tokio-src/tokio/src/task/spawn.rs:174</code>). The implementation must use only <code>Send</code> types internally (no <code>Rc</code>, no <code>RefCell</code>; <code>Arc</code> + <code>Mutex</code> if shared state is needed).</li>
   <li><code>attach_and_extract_creds(fsm_tx, peer_id, Role) -&gt; Result&lt;PeerCreds&gt;</code>: synthesizes an <code>FsmCommand::AttachStreamer</code> (or <code>AttachViewer</code>) carrying an internally-constructed <code>Rtc</code>, then returns that Rtc's <code>local_dtls_fingerprint()</code>, <code>local_ice_credentials()</code>, and the SFU's local UDP <code>SocketAddr</code>. This is the integration-test analogue of the production WS handler's "build Rtc, call accept_offer, send AttachStreamer" sequence in Section 11.8 steps 3-7. Putting it in <code>test_support</code> keeps the WS handler's SDP-parsing path untouched while still exercising the FSM's AttachStreamer/AttachViewer code path.</li>
   <li><code>Role::{Streamer, Viewer}</code> enum.</li>
   <li><code>TestCfg { la_host: String, la_port: u16, auth_secret: String, public_host: String }</code> struct.</li>
@@ -6085,19 +6090,33 @@ async fn collect_phase_sequence(
   <li><code>StubLaServer</code>: bundles an axum router on <code>127.0.0.1:0</code> with two routes — <code>GET /v1/capabilities</code> returns the canonical JSON Section 12.2 mandates; <code>WS /v1/stream</code> increments an <code>AtomicU64</code> on each LA-protocol frame and replies with the canned <code>{"type":"result","frame_id":N,...,"points":[],...}</code>. Provides <code>.tcp_addr</code>, <code>.frames_received() -&gt; u64</code>, and <code>.shutdown()</code> methods.</li>
 </ul>
 
-<h4>24.4.2.3 Dev-dependency additions</h4>
+<h4>24.4.2.3 Dev-dependency additions and the <code>test-support</code> feature gate</h4>
 
-<p>Add to <code>server/Cargo.toml</code>'s <code>[dev-dependencies]</code>:</p>
-<pre><code>[dev-dependencies]
+<p><strong>Critical:</strong> integration tests under <code>tests/</code> compile as a SEPARATE crate that links <code>la_website_server</code> as an ordinary library dependency. The <code>#[cfg(test)]</code> flag is true only inside the crate's own unit-test compilation, NOT during integration-test compilation. To make <code>la_website_server::test_support</code> reachable from <code>tests/e2e_pipeline.rs</code>, the integration test must explicitly activate the <code>test-support</code> feature on its self-dependency to the server crate. This is Cargo's canonical pattern for "expose this module only during testing".</p>
+
+<p>Add to <code>server/Cargo.toml</code>:</p>
+<pre><code>[features]
+# Enables `pub mod test_support` in lib.rs. Off by default; only the
+# self-dev-dependency below turns it on during `cargo test`.
+test-support = []
+
+[dev-dependencies]
+# Self-dependency that activates the test-support feature for integration
+# tests. Without this, the `use la_website_server::test_support::...` line
+# in tests/e2e_pipeline.rs fails to resolve at link time.
+la-website-server = { path = ".", features = ["test-support"] }
+
 sha2  = "=0.11.0"   # for fixture SHA-256 verification (also used by build.rs)
 str0m = { version = "=0.20.0", features = ["unversioned"] }   # H264Packetizer + Packetizer trait
-# tokio-tungstenite, anyhow, tokio, futures-util, protocol are already declared in
-# [dependencies]; test code links them automatically because tests link the same
-# lib that production code links. (Cargo does NOT "inherit" [dev-dependencies] from
-# [dependencies]; tests inherit [dependencies] as a normal link relationship.)
+# tokio-tungstenite, anyhow, tokio, futures-util, protocol are already
+# declared in [dependencies]; the self-dev-dep above re-exports them via
+# the la-website-server crate boundary so integration tests link them
+# automatically (Cargo does NOT "inherit" [dev-dependencies] from
+# [dependencies]; tests inherit [dependencies] as a normal link
+# relationship and additionally see anything from [dev-dependencies]).
 </code></pre>
 
-<p><strong>No new production dependencies.</strong> <code>sha2</code> already lives in the server crate's <code>build.rs</code> dependencies (Section 7.7); promoting it to dev-deps adds zero bytes to the release binary. The <code>str0m</code> dev-dep redeclaration carries the <code>unversioned</code> feature only for the test build — the runtime <code>[dependencies]</code> pin in Section 7.4 keeps the original feature set, so the production binary's surface is unchanged. Cargo merges feature sets within a single dependency graph, but feature unification across <code>[dependencies]</code> and <code>[dev-dependencies]</code> happens only when <code>cargo test</code> is invoked; production <code>cargo build --release</code> never sees the <code>unversioned</code> feature.</p>
+<p><strong>No new production dependencies.</strong> <code>sha2</code> already lives in the server crate's <code>build.rs</code> dependencies (Section 7.7); promoting it to dev-deps adds zero bytes to the release binary. The <code>str0m</code> dev-dep redeclaration carries the <code>unversioned</code> feature only for the test build — the runtime <code>[dependencies]</code> pin in Section 7.4 keeps the original feature set, so the production binary's surface is unchanged. Cargo merges feature sets within a single dependency graph, but feature unification across <code>[dependencies]</code> and <code>[dev-dependencies]</code> happens only when <code>cargo test</code> is invoked; production <code>cargo build --release</code> never sees the <code>unversioned</code> feature OR the <code>test-support</code> feature.</p>
 
 <p><strong>Honest gaps that this integration test does NOT cover</strong> (must be exercised separately by the manual browser-matrix in Section 22, or as documented operational characteristics):</p>
 <ul>
