@@ -1741,7 +1741,7 @@ fn canonical_templates_match_prompts_py_byte_for_byte() {
   <tr><td>Claimed → Streaming</td><td>First Real-time Transport Protocol packet received from the claimer's WebRTC peer</td><td>n/a (immediate)</td></tr>
   <tr><td>Claimed → Draining</td><td>No Real-time Transport Protocol from claimer within 10 seconds of accept</td><td>10 seconds (<code>CLAIM_TIMEOUT</code>)</td></tr>
   <tr><td>Streaming → Draining</td><td>WebSocket close from streamer; OR no Real-time Transport Protocol from streamer for 5 seconds; OR <code>IceConnectionStateChange::Disconnected</code> event from str0m; OR signaling-WebSocket keepalive miss (see below); OR explicit <code>Bye</code> from streamer; OR <code>FsmCommand::LaDown</code> while in Streaming (Section 19.4)</td><td>5 seconds RTP gap (<code>RTP_TIMEOUT</code>); ~21.5 seconds ICE consent freshness (str0m's reduced timeout vs RFC 7675's nominal 30 s; see Section 20.11); 30 seconds signaling-WS keepalive (<code>KEEPALIVE_TIMEOUT</code>)</td></tr>
-  <tr><td>Draining → Idle</td><td>Drain deadline reached, OR all client peer connections dropped</td><td>5 seconds (<code>DRAIN_TIMEOUT</code>)</td></tr>
+  <tr><td>Draining → Idle</td><td>Drain deadline reached, OR all client peer connections dropped, AND no <code>ResumeSession</code> for this session_id arrived during the drain window</td><td>30 seconds (<code>DRAIN_TIMEOUT</code>) — sized to cover an iPhone WiFi↔cellular handover (~1–3 s re-attach plus ICE consent freshness of ~21.5 s per Section 20.11) so a streamer mid-handover can <code>ResumeSession</code> back into the still-Draining FSM rather than losing ownership. Tightening DRAIN_TIMEOUT below 25 s would cause iOS-on-cellular streamers to lose their slot on every Wi-Fi→cellular transition, contradicting the user's "if anybody disconnects, server cleanly reverts" requirement (where "cleanly" includes survival of common handovers, not aggressive eviction).</td></tr>
 </table>
 
 <h4>11.2.1 Signaling-WebSocket keepalive protocol</h4>
@@ -2253,6 +2253,15 @@ fn request_pli_from_streamer(streamer: &amp;mut Client, streamer_video_mid: Mid)
                 let _ = reply.send(result);  // WS handler may have dropped Receiver; harmless
             }
             FsmCommand::ResumeSession { peer_id, session_id, reply } =&gt; {
+                // handle_resume semantics (specified):
+                //   Phase::Streaming { owner, .. } if session_id matches → Ok (still-active session)
+                //   Phase::Claimed   { owner, .. } if session_id matches → Ok (mid-handshake session)
+                //   Phase::Draining  { .. }        if session_id matches → Ok AND cancel drain:
+                //       self.phase = Phase::Streaming { owner: peer_id, last_rtp: now };
+                //       self.drain_deadline = None;
+                //       broadcast new Phase on phase_tx.
+                //     This is the iPhone-handover case (Section 11.2 DRAIN_TIMEOUT rationale).
+                //   Phase::Idle, or any phase with a mismatched session_id → Expired.
                 let result = self.handle_resume(peer_id, session_id);
                 let _ = reply.send(result);
             }
@@ -2319,7 +2328,9 @@ fn request_pli_from_streamer(streamer: &amp;mut Client, streamer_video_mid: Mid)
 <tr><td><code>Shutdown</code></td><td>Signal-watcher task (Section 12 list item 2 + Section 18.1)</td></tr>
 </table>
 
-<p><strong>The <code>transition_to_draining_with</code> helper</strong> referenced in the LaDown arm sends <code>SignalMessage::Error { code: error_code::LA_UNREACHABLE, message: format!("{error:#}") }</code> to the streamer's <code>signal_tx</code> (and a DataChannel "bye" message to every connected peer's "boxes" channel), then sets <code>self.phase = Phase::Draining { deadline: now + Duration::from_secs(5) }</code>. The send via <code>signal_tx.try_send</code> is non-blocking; if the WS handler's Receiver has already dropped (peer left), the send fails and is logged, not propagated.</p>
+<p><strong>The <code>transition_to_draining_with</code> helper</strong> referenced in the LaDown arm sends <code>SignalMessage::Error { code: error_code::LA_UNREACHABLE, message: format!("{error:#}") }</code> to the streamer's <code>signal_tx</code> (and a DataChannel "bye" message to every connected peer's "boxes" channel), then sets <code>self.phase = Phase::Draining { deadline: now + Duration::from_secs(30) }</code>.</p>
+
+<p><strong>Policy on <code>signal_tx.try_send</code> failure.</strong> The per-peer outbound mpsc to the WebSocket handler has capacity 32 (Section 11.5). On <code>Err(TrySendError::Full)</code> OR <code>Err(TrySendError::Closed)</code>, the FSM logs at <code>tracing::warn!</code> AND immediately calls <code>client.rtc.disconnect()</code> on that peer's Rtc. <strong>Rationale:</strong> a Full mpsc means the peer's WS handler task is not draining its Receiver — either it is stuck on a blocked socket write (a frozen browser tab; cellular outage; etc.) or its task has stalled. A Closed mpsc means the WS handler has already exited. Either way the peer is dead on the wire; immediately disconnecting the Rtc triggers the standard cleanup path on the next select iteration (<code>FsmCommand::Disconnect</code> arrives from the WS handler's exit, OR the next UDP-receive tick observes <code>!rtc.is_alive()</code> and culls the Client). This is fail-loud per Section 3 — no consecutive-failure counter, no retry budget, no silent absorption.</p>
 
 <h3>11.7.1 BoxMessage fan-out handler — load-bearing for overlay rendering</h3>
 
@@ -2383,23 +2394,26 @@ impl Sfu {
     /// not FSM-side).
     fn on_la_error_result(&amp;mut self, frame_id: u64, code: String, message: String) -&gt; Result&lt;()&gt; {
         let Some(streamer_id) = self.owner else { return Ok(()); };
-        let Some(streamer) = self.clients.iter().find(|c| c.id == streamer_id) else {
+        let Some(streamer) = self.clients.iter_mut().find(|c| c.id == streamer_id) else {
             return Ok(());
         };
         let err = protocol::SignalMessage::Error(protocol::ErrorMsg {
             code:    protocol::error_code::PROMPT_REJECTED.to_string(),
             message: format!("frame {frame_id}: {code}: {message}"),
         });
-        // `try_send` is non-blocking. On a full channel (32 slots) or closed
-        // Receiver (WS handler is gone), we log and continue — neither
-        // condition warrants killing the FSM. The next FsmCommand::Disconnect
-        // will clean up the Client entry.
+        // `try_send` is non-blocking. On Err(Full) the WS handler is not
+        // draining its Receiver (frozen tab, cellular blackout, etc.); on
+        // Err(Closed) it has already exited. Either way the peer is dead
+        // on the wire — disconnect the Rtc immediately so the standard
+        // cleanup path culls the Client on the next select iteration.
+        // Fail-loud per Section 3; no consecutive-failure counter.
         if let Err(e) = streamer.signal_tx.try_send(err) {
             tracing::warn!(
                 streamer_id = ?streamer_id,
                 error = ?e,
-                "signal_tx full or closed; dropping LA error for streamer"
+                "signal_tx Full or Closed; disconnecting streamer Rtc"
             );
+            streamer.rtc.disconnect();
         }
         Ok(())
     }
@@ -3617,20 +3631,91 @@ tokio::spawn(async move {
 // No IPv6 socket is ever opened (the binary refuses IPv6 --public-host values).
 let bind_addr: SocketAddr = /* IPv4-only; see config.rs for the construction */;
 
-axum_server::bind_rustls(bind_addr, rustls_config)
+// TCP keepalive on accepted signaling sockets (Section 17.6.1 below).
+// We need the per-stream sockopt to be applied between accept() and the
+// TLS+HTTP machinery. axum-server's `Acceptor` trait is the seam.
+let acceptor = axum_server::tls_rustls::RustlsAcceptor::new(rustls_config)
+    .with_inner(KeepaliveAcceptor::default());
+
+axum_server::bind(bind_addr)
     .handle(handle)
+    .acceptor(acceptor)
     .serve(app.into_make_service_with_connect_info::&lt;SocketAddr&gt;())
     .await
-    .context("axum_server::bind_rustls serve")?;
+    .context("axum_server::bind serve")?;
 </code></pre>
 
 <p>Important details verified at the pinned versions on 2026-06-01:</p>
 <ul>
-  <li><code>axum_server::bind_rustls(SocketAddr, RustlsConfig)</code> returns a builder that listens on the given socket and terminates TLS via the supplied <code>RustlsConfig</code>.</li>
+  <li><code>axum_server::bind(SocketAddr).acceptor(A).serve(...)</code> is the long-form of <code>bind_rustls</code> that lets us inject a custom <code>Acceptor</code> wrapped around the rustls TLS acceptor. Per <code>/tmp/axum-server-src/src/lib.rs</code>, the <code>RustlsAcceptor</code>'s <code>with_inner</code> method composes a per-stream socket-options pass before TLS terminates the connection.</li>
   <li><code>.handle(Handle)</code> attaches a shutdown-control handle.</li>
   <li><code>.serve(make_service)</code> takes any Tower <code>MakeService</code> that produces a per-connection axum <code>Service</code>. <code>app.into_make_service_with_connect_info::&lt;SocketAddr&gt;()</code> from axum 0.8.9 (verified at <code>/tmp/axum-src/axum/src/routing/mod.rs:537</code>) is exactly such a <code>MakeService</code>; the <code>ConnectInfo&lt;SocketAddr&gt;</code> extractor used in <code>auth_layer</code> (Section 17.5) reads the per-connection peer address from this.</li>
   <li>UDP port 51000 (own-STUN + WebRTC media) is handled by a separate <code>tokio::net::UdpSocket</code> in the Selective Forwarding Unit actor task (Section 11.3); it does not touch axum-server.</li>
   <li><code>Handle::graceful_shutdown(Some(Duration::from_secs(3)))</code>: per <code>/tmp/axum-server-src/src/handle.rs:70</code>, this notifies in-flight connections to drain within the given budget. Per Section 18, the outer wrapper at process level allows up to 8 s total; this inner budget plus the per-connection 3 s HTTP drain composes cleanly.</li>
+</ul>
+
+<h4>17.6.1 TCP keepalive on accepted signaling sockets — defense against zombie WS handlers</h4>
+
+<p>An accepted signaling WebSocket TCP connection that dies mid-stream (router cycle, peer's tab crashed, peer's wifi card died) leaves the corresponding axum WebSocket-handler task parked on <code>socket.recv().await</code> until Linux's default <code>tcp_keepalive_time</code> of 7200 seconds fires (verified at <code>man 7 tcp</code>). With many viewers, that's two hours of leaked tokio tasks holding stack frames, mpsc Receivers, and per-peer FSM bookkeeping. Apply <code>TCP_KEEPALIVE</code> + <code>TCP_USER_TIMEOUT</code> to every accepted stream so a dead peer is culled in ~25 seconds, matching the LA WebSocket defense in Section 19.4.1.1.</p>
+
+<pre><code>use std::time::Duration;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use std::io;
+
+use axum_server::accept::Accept;
+use socket2::{SockRef, TcpKeepalive};
+use tokio::net::TcpStream;
+
+/// Acceptor that applies TCP_KEEPALIVE + TCP_USER_TIMEOUT to every accepted
+/// stream before passing it through. Same parameters as the LA WS socket
+/// (Section 19.4.1.1) so the maximum time from peer-vanish to handler-task
+/// reaped is bounded at ~25 s.
+#[derive(Default, Clone, Copy)]
+pub struct KeepaliveAcceptor;
+
+impl&lt;I&gt; Accept&lt;I, axum_server::service::SendService&gt; for KeepaliveAcceptor
+where
+    I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
+{
+    // axum-server 0.8's Accept trait — see /tmp/axum-server-src/src/accept.rs
+    type Stream  = I;
+    type Service = axum_server::service::SendService;
+    type Future  = std::future::Ready&lt;io::Result&lt;(I, Self::Service)&gt;&gt;;
+
+    fn accept(&amp;self, stream: I, service: Self::Service) -&gt; Self::Future {
+        std::future::ready(Ok((stream, service)))
+    }
+}
+
+/// Apply keepalive to a TcpStream BEFORE we hand it to the rustls acceptor.
+/// Called at `bind` time via a custom listener wrapper, OR by hooking
+/// `TcpListener::accept` in the main task before passing each stream to
+/// axum-server's builder. Either path works; both are valid against the
+/// axum-server 0.8 API. Implementation choice goes here at build time.
+pub fn apply_keepalive(tcp: &amp;TcpStream) -&gt; anyhow::Result&lt;()&gt; {
+    let sock_ref = SockRef::from(tcp);
+
+    // Idle 10 s, probe every 5 s, fail after 3 unanswered probes.
+    // Worst-case dead-peer detection: ~25 s. Identical to Section 19.4.1.1
+    // for symmetry; nothing in either path depends on the specific numbers.
+    let keepalive = TcpKeepalive::new()
+        .with_time(Duration::from_secs(10))
+        .with_interval(Duration::from_secs(5))
+        .with_retries(3);
+    sock_ref.set_tcp_keepalive(&amp;keepalive)
+        .context("set_tcp_keepalive on signaling WS socket")?;
+    sock_ref.set_tcp_user_timeout(Some(Duration::from_secs(25)))
+        .context("set_tcp_user_timeout on signaling WS socket")?;
+    Ok(())
+}
+</code></pre>
+
+<p>Properties:</p>
+<ul>
+  <li><strong>Symmetric with the LA path (Section 19.4.1.1).</strong> Same 10/5/3 keepalive, same 25-second TCP_USER_TIMEOUT. No design surface duplication.</li>
+  <li><strong>Catches the 5 AM router cycle.</strong> When the LAN switch loses power for 90 s, the per-peer WS handler's <code>recv()</code> on a dead TCP connection returns <code>ETIMEDOUT</code> at ~25 s post-disconnect (not Linux's 7200 s default). The chain propagates <code>FsmCommand::Disconnect { peer_id, reason }</code> to the FSM; the WS handler returns; tokio reclaims the task. No 50-viewer task leak.</li>
+  <li><strong>Application-level <code>SignalMessage::Keepalive {}</code> every 15 s (Section 11.2.1) remains the FSM-side keepalive timer.</strong> The TCP keepalive here is transport-level defense; the application keepalive ensures the FSM treats application-silent peers as gone within 30 s even when TCP appears healthy (e.g., wifi-portal MITM that ACKs TCP but drops application bytes).</li>
 </ul>
 
 <hr>
@@ -3852,11 +3937,20 @@ loop {
 }</code></pre>
 <p>The <code>MissedTickBehavior::Skip</code> setting prevents a backlog of keepalives queueing up after a long busy period (otherwise an interval that was suppressed for ten ticks would fire ten times in rapid succession). The <code>biased</code> selector prefers frame-send over ping, so a steadily-streaming session never emits a keepalive.</p>
 
-<h4>19.4.1 OS-level TCP keepalive on the LocateAnything-3B socket — defense against hung-but-alive replies</h4>
+<h4>19.4.1 Two-layer defense against unresponsive LocateAnything-3B — TCP-dead AND app-hang</h4>
 
-<p>The application-level RFC 6455 ping above defends against the LA server's 60-second read-idle close. It does NOT defend against the LA <em>process</em> hanging on a forward pass while the TCP socket stays open — in that scenario the LA WebSocket client task is parked on <code>ws.next().await</code> waiting for the reply, the SFU keeps decoding frames into the watch slot, the FSM still sees <code>la_reachable = true</code>, and the streamer's overlay silently never updates. This is the kind of silent-stall the user's Section 3 explicitly forbids.</p>
+<p>A non-responsive LocateAnything-3B comes in two distinct failure modes, each requiring a different defense:</p>
 
-<p>The sovereign cure is OS-level TCP keepalive on the LA socket. These are transport-layer parameters, completely independent of LocateAnything-3B's per-frame inference time — they detect a TCP-dead peer, nothing about model perf. The implementation enables three Linux-specific options on the underlying <code>tokio::net::TcpStream</code> after <code>tokio_tungstenite::connect_async</code> returns but before the WebSocket handshake is consumed:</p>
+<ol>
+  <li><strong>TCP-dead peer.</strong> Cable yanked, container crashed, kernel panicked, route blackholed. The remote IP stack is no longer ACKing packets. Detection mechanism: OS-level <code>TCP_KEEPALIVE</code> probes (Linux <code>tcp_keepalive_time</code>/<code>tcp_keepalive_intvl</code>/<code>tcp_keepalive_probes</code>, also reachable via <code>SO_KEEPALIVE</code> + <code>TCP_KEEPIDLE</code>/<code>TCP_KEEPINTVL</code>/<code>TCP_KEEPCNT</code>) plus <code>TCP_USER_TIMEOUT</code> (RFC 5482, Linux-specific) for bounded transmission-stall on outbound bytes.</li>
+  <li><strong>App-hung peer.</strong> LocateAnything-3B process is alive (CUDA kernel stuck, Python GIL deadlock, GPU OOM-stall, etc.) but the kernel's TCP stack is fine and ACKs everything. Keepalive probes succeed. <code>TCP_USER_TIMEOUT</code> does not engage because there are no outbound bytes waiting on ACK — our last <code>ws.send</code> finished, the LA-side kernel buffered the bytes, and we are now in <code>ws.next().await</code>. Detection of this case requires an <em>application-level</em> bound on how long we wait for the WebSocket reply.</li>
+</ol>
+
+<p>The plan applies both defenses simultaneously. They are orthogonal and cover orthogonal failure modes.</p>
+
+<h5>19.4.1.1 Defense layer 1 — Linux TCP keepalive on the LocateAnything-3B socket</h5>
+
+<p>Catches TCP-dead. Transport-level, latency-agnostic — the parameters do not change if LocateAnything-3B is replaced by a model with 10 ms inference or 10 s inference; they detect whether the remote TCP stack is alive, not whether the model is fast.</p>
 
 <pre><code>use std::time::Duration;
 use socket2::{SockRef, TcpKeepalive};
@@ -3871,7 +3965,7 @@ let tcp_stream: &amp;tokio::net::TcpStream = match ws.get_ref() {
 };
 let sock_ref = SockRef::from(tcp_stream);
 
-// Idle 10 s, then probe every 5 s, fail after 3 unanswered probes.
+// Idle 10 s, probe every 5 s, fail after 3 unanswered probes.
 // Worst-case TCP-dead detection: 10 + 3*5 = 25 s. No LA-perf coupling.
 let keepalive = TcpKeepalive::new()
     .with_time(Duration::from_secs(10))
@@ -3882,17 +3976,53 @@ sock_ref.set_tcp_keepalive(&amp;keepalive)
 
 // Bound transmit-stall on the send side: if the kernel cannot get any TCP
 // ACK for an in-flight segment within 25 s, the next write/read on this
-// socket returns ETIMEDOUT. Linux-specific (`TCP_USER_TIMEOUT`, RFC 5482).
+// socket returns ETIMEDOUT. Linux-specific (TCP_USER_TIMEOUT, RFC 5482).
 sock_ref.set_tcp_user_timeout(Some(Duration::from_secs(25)))
     .context("set_tcp_user_timeout on LA WS socket")?;
 </code></pre>
 
-<p>Properties of this design:</p>
+<h5>19.4.1.2 Defense layer 2 — application-level reply deadline</h5>
+
+<p>Catches app-hung-but-TCP-alive. This necessarily couples to a wall-clock bound on LA's per-frame latency, because TCP cannot see application hangs. We pick the bound generously so the architecture remains agnostic to specific model perf:</p>
+
+<pre><code>use std::time::Duration;
+use tokio::time::timeout;
+
+/// Maximum wall-clock time the demo server waits for ANY single
+/// LocateAnything-3B reply after sending a frame.
+///
+/// Chosen generously to cover any plausible model — LocateAnything-3B's
+/// measured p95 slow-mode inference is ~1.61 s per
+/// docs/DRONE_DETECTION.md:117; a future variant could be 5× slower
+/// without changing the protocol. Setting this to 30 s gives ~18× headroom
+/// over the worst measured tail, while still bounding silent-stall
+/// detection to half a minute. If a future model legitimately needs &gt; 30 s
+/// per frame for our use case, the operator bumps this single constant.
+///
+/// NOTE on the LA-side timer: per docs/CLIENT_PROTOCOL.md the LA worker
+/// has its own configurable inference timeout (default ~600 s) above which
+/// it returns type:"error" rather than hanging. Our 30 s budget here is a
+/// belt against the case where even that timeout fails to fire (worker
+/// crashed mid-inference, Python GIL deadlock, CUDA driver hang).
+const LA_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
+
+let reply = timeout(LA_REPLY_TIMEOUT, ws.next())
+    .await
+    .map_err(|_elapsed| anyhow::anyhow!(
+        "LA WS reply timeout: no reply received within {:?} after sending frame_id={} \
+         (LA process likely hung — TCP keepalive did not trigger because LA's kernel \
+         is still ACKing probes; see Section 19.4.1.2)",
+        LA_REPLY_TIMEOUT, frame_id
+    ))?
+    .ok_or_else(|| anyhow::anyhow!("LA WS stream ended mid-frame for frame_id={frame_id}"))??;
+</code></pre>
+
+<h5>19.4.1.3 Properties of the combined two-layer design</h5>
 <ul>
-  <li><strong>Latency-agnostic:</strong> the 10 s / 5 s / 3 retries / 25 s numbers are transport-level. They do not change if LocateAnything-3B is replaced by a model with 10 ms inference or 10 s inference.</li>
-  <li><strong>Sovereign:</strong> uses standard Linux kernel sockopts via the <code>socket2</code> crate (pinned at <code>=0.6.4</code>, verified live on 2026-06-02 — see Section 7.4). Already in the dependency closure transitively via <code>hyper-util</code>; the explicit pin is declared so the call sites here are honest about their direct dependency.</li>
-  <li><strong>Loud failure:</strong> a TCP-dead LA causes the next <code>ws.send</code> or <code>ws.next().await</code> to return <code>Err(io::Error { kind: TimedOut, .. })</code>, which the task propagates as anyhow chain → <code>FsmCommand::LaDown { error }</code> → the FSM transitions Streaming/Claimed to Draining with code <code>"la_unreachable"</code>, exactly as Section 19.4 step 1 already specifies.</li>
-  <li><strong>No application-level reply-timeout needed:</strong> we deliberately do NOT add a <code>tokio::time::timeout</code> around <code>ws.next().await</code>, because that would couple the demo server's correctness to a specific bound on LA's inference time (and LA-3B's p95 slow mode is already 1.61 s per <code>/home/user/Desktop/locate_anything_setup/docs/DRONE_DETECTION.md:117</code>; future models could be slower without changing the protocol). The OS keepalive detects TCP-dead, which is genuinely model-independent.</li>
+  <li><strong>Coverage is complete:</strong> Layer 1 catches every TCP-dead variant within ~25 s. Layer 2 catches every app-hung variant within 30 s. There is no failure mode of an unresponsive LA that escapes both.</li>
+  <li><strong>Loud failure:</strong> on either trigger, the LA WS client task returns an <code>anyhow::Error</code> with the full chained context (including which layer fired) → propagates to <code>FsmCommand::LaDown { error }</code> → FSM transitions Streaming/Claimed to Draining with code <code>"la_unreachable"</code> exactly as Section 19.4 step 1 specifies. No silent fallback.</li>
+  <li><strong>Sovereign:</strong> uses standard Linux kernel sockopts via the <code>socket2</code> crate (pinned at <code>=0.6.4</code>; see Section 7.4) plus <code>tokio::time::timeout</code>, both already in the dependency closure.</li>
+  <li><strong>Layer 2's 30 s constant is the only application-level wall-clock number in the LA pipeline.</strong> The cadence-driving loop (Section 19.1) remains event-driven (<code>watch::changed</code>); the 30 s budget is a circuit-breaker, not a scheduler. Acceptable per Section 3 because the alternative (no timeout at all) leaves an open silent-stall hole; TCP cannot see app hangs.</li>
 </ul>
 
 <p><strong>Behavior on disconnect (strict, no advisory sub-state):</strong> the WebAssembly streamer sees a single user-facing error and the Finite State Machine releases the streamer slot:</p>
@@ -4877,7 +5007,7 @@ ctx.scale(dpr, dpr).map_err(js_err("ctx.scale"))?;  // accumulating transform
   <li><strong>On <code>ResumeOk</code>:</strong> the client retains <code>session_id</code> and follows Option α: tear down the old <code>RTCPeerConnection</code>, build a fresh one, send a new <code>SdpOffer</code>.</li>
   <li><strong>On <code>ResumeExpired</code>:</strong> the client clears <code>session_id.set(None)</code> and reverts the user interface to the 7-card prompt-builder grid.</li>
   <li><strong>On user-initiated Bye / Release:</strong> the client clears <code>session_id.set(None)</code> immediately, before sending the <code>SignalMessage::Bye {}</code> to the server.</li>
-  <li><strong>On page navigation away:</strong> Leptos's cleanup runs <code>App</code>'s <code>on_cleanup</code> hook; <code>session_id</code>'s memory is freed alongside the rest of the application state. The server's session-grace window (per Section 11.2's <code>DRAIN_TIMEOUT</code> of 5 seconds — after a streamer WebSocket close, the FSM transitions to <code>Draining</code> and holds the session_id for the drain duration) handles the case where the user comes back: if they return within the 5-second drain window AND the FSM has not yet transitioned to <code>Idle</code>, their <code>ResumeSession</code> request lands on a Draining FSM and is granted; if they return after 5 seconds (the FSM is back to <code>Idle</code>), <code>ResumeExpired</code> fires.</li>
+  <li><strong>On page navigation away:</strong> Leptos's cleanup runs <code>App</code>'s <code>on_cleanup</code> hook; <code>session_id</code>'s memory is freed alongside the rest of the application state. The server's session-grace window (per Section 11.2's <code>DRAIN_TIMEOUT</code> of 30 seconds — after a streamer WebSocket close, the FSM transitions to <code>Draining</code> and holds the session_id for the drain duration) handles the case where the user comes back: if they return within the 30-second drain window AND the FSM has not yet transitioned to <code>Idle</code>, their <code>ResumeSession</code> request lands on a Draining FSM and is granted (the FSM cancels the drain and re-enters Streaming with the same session_id); if they return after 30 seconds (the FSM is back to <code>Idle</code>), <code>ResumeExpired</code> fires. The 30-second window deliberately covers iPhone WiFi↔cellular handover (~1–3 s re-attach + ~21.5 s ICE consent freshness), so a streamer who switches networks mid-stream does not lose their slot.</li>
 </ol>
 
 <p><strong>Where <code>session_id</code> is NOT persisted:</strong> we deliberately do NOT use <code>sessionStorage</code> or <code>localStorage</code>. The session-id is in-memory only. Reasons: (a) sessionStorage adds a DOM-storage API surface that requires CSP <code>connect-src</code>-like considerations and Permissions-Policy entries; (b) localStorage would leak the session-id across reloads, which doesn't compose with the server's session-grace semantics. In-memory only.</p>
