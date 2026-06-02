@@ -921,14 +921,14 @@ Use Bash:
 │  │ │     access units from streamer's MediaData:                      │  │
 │  │ │       (a) republish RTP to every viewer's StreamTx               │  │
 │  │ │       (b) push the AU into a bounded mpsc::channel(256) toward   │  │
-│  │ │           the decode-pipeline task; in-order delivery, NO        │  │
+│  │ │           the decode-pipeline thread; in-order delivery, NO      │  │
 │  │ │           coalescing — the H.264 reference chain across          │  │
 │  │ │           P-frames is preserved end-to-end.                      │  │
 │  │ └── PLI (Picture Loss Indication) keyframe requests, event-driven  │  │
 │  │       only — NO periodic scheduler, NO hardcoded interval:         │  │
 │  │       (i) proactive on new-viewer attach (~1 RTT saved on the      │  │
 │  │       viewer's first-frame); (ii) on MediaData.contiguous=false    │  │
-│  │       from the decode task on packet-loss recovery (str0m chat.rs  │  │
+│  │       from the decode thread on packet-loss recovery (str0m chat.rs│  │
 │  │       reference pattern). Wire-rate is structurally bounded by     │  │
 │  │       str0m's per-50-ms TWCC pass coalescing the pending_request_  │  │
 │  │       keyframe field AND by libwebrtc's kMinKeyframeSendInterval   │  │
@@ -936,7 +936,7 @@ Use Bash:
 │  │       is needed on top of those two structural caps.               │  │
 │  └────────────────────────────────────────────────────────────────────┘  │
 │  ┌────────────────────────────────────────────────────────────────────┐  │
-│  │ Decode pipeline task (tokio task)                                  │  │
+│  │ Decode pipeline (DEDICATED OS thread — scaler is !Send)            │  │
 │  │ Drains AUs in arrival order from the bounded mpsc::channel(256).   │  │
 │  │ Holds ONE long-lived ffmpeg-next 7.1.0 H.264 decoder Context for   │  │
 │  │ the entire streaming session; libavcodec maintains the H.264       │  │
@@ -1776,26 +1776,49 @@ let (fsm_tx, fsm_rx) = tokio::sync::mpsc::channel::&lt;FsmCommand&gt;(256);
 // only — the rich Phase, with its session_id, never leaves the SFU actor).
 let (phase_tx, phase_rx) = tokio::sync::watch::channel(PhaseKind::Idle);
 
-// H.264 access-unit channel: SFU → decode-pipeline task (Section 19.1).
+// H.264 access-unit channel: SFU → decode-pipeline thread (Section 19.1).
 // Capacity 256 frames; non-coalescing, in-order. Sized as "many frames",
 // not "seconds" — the producer is the browser encoder whose framerate
 // varies with thermal/battery throttle (libwebrtc QualityScaler may drop
 // from 30 fps to ~5 fps under sustained load). 256 frames absorbs any
 // transient decoder hiccup; sustained Full = the decoder has wedged and
 // loud-disconnect is the correct signal.
-let (au_tx, au_rx) = tokio::sync::mpsc::channel::&lt;std::sync::Arc&lt;[u8]&gt;&gt;(256);
+// Each item pairs the H.264 access-unit bytes with str0m's per-AU `contiguous`
+// flag. The decode thread needs that flag to drive packet-loss recovery (flush
+// the DPB + request a PLI, Section 20.6), and it MUST travel on this same channel
+// so it stays ordered with the AU it describes — a side channel would race the
+// byte stream. `data` is `Arc<[u8]>`, so cloning a DecodeAu is a ref-count bump.
+struct DecodeAu { data: std::sync::Arc&lt;[u8]&gt;, contiguous: bool }
+let (au_tx, au_rx) = tokio::sync::mpsc::channel::&lt;DecodeAu&gt;(256);
 
 // RGB frame channel: decode-pipeline → LA-WS-client task (Section 19.1).
-// 1-slot watch; coalescing safe because each RGB frame is self-contained.
+// 1-slot watch; coalescing safe because each RGB frame is self-contained. The
+// decode thread publishes every converted frame here; the watch keeps only the
+// latest, so while LA is mid-inference the intervening frames are overwritten
+// and LA always pulls the freshest — natural rate-matching, no scheduler.
 let (rgb_tx, rgb_rx) = tokio::sync::watch::channel::&lt;Option&lt;RgbFrame&gt;&gt;(None);
 
 // Capture the JoinHandles so main can JOIN these tasks within the shutdown
 // budget (Section 18.2) — bye-flush delivery must be deterministic, not a blind
 // sleep. run_sfu returns once it processes FsmCommand::Shutdown (on_shutdown
 // flushes byes + disconnects, then the run loop breaks).
-let sfu_h    = tokio::spawn(run_sfu(udp_socket, fsm_rx, phase_tx, au_tx));
-let decode_h = tokio::spawn(run_decode_pipeline(au_rx, rgb_tx, fsm_tx.clone()));
-let la_h     = tokio::spawn(run_la_client(rgb_rx, fsm_tx.clone(), /* la host:port, prompt, mode */ /* ... */));
+let sfu_h = tokio::spawn(run_sfu(udp_socket, fsm_rx, phase_tx, au_tx));
+
+// The decode pipeline is a DEDICATED OS THREAD, NOT a tokio task: it owns the
+// libswscale `scaling::Context`, which is `!Send` in ffmpeg-next 7.1.0 (the
+// crate has no `unsafe impl Send` for `software::scaling::Context` — verified;
+// strikingly, the audio resampler DOES, so this is deliberate not an oversight),
+// so the scaler cannot be held across a tokio `.await` and the pipeline cannot
+// be `tokio::spawn`ed. Per Tokio's own guidance, a persistent CPU-bound loop
+// (decode + swscale, ~30 fps, no .await between) belongs on a dedicated thread,
+// not a runtime worker. It bridges the async channels with `blocking_recv()`
+// (AUs in) and `blocking_send()` (PLI requests out).
+let decode_thread = std::thread::Builder::new()
+    .name("decode".into())
+    .spawn(move || run_decode_pipeline(au_rx, rgb_tx, fsm_tx.clone()))
+    .context("spawn decode OS thread")?;
+
+let la_h = tokio::spawn(run_la_client(rgb_rx, fsm_tx.clone(), /* la host:port, prompt, mode */ /* ... */));
 </code></pre>
 
 <p>The run task:</p>
@@ -1803,7 +1826,7 @@ let la_h     = tokio::spawn(run_la_client(rgb_rx, fsm_tx.clone(), /* la host:por
     socket: tokio::net::UdpSocket,
     mut rx: tokio::sync::mpsc::Receiver&lt;FsmCommand&gt;,
     phase_tx: tokio::sync::watch::Sender&lt;PhaseKind&gt;,
-    au_tx:   tokio::sync::mpsc::Sender&lt;std::sync::Arc&lt;[u8]&gt;&gt;,
+    au_tx:   tokio::sync::mpsc::Sender&lt;DecodeAu&gt;,
 ) -&gt; anyhow::Result&lt;()&gt; {
     use std::num::NonZeroU32;
     use std::time::Duration;
@@ -2081,13 +2104,14 @@ pub struct Sfu {
     pub local_addr:          std::net::SocketAddr,
     pub stun_rate_limiter:   RateLimiter&lt;IpAddr, DashMapStateStore&lt;IpAddr&gt;, DefaultClock&gt;,
     /// Sender side of the bounded H.264 access-unit channel to the
-    /// decode-pipeline task (Section 19.1 step 1). The matching Receiver
+    /// decode-pipeline thread (Section 19.1 step 1). The matching Receiver
     /// is owned exclusively by that task. Capacity 256 frames — sized as
     /// "many frames" rather than seconds because the encoder framerate
     /// varies with thermal/battery throttle on mobile producers.
     /// `try_send` returns `Err(Full)` if the decoder is wedged; the SFU
     /// propagates this as anyhow::Error per the no-fallback rule.
-    pub au_tx:               tokio::sync::mpsc::Sender&lt;std::sync::Arc&lt;[u8]&gt;&gt;,
+    /// Each item is a `DecodeAu` = AU bytes + str0m's `contiguous` flag.
+    pub au_tx:               tokio::sync::mpsc::Sender&lt;DecodeAu&gt;,
 }
 </code></pre>
 
@@ -2096,7 +2120,7 @@ pub struct Sfu {
   <li>The <code>video_mid: Option&lt;Mid&gt;</code> and <code>boxes_cid: Option&lt;ChannelId&gt;</code> are the load-bearing guards for the Option α reconnect sequence (Section 11.8 step 8) — both must be <code>Some</code> before a peer is a forwarding target.</li>
   <li>Each <code>Rtc</code> in <code>Vec&lt;Client&gt;</code> is independently <code>Send + Sync</code> (verified prior research), but the whole <code>Sfu</code> is owned by a single Tokio task (Section 11.3) so the actor pattern guarantees unique mutable access; no <code>Mutex</code> is needed.</li>
   <li><code>channel_open_at</code> is set in Section 11.8 step 8 on receipt of <code>Event::ChannelOpen</code>; it is otherwise advisory (not used by any control flow).</li>
-  <li><code>au_tx</code> is bounded (capacity 256); the matching Receiver lives in the decode-pipeline task and is the sole consumer. <code>try_send</code> on a full channel is the deliberate loud-drop signal (Section 19.1 step 1).</li>
+  <li><code>au_tx</code> is bounded (capacity 256); the matching Receiver lives in the decode-pipeline thread and is the sole consumer. <code>try_send</code> on a full channel is the deliberate loud-drop signal (Section 19.1 step 1).</li>
 </ul>
 
 <h3>11.5.1 FsmCommand enumeration</h3>
@@ -2167,7 +2191,7 @@ pub struct Sfu {
     /// forwards it via this command; the FSM calls
     /// `client.rtc.add_remote_candidate(candidate)`.
     AddRemoteCandidate { peer_id: PeerId, candidate: str0m::Candidate },
-    /// Decoder-loss recovery: the decode-pipeline task observed
+    /// Decoder-loss recovery: the decode-pipeline thread observed
     /// `MediaData.contiguous == false` from str0m (the depacketizer's
     /// hold-back window expired without NACK/RTX recovering the lost
     /// packet). The FSM, on receiving this, calls
@@ -2230,7 +2254,7 @@ impl Sfu {
     /// Per-viewer failures are isolated. We never propagate up — that
     /// would kill the streamer because one viewer's UDP path died.
     ///
-    /// AU mpsc push to the decode-pipeline task is the OTHER half of this
+    /// AU mpsc push to the decode-pipeline thread is the OTHER half of this
     /// handler (Section 19.1 step 1): every AU is sent in arrival order;
     /// Err(Full) propagates because a wedged decoder is a loud failure,
     /// not a silent backpressure event.
@@ -2249,10 +2273,11 @@ impl Sfu {
                 viewer.rtc.disconnect();
             }
         }
-        // (b) Push the same AU to the decode-pipeline task. In-order,
-        // non-coalescing; `data.data` is `Arc&lt;[u8]&gt;` so the clone is a
-        // reference-count bump, not a byte-copy.
-        self.au_tx.try_send(data.data.clone())
+        // (b) Push the same AU to the decode-pipeline thread, paired with str0m's
+        // `contiguous` flag (the decode thread flushes + PLIs on a gap, §20.6).
+        // In-order, non-coalescing; `data.data` is `Arc&lt;[u8]&gt;` so cloning is a
+        // reference-count bump, not a byte-copy, and `contiguous` is a Copy bool.
+        self.au_tx.try_send(DecodeAu { data: data.data.clone(), contiguous: data.contiguous })
             .with_context(|| format!(
                 "AU mpsc push (cap=256 frames) for streamer {} — Full means the \
                  decode pipeline failed to drain 256 access units; disconnecting streamer",
@@ -2465,7 +2490,7 @@ fn request_pli_from_streamer(streamer: &amp;mut Client, streamer_video_mid: Mid)
 <tr><td><code>Claim</code>, <code>ResumeSession</code>, <code>AttachStreamer</code>, <code>AttachViewer</code>, <code>Disconnect</code>, <code>AddRemoteCandidate</code></td><td>WebSocket handler task (Section 12 list item 7)</td></tr>
 <tr><td><code>GotRtp</code></td><td>SFU actor task itself, emitted inline from the UDP-demux <code>Event::MediaData</code> arm when the owner is in <code>Phase::Claimed</code>. NOT cross-task — same task self-dispatches via re-entrancy on the next select! iteration. (Could equivalently be a direct method call; the variant exists for symmetry and observability.)</td></tr>
 <tr><td><code>LaDown</code>, <code>LaUp</code>, <code>LaBoxResult</code>, <code>LaErrorResult</code></td><td>LocateAnything-3B WebSocket client task (Section 12 list item 4)</td></tr>
-<tr><td><code>RequestStreamerPli</code></td><td>Decode-pipeline task (Section 12 list item 6) on observing <code>MediaData.contiguous == false</code>.</td></tr>
+<tr><td><code>RequestStreamerPli</code></td><td>Decode-pipeline thread (Section 12 list item 6) on observing <code>MediaData.contiguous == false</code>.</td></tr>
 <tr><td><code>Shutdown</code></td><td>Signal-watcher task (Section 12 list item 2 + Section 18.1)</td></tr>
 </table>
 
@@ -2694,8 +2719,8 @@ let _ = self.phase_tx.send(self.phase.kind());</code></pre>
   <li><strong>Authentication rate-limit garbage-collection task</strong>: on a 60-second tokio::time::interval, calls <code>RateLimiter::retain_recent()</code> on the per-IP rate limiter to evict entries whose buckets have fully refilled.</li>
   <li><strong>Cert-expiry re-check task</strong>: on a 6-hour <code>tokio::time::interval</code>, re-parses the live <code>cert.pem</code> at <code>STATE_DIR/cert.pem</code> via <code>x509-parser</code> and re-runs the §14.5 three-band check against <code>SystemTime::now()</code>. <strong>If the cert has crossed into the &lt;30-day-from-expiry band</strong>, log a WARN identical to the boot-time WARN (idempotent — operator sees the same message every 6 hours regardless of how many days have elapsed). <strong>If the cert has crossed into the &lt;7-day-from-expiry band</strong>, log an ERROR at every interval AND flip a process-local <code>cert_expiring_soon: AtomicBool</code> flag that <code>/v1/health</code> reads and reports as <code>status: "degraded"</code>. The binary does NOT self-exit (existing TLS sessions stay valid); the operator monitoring <code>/v1/health</code> or <code>docker logs</code> gets a continuous loud signal. <strong>If the cert is past <code>notAfter</code></strong>, the same flag is set, plus <code>cert_valid: false</code> is reported in <code>/v1/health</code>. This closes the silent-stall window in which a binary that started with 7–30 days of cert remaining keeps running through expiry without proactive logging. The 6-hour cadence is generous (the band crossings only happen once every ~27 months in normal operation); not perf-coupled.</li>
   <li><strong>LocateAnything-3B WebSocket client task</strong>: maintains a reconnecting <code>tokio-tungstenite</code> connection to <code>ws://&lt;la-host&gt;:&lt;la-port&gt;/v1/stream</code>; reads the latest RGB frame from a <code>tokio::sync::watch::Receiver&lt;Option&lt;RgbFrame&gt;&gt;</code> via the canonical <code>changed().await</code> + <code>borrow_and_update()</code> idiom; encodes JPEG via <code>mozjpeg::Compress</code> at quality 92 per the knob discipline in Section 19.2; writes frame headers + JPEG body per the LA wire format; reads one JSON reply (stop-and-wait per LA's enforcement); emits <code>FsmCommand::LaBoxResult { msg: BoxMessage }</code> on <code>type:"result"</code> replies, <code>FsmCommand::LaErrorResult { frame_id, code, message }</code> on <code>type:"error"</code> replies, <code>FsmCommand::LaDown { error }</code> on WebSocket-drop, and <code>FsmCommand::LaUp</code> on reconnect-success into the FSM. LA's per-frame latency is the natural sampling cadence; the loop runs forever as fast as LA can chew through frames.</li>
-  <li><strong>Selective Forwarding Unit actor task</strong>: see <a href="#sec-fsm">Section 11</a>. Owns the UDP socket and the <code>Vec&lt;Client&gt;</code>. Drives <code>str0m::Rtc</code> instances. Handles own-STUN binding-request demultiplexing. Pushes every streamer-video <code>MediaData</code> access unit into a bounded <code>tokio::sync::mpsc::channel(256)</code> toward the decode-pipeline task in arrival order — no coalescing.</li>
-  <li><strong>Decode pipeline task</strong>: drains the bounded mpsc of H.264 access units in arrival order; holds ONE long-lived <code>ffmpeg-next 7.1.0</code> H.264 decoder <code>Context</code> across the entire streaming session; libavcodec maintains the H.264 reference chain across P-frames and naturally suppresses output until <code>recovered=true</code> after the first IDR (verified at upstream <code>libavcodec/h264_slice.c:1376-1383</code>). On <code>MediaData.contiguous == false</code>: calls <code>decoder.flush()</code> AND emits one event-driven <code>KeyframeRequestKind::Pli</code> upstream. Decoded YUV420 frames flow through a long-lived <code>ffmpeg-next::software::scaling::Context</code> (BICUBIC, BT.709 limited→full per Section 19.3, reconstructed only on a frame-dimensions change) into RGB24, and the RGB frame is published to a <code>tokio::sync::watch::Sender&lt;Option&lt;RgbFrame&gt;&gt;</code> for the LA client task to pull. JPEG encoding lives in the LA client task (Section 12.1 list item 4) so that frames the LA task never sees are never JPEG-encoded.</li>
+  <li><strong>Selective Forwarding Unit actor task</strong>: see <a href="#sec-fsm">Section 11</a>. Owns the UDP socket and the <code>Vec&lt;Client&gt;</code>. Drives <code>str0m::Rtc</code> instances. Handles own-STUN binding-request demultiplexing. Pushes every streamer-video <code>MediaData</code> access unit into a bounded <code>tokio::sync::mpsc::channel(256)</code> toward the decode-pipeline thread in arrival order — no coalescing.</li>
+  <li><strong>Decode pipeline — a DEDICATED OS thread (<code>std::thread</code>), NOT a tokio task</strong>: the libswscale <code>software::scaling::Context</code> it owns is <code>!Send</code> in ffmpeg-next 7.1.0 (no <code>unsafe impl Send</code> — the decoder/frame/packet types ARE <code>Send</code>, only the scaler is not), so it cannot be held across a tokio <code>.await</code>; and per Tokio's own guidance a persistent CPU-bound loop belongs on a dedicated thread, not a runtime worker (Section 11.3). It bridges the bounded AU mpsc with <code>blocking_recv()</code> and drains access units in arrival order; holds ONE long-lived <code>ffmpeg-next 7.1.0</code> H.264 decoder <code>Context</code> for the session; libavcodec maintains the H.264 reference chain across P-frames and naturally suppresses output until <code>recovered=true</code> after the first IDR (verified at upstream <code>libavcodec/h264_slice.c:1376-1383</code>). It decodes EVERY access unit (preserving the reference chain), runs the long-lived <code>scaling::Context</code> (BICUBIC, BT.709 limited→full per Section 19.3, rebuilt only on a frame-dimensions change) YUV→RGB24 on each decoded frame, and publishes the RGB to <code>watch::Sender&lt;Option&lt;RgbFrame&gt;&gt;</code>; the 1-slot watch coalesces, so the LA client samples only the freshest frame at its own ~1.3 fps pace while intervening frames are overwritten. On <code>MediaData.contiguous == false</code> (the flag rides the AU channel as part of <code>DecodeAu</code>): calls <code>decoder.flush()</code> AND signals the FSM (<code>blocking_send</code>) to emit one event-driven <code>KeyframeRequestKind::Pli</code>. JPEG encoding still lives in the LA client task (Section 12.1 list item 4).</li>
   <li><strong>Per-HTTP-connection task</strong>: spawned automatically by <code>axum_server</code>'s underlying hyper service. Each one handles one HTTP request, or upgrades to a long-lived WebSocket. WebSocket handler tasks (the <code>/v1/signal</code> upgrade route) drive a per-peer state machine on top of the FsmCommand channel:
     <ul>
       <li>Read <code>SignalMessage</code>s from the wire and dispatch:
@@ -2768,7 +2793,7 @@ let _ = self.phase_tx.send(self.phase.kind());</code></pre>
 </ol>
 
 <h3>12.4 Tokio runtime worker-thread configuration</h3>
-<p>The server uses <code>#[tokio::main(flavor = "multi_thread", worker_threads = 4)]</code> — exactly four worker threads, fixed regardless of host core count. Rationale: the load-bearing tasks are the Selective Forwarding Unit actor (single task, single thread), the per-connection HTTP/WebSocket handlers (small), the decode-and-JPEG-encode pipeline (CPU-bound, benefits from one worker), and the LocateAnything-3B WebSocket client (I/O-bound). Four workers handle this with headroom. Pinning the count makes performance predictable across host hardware; auto-sizing to CPU count would make a 64-core box and a 4-core box behave differently in subtle ways the operator would have to debug.</p>
+<p>The server uses <code>#[tokio::main(flavor = "multi_thread", worker_threads = 4)]</code> — exactly four worker threads, fixed regardless of host core count. Rationale: the load-bearing tokio tasks are the Selective Forwarding Unit actor (single task, single thread), the per-connection HTTP/WebSocket handlers (small), and the LocateAnything-3B WebSocket client (I/O-bound, plus the on-demand mozjpeg encode). Four workers handle these with headroom. <strong>The decode pipeline is NOT one of them</strong> — it is a dedicated OS thread outside the runtime (Section 11.3: the libswscale Context is <code>!Send</code>, and a persistent CPU-bound decode loop should not occupy a runtime worker), so the CPU-bound H.264 decode never blocks an async worker. Pinning the count makes performance predictable across host hardware; auto-sizing to CPU count would make a 64-core box and a 4-core box behave differently in subtle ways the operator would have to debug.</p>
 
 <h3>12.5 Why all RTC instances are owned by one task (not per-peer-task)</h3>
 <p>str0m's <code>Rtc::accepts()</code> demultiplexer at <code>str0m-src/src/lib.rs:1792-1820</code> is called against the inbound UDP packet to determine which Rtc the packet belongs to. With one Rtc per task, every UDP packet receive would have to round-trip across N task boundaries to find its owner — a major performance and complexity penalty. The reference example <code>str0m-src/examples/chat.rs:111-170</code> demonstrates the single-task pattern; we follow it.</p>
@@ -3981,7 +4006,7 @@ fn apply_keepalive(tcp: &amp;TcpStream) -&gt; io::Result&lt;()&gt; {
   </li>
   <li>The <code>axum_server::bind_rustls(...).serve(...).await</code> future returns once every per-connection task has dropped its handle. <strong>This typically returns very quickly</strong> because the per-connection HTTP task ends at the WebSocket upgrade boundary; upgraded WebSocket tasks have already dropped their handles in step 3.</li>
   <li>Outer wrapper: <code>tokio::time::timeout(Duration::from_secs(8), serve_future)</code>. On elapse, log a WARN line and continue (the underlying handler tasks have all been notified and will drain themselves; we just stop waiting). <strong>Time budget: 8 seconds.</strong></li>
-  <li><strong>Join the long-lived tasks (deterministic, not a blind sleep).</strong> <code>tokio::time::timeout(Duration::from_secs(1), futures::future::join_all([sfu_h, decode_h, la_h])).await</code>. run_sfu's select loop intercepts <code>FsmCommand::Shutdown</code>, runs the async <code>on_shutdown</code> (per-peer DataChannel "bye" flush + <code>rtc.disconnect()</code>, step 3, ≤800 ms) and then <code>break</code>s — so <code>sfu_h</code> resolves; <code>la_h</code> and <code>decode_h</code> return on their WS/channel close. Because <code>on_shutdown</code>'s flush begins at signal time (step 2) and overlaps the serve-drain, by the time this join runs the tasks have typically already returned, so it completes near-instantly; only a pathological stall waits out the 1 s cap (then log a WARN and exit anyway — the handlers were already notified). This replaces the former blind 1-second <code>sleep</code>, closing the race where a bye-flush slower than the sleep let the process exit before the browser saw its clean goodbye (§18.3). <strong>Time budget: ≤1 second, sequential to step 5</strong> — worst-case total shutdown is 8 s (step 5's serve cap) + 1 s = 9 s, preserving a 1-second buffer under the Docker 10-second SIGTERM→SIGKILL window (§15.7.1); the realistic path (serve returns sub-second, tasks already joined) is well under 3 s.</li>
+  <li><strong>Join the long-lived tasks (deterministic, not a blind sleep).</strong> <code>tokio::time::timeout(Duration::from_secs(1), futures::future::join_all([sfu_h, la_h])).await</code> (the two tokio tasks), then join the decode OS thread via <code>tokio::task::spawn_blocking(move || decode_thread.join())</code> within the same budget. run_sfu's select loop intercepts <code>FsmCommand::Shutdown</code>, runs the async <code>on_shutdown</code> (per-peer DataChannel "bye" flush + <code>rtc.disconnect()</code>, step 3, ≤800 ms) and then <code>break</code>s — so <code>sfu_h</code> resolves; <code>la_h</code> returns on its WS close; the decode pipeline OS thread (§11.3) returns as soon as the SFU drops <code>au_tx</code> (its <code>blocking_recv()</code> yields <code>None</code>) and emits no DataChannel byes itself, so joining it is best-effort cleanup with no shutdown-ordering obligation. Because <code>on_shutdown</code>'s flush begins at signal time (step 2) and overlaps the serve-drain, by the time this join runs the tasks have typically already returned, so it completes near-instantly; only a pathological stall waits out the 1 s cap (then log a WARN and exit anyway — the handlers were already notified). This replaces the former blind 1-second <code>sleep</code>, closing the race where a bye-flush slower than the sleep let the process exit before the browser saw its clean goodbye (§18.3). <strong>Time budget: ≤1 second, sequential to step 5</strong> — worst-case total shutdown is 8 s (step 5's serve cap) + 1 s = 9 s, preserving a 1-second buffer under the Docker 10-second SIGTERM→SIGKILL window (§15.7.1); the realistic path (serve returns sub-second, tasks already joined) is well under 3 s.</li>
   <li>Process exits with code 0.</li>
 </ol>
 
@@ -4006,9 +4031,9 @@ Without this sequence, the browser learns of disconnect only via ICE consent-fre
 
 <p>The pipeline is structured so that LocateAnything-3B naturally pulls a frame at its own pace:</p>
 <ol>
-  <li><strong>SFU → decoder feed (non-coalescing).</strong> The Selective Forwarding Unit's <code>on_streamer_media_data</code> handler does two things on every <code>Event::MediaData</code> from the streamer: (a) re-publish the access unit (AU) to every viewer via <code>str0m::Writer</code> (Section 11.7, unchanged); (b) push the AU into a bounded <code>tokio::sync::mpsc::channel(256)</code> toward the decode-pipeline task. The capacity is sized in <em>frames</em>, not seconds — the producer-side framerate is whatever the browser encoder happens to be emitting (the WebRTC capture target is 30 fps but libwebrtc's QualityScaler may drop it under mobile thermal or battery-save throttle); 256 access units is a generous safety margin against any transient decoder stall regardless of the live encoder rate. <strong>In-order delivery, no coalescing.</strong> The H.264 reference chain across P-frames is preserved end-to-end. On <code>try_send</code> returning <code>Err(Full)</code>, the SFU surfaces an <code>anyhow::Error</code> up to its supervising task, which disconnects the streamer per the strict no-fallback rule (Section 3); a chronic Full condition indicates the decode pipeline has wedged and silent backpressure would only mask the bug.</li>
-  <li><strong>Decoder (stateful, long-lived).</strong> One <code>ffmpeg_next::codec::context::Context</code> with an open H.264 decoder lives for the entire streaming session. The task calls <code>decoder.send_packet(&amp;packet)</code> and <code>decoder.receive_frame(&amp;mut yuv_frame)</code> per AU. <strong>libavcodec naturally suppresses output before the H.264 recovery flag is set</strong> (verified at upstream <code>libavcodec/h264_slice.c:1376-1383</code>: without <code>AV_CODEC_FLAG_OUTPUT_CORRUPT</code>, output is held until <code>out-&gt;recovered = true</code>, set on IDR at line 1664 or on an SEI recovery-point message). Therefore: a fresh decoder attaching mid-stream on a P-frame DOES NOT emit corrupt pixels — it stays silent until the recovery IDR arrives. Cold-start before the very first IDR is correct by construction. Mid-stream Sequence Parameter Set changes (e.g., the streamer's camera changing resolution via <code>RTCRtpSender.replaceTrack</code> in Section 21.6) are handled by libavcodec's automatic re-init path at <code>h264_slice.c:1080-1090</code>.</li>
-  <li><strong>Packet-loss recovery is event-driven.</strong> str0m's depacketizer holds packets for up to 30 frames (~1 second at 30 fps; default at <code>str0m 0.20.0 src/config.rs:639</code>) waiting for Negative-Acknowledgement-driven retransmission via the 3-second StreamTx cache (<code>src/streams/send.rs:38, 275</code>). When that hold-back window expires without recovery, str0m emits <code>MediaData.contiguous = false</code>. The decode-pipeline task, on observing this, calls <code>decoder.flush()</code> to clear the Decoded Picture Buffer AND emits one <code>KeyframeRequestKind::Pli</code> upstream to the streamer via the FSM. This is the str0m reference pattern (<code>examples/chat.rs:442-445</code>) verbatim — event-driven, not periodic.</li>
+  <li><strong>SFU → decoder feed (non-coalescing).</strong> The Selective Forwarding Unit's <code>on_streamer_media_data</code> handler does two things on every <code>Event::MediaData</code> from the streamer: (a) re-publish the access unit (AU) to every viewer via <code>str0m::Writer</code> (Section 11.7, unchanged); (b) push the AU into a bounded <code>tokio::sync::mpsc::channel(256)</code> toward the decode-pipeline thread. The capacity is sized in <em>frames</em>, not seconds — the producer-side framerate is whatever the browser encoder happens to be emitting (the WebRTC capture target is 30 fps but libwebrtc's QualityScaler may drop it under mobile thermal or battery-save throttle); 256 access units is a generous safety margin against any transient decoder stall regardless of the live encoder rate. <strong>In-order delivery, no coalescing.</strong> The H.264 reference chain across P-frames is preserved end-to-end. On <code>try_send</code> returning <code>Err(Full)</code>, the SFU surfaces an <code>anyhow::Error</code> up to its supervising task, which disconnects the streamer per the strict no-fallback rule (Section 3); a chronic Full condition indicates the decode pipeline has wedged and silent backpressure would only mask the bug.</li>
+  <li><strong>Decoder (stateful, long-lived).</strong> One <code>ffmpeg_next::codec::context::Context</code> with an open H.264 decoder lives for the entire streaming session. The thread calls <code>decoder.send_packet(&amp;packet)</code> and <code>decoder.receive_frame(&amp;mut yuv)</code> per AU. <strong>libavcodec naturally suppresses output before the H.264 recovery flag is set</strong> (verified at upstream <code>libavcodec/h264_slice.c:1376-1383</code>: without <code>AV_CODEC_FLAG_OUTPUT_CORRUPT</code>, output is held until <code>out-&gt;recovered = true</code>, set on IDR at line 1664 or on an SEI recovery-point message). Therefore: a fresh decoder attaching mid-stream on a P-frame DOES NOT emit corrupt pixels — it stays silent until the recovery IDR arrives. Cold-start before the very first IDR is correct by construction. Mid-stream Sequence Parameter Set changes (e.g., the streamer's camera changing resolution via <code>RTCRtpSender.replaceTrack</code> in Section 21.6) are handled by libavcodec's automatic re-init path at <code>h264_slice.c:1080-1090</code>.</li>
+  <li><strong>Packet-loss recovery is event-driven.</strong> str0m's depacketizer holds packets for up to 30 frames (~1 second at 30 fps; default at <code>str0m 0.20.0 src/config.rs:639</code>) waiting for Negative-Acknowledgement-driven retransmission via the 3-second StreamTx cache (<code>src/streams/send.rs:38, 275</code>). When that hold-back window expires without recovery, str0m emits <code>MediaData.contiguous = false</code>; the SFU forwards that flag to the decode thread on the AU channel itself (as part of the <code>DecodeAu</code> payload — Section 11.7 — so it stays ordered with the access unit it describes). The decode thread, on seeing <code>contiguous == false</code>, calls <code>decoder.flush()</code> to clear the Decoded Picture Buffer AND signals the FSM (<code>blocking_send</code>, since the thread is off-runtime) to emit one <code>KeyframeRequestKind::Pli</code> upstream to the streamer. This is the str0m reference pattern (<code>examples/chat.rs:442-445</code>) verbatim — event-driven, not periodic.</li>
   <li><strong>YUV → RGB conversion (long-lived swscale Context).</strong> Each successfully-decoded YUV420P frame goes through libswscale via <code>ffmpeg_next::software::scaling::Context</code> with <code>Flags::BICUBIC</code> and an explicit <code>sws_setColorspaceDetails</code> call (BT.709 source coefficients, limited→full range — see Section 19.3 for the unsafe FFI shape and rationale). The swscale Context is long-lived across the streaming session; it is reconstructed only when the decoded frame's dimensions change (the libavcodec auto-reinit signal at <code>h264_slice.c:1080-1090</code>).</li>
   <li><strong>Decoder → LA feed (coalescing safe).</strong> Each RGB frame is published to a <code>tokio::sync::watch::Sender&lt;Option&lt;RgbFrame&gt;&gt;</code>. The watch's 1-slot coalescing semantic is <em>safe</em> here because each RGB frame is self-contained — no cross-frame state, no reference chain. The LA WebSocket client task is the sole consumer.</li>
   <li><strong>LA WebSocket client (the natural-rate driver).</strong> The canonical Tokio watch idiom drives a strict stop-and-wait loop:
@@ -4046,47 +4071,65 @@ Without this sequence, the browser learns of disconnect only via ICE consent-fre
         ▼
 SFU actor (on_streamer_media_data):
   - Always re-publish to viewers via str0m::Writer (Section 11.7).
-  - Push every AU into mpsc::channel(256) toward the decoder task. On Err(Full),
+  - Push every AU into mpsc::channel(256) toward the decode thread. On Err(Full),
     propagate anyhow::Error up; supervising task disconnects the streamer.
         │
         ▼
-Decode pipeline task (long-lived libavcodec H.264 Context):
-  loop {
-      let pkt_bytes = au_rx.recv().await
-          .ok_or_else(|| anyhow!("SFU closed AU channel"))?;
-      let packet = ffmpeg_next::packet::Packet::copy(&amp;pkt_bytes);
-      decoder.send_packet(&amp;packet)
-          .with_context(|| format!("libavcodec send_packet (len={})", pkt_bytes.len()))?;
-      match decoder.receive_frame(&amp;mut yuv_frame) {
-          Ok(()) =&gt; {
-              if yuv_frame.is_corrupt() {              // AV_FRAME_FLAG_CORRUPT — extra-defensive
-                  tracing::warn!("libavcodec emitted corrupt frame; dropping");
-                  continue;
+Decode pipeline — DEDICATED OS THREAD (owns the libavcodec H.264 Context AND
+the !Send libswscale Context). Sync fn run via std::thread (Section 11.3):
+  fn run_decode_pipeline(
+      mut au_rx: tokio::sync::mpsc::Receiver&lt;DecodeAu&gt;,
+      rgb_tx:    tokio::sync::watch::Sender&lt;Option&lt;RgbFrame&gt;&gt;,
+      fsm_tx:    tokio::sync::mpsc::Sender&lt;FsmCommand&gt;,
+  ) -&gt; anyhow::Result&lt;()&gt; {
+      use ffmpeg_next::codec::{Context as CodecContext, Id as CodecId};
+      // Built once at thread entry; live for the whole streaming session.
+      let mut decoder = CodecContext::new().decoder().open_as(CodecId::H264)
+          .context("opening H.264 decoder via libavcodec")?;
+      let mut scaler_slot: Option&lt;ffmpeg_next::software::scaling::Context&gt; = None; // rebuilt on dim change (ensure_scaler_for, §19.3)
+      let mut rgb_frame = ffmpeg_next::frame::Video::empty();   // RGB24 output scratch (reused)
+      let mut yuv       = ffmpeg_next::frame::Video::empty();   // decoder output scratch (reused)
+      loop {
+          // blocking_recv bridges the async SFU (tokio mpsc) to this sync thread.
+          // None = the SFU dropped au_tx (shutdown) → return so main can join us.
+          let Some(au) = au_rx.blocking_recv() else { return Ok(()); };
+          if !au.contiguous {
+              // str0m's depacketizer exhausted its NACK/RTX hold-back without
+              // recovering a lost packet. Flush the DPB — stale references would
+              // corrupt every dependent P-frame — and ask the FSM to PLI the
+              // streamer (Section 20.6). blocking_send, NOT .await: this is a
+              // plain OS thread, never a runtime worker. (str0m chat.rs:442-445.)
+              decoder.flush();
+              fsm_tx.blocking_send(FsmCommand::RequestStreamerPli)
+                  .context("FSM channel closed (RequestStreamerPli)")?;
+          }
+          let packet = ffmpeg_next::packet::Packet::copy(&amp;au.data);
+          decoder.send_packet(&amp;packet)
+              .with_context(|| format!("libavcodec send_packet (len={})", au.data.len()))?;
+          match decoder.receive_frame(&amp;mut yuv) {            // yuv: frame::Video (reused scratch)
+              Ok(()) =&gt; {
+                  if yuv.is_corrupt() {                       // AV_FRAME_FLAG_CORRUPT — extra-defensive
+                      tracing::warn!("libavcodec emitted corrupt frame; dropping");
+                      continue;
+                  }
               }
-              // proceed to scale + publish
+              Err(ffmpeg_next::Error::Other { errno })
+                  if errno == ffmpeg_next::error::EAGAIN =&gt; continue, // cold-start, benign (h264_slice.c:1376-1383)
+              Err(e) =&gt; return Err(e).context("libavcodec receive_frame"),
           }
-          Err(ffmpeg_next::Error::Other { errno })
-              if errno == ffmpeg_next::error::EAGAIN =&gt; {
-              // Decoder needs more input — normal during cold-start before the
-              // first IDR arrives, and benign per h264_slice.c:1376-1383
-              // (libavcodec suppresses output until recovered=true).
-              continue;
-          }
-          Err(e) =&gt; return Err(e).context("libavcodec receive_frame"),
+          // Colour-convert this frame and publish. We convert EVERY decoded frame
+          // (not just the ones LA consumes): on this hardware the swscale of the
+          // ~29 frames/sec LA skips is irrelevant, and gating it on an LA-demand
+          // flag would be cross-thread state to keep in sync for no real saving
+          // (Section 3 — no overengineering). The 1-slot watch coalesces, so LA
+          // still samples only the freshest frame at its own pace.
+          ensure_scaler_for(&amp;mut scaler_slot, yuv.width(), yuv.height())?;
+          scaler_slot.as_mut().unwrap().run(&amp;yuv, &amp;mut rgb_frame)
+              .context("libswscale run YUV420P→RGB24")?;
+          rgb_tx.send(Some(rgb_frame.clone()))
+              .context("rgb watch channel closed")?;
       }
-      // If dimensions changed since the last frame, rebuild swscale Context.
-      ensure_scaler_for(&amp;mut scaler_slot, yuv_frame.width(), yuv_frame.height())?;
-      scaler_slot.as_mut().unwrap().run(&amp;yuv_frame, &amp;mut rgb_frame)
-          .context("libswscale run YUV420P→RGB24")?;
-      rgb_tx.send(Some(rgb_frame.clone()))
-          .context("rgb watch channel closed")?;
   }
-        │
-        ▼
-On str0m emitting MediaData.contiguous=false:
-  decoder.flush();
-  fsm_tx.send(FsmCommand::RequestStreamerPli).await?;
-  (Section 20.6 — event-driven only, no time-based scheduler.)
         │
         ▼
 LA WebSocket client task (the natural-rate driver):
@@ -4126,7 +4169,7 @@ LA WebSocket client task (the natural-rate driver):
   <li><strong>JSON reply parse + DataChannel fan-out + tokio scheduling:</strong> &lt;0.5 ms total.</li>
 </ul>
 
-<p>The decode task runs as a separate Tokio worker (Section 12.4 pins 4 workers): at 30 fps with ~6–12 ms per 720p H.264 software-decode frame plus the libswscale step, the decode task occupies roughly 18–36 % of one core sustained. Well within budget. The LA client task's critical path sees only the per-LA-cycle overhead because the decode pipeline is fully parallel; the ~2 % fps loss versus LA's native throughput (hybrid mode) is the dominant accounting term and is invariant to streamer-side frame rate.</p>
+<p>The decode pipeline runs on a dedicated OS thread (Sections 11.3 and 12.4 — deliberately NOT one of the 4 tokio workers: the libswscale Context is <code>!Send</code>, and a persistent CPU-bound loop should not occupy an async worker): at 30 fps, ~6–12 ms per 720p H.264 software-decode frame plus the libswscale step puts the decode thread at roughly 18–36 % of one core sustained. We convert every decoded frame rather than gating colour-conversion on LA's cadence: the swscale of the frames LA skips costs a small fraction of one core and is not worth a cross-thread demand flag to keep in sync (Section 3 — no overengineering), and the 1-slot watch already coalesces so LA samples only the freshest. Well within budget. The LA client task's critical path sees only its own per-cycle overhead — the mozjpeg encode of the single frame it consumes — because the decode thread runs fully in parallel; the ~2 % fps loss versus LA's native throughput (hybrid mode) is the dominant accounting term and is invariant to streamer-side frame rate.</p>
 
 <h3>19.2 mozjpeg knob discipline</h3>
 <div class="note note-critical">
@@ -4489,7 +4532,7 @@ let pc = web_sys::RtcPeerConnection::new_with_configuration(&amp;cfg)
 <ul>
   <li><strong>Use <code>KeyframeRequestKind::Pli</code></strong> (Picture Loss Indication), NOT <code>Fir</code> (Full Intra Request). FIR is reserved for mixer/composition scenarios per RFC 5104 and is explicitly disallowed for loss recovery. <strong>The str0m example file <code>examples/chat.rs:444</code> uses <code>Fir</code>; this is wrong per the RFC; the implementation agent MUST use Pli.</strong></li>
   <li><strong>PLI emitter #1 — new-viewer attach.</strong> Proactively send a Picture Loss Indication to the streamer when a new viewer's outbound video is ready, saving approximately one round-trip-time of black frames at the viewer's start. Implementation: when an <code>Event::MediaAdded</code> fires for a viewer Rtc's outbound video <code>Mid</code>, look up the streamer Rtc, find the inbound video stream, call <code>streamer_rtc.writer(STREAMER_VIDEO_MID).request_keyframe(None, KeyframeRequestKind::Pli)</code>.</li>
-  <li><strong>PLI emitter #2 — decoder-loss recovery.</strong> The decode-pipeline task (Section 19.1) observes <code>MediaData.contiguous == false</code> when str0m's depacketizer has exhausted its hold-back window without recovering a lost packet via NACK/RTX. The task calls <code>decoder.flush()</code> AND emits one <code>KeyframeRequestKind::Pli</code> upstream to the streamer via an <code>FsmCommand::RequestStreamerPli</code> to the FSM. This is the str0m reference pattern (<code>examples/chat.rs:442-445</code>) verbatim — one event-driven PLI per packet-loss recovery event.</li>
+  <li><strong>PLI emitter #2 — decoder-loss recovery.</strong> The decode-pipeline thread (Section 19.1) observes <code>MediaData.contiguous == false</code> when str0m's depacketizer has exhausted its hold-back window without recovering a lost packet via NACK/RTX. The thread calls <code>decoder.flush()</code> AND signals the FSM via <code>FsmCommand::RequestStreamerPli</code> (<code>blocking_send</code>) to emit one <code>KeyframeRequestKind::Pli</code> upstream to the streamer. This is the str0m reference pattern (<code>examples/chat.rs:442-445</code>) verbatim — one event-driven PLI per packet-loss recovery event.</li>
   <li><strong>No periodic scheduler, no application-level throttle.</strong> Two structural rate caps already sit below the SFU's application code: <strong>(i)</strong> str0m's <code>pending_request_keyframe: Option&lt;KeyframeRequestKind&gt;</code> field at <code>src/streams/receive.rs:80</code> is single-slot — <code>request_keyframe()</code> assigns, so multiple calls within one drain window collapse; the <code>StreamRx::pending_request_keyframe</code> field is drained inside <code>Session::handle_timeout</code> → <code>Streams::handle_timeout</code> → <code>StreamRx::maybe_create_keyframe_request</code> (<code>src/session.rs:234</code>, <code>src/streams/mod.rs:429</code>, <code>src/streams/receive.rs:506</code>) and the dominant recurring wakeup that pumps it is the 50-millisecond <code>TWCC_INTERVAL</code> (<code>src/session.rs:42</code>), so the wall-clock cap on outbound PLI is ≤ one per ~50 ms. (This is the inbound <code>StreamRx</code> path — the SFU asking the streamer for an IDR. Do not confuse it with the separate <code>StreamTx::pending_request_keyframe</code> at <code>src/streams/send.rs:114</code>, drained via <code>Session::poll_event</code> → <code>Streams::poll_keyframe_request</code>, which is the forward-to-viewer direction and is not used here.) <strong>(ii)</strong> libwebrtc's <code>kMinKeyframeSendIntervalMs = 300</code> at <code>video/encoder_rtcp_feedback.cc:23-24</code> drops any PLI received within 300 ms of the last emitted IDR. The streamer's encoder physically cannot produce IDRs faster than ~3.3/second regardless of how many PLIs we issue. An application-level throttle on top of these two structural floors would be a third redundant layer with no behavioral effect; omitting it honors the no-overengineered-options principle of Section 3.</li>
   <li><strong>No periodic IDR cadence imposed by the demo server.</strong> The browser's encoder emits IDRs on its own natural cadence (libwebrtc default <code>keyFrameInterval = 3000</code> frames per <code>api/video_codecs/video_encoder.cc:36</code>, ≈ 100 seconds at 30 fps), plus on the two event-driven triggers above. Sampling to LocateAnything-3B is driven by LA's own per-frame latency via the watch-channel pattern (Section 19.1); the demo server runs no timer-driven PLI loop.</li>
 </ul>
@@ -5983,7 +6026,7 @@ done
   <li><code>--security-opt no-new-privileges</code> — a <code>setuid</code> ELF can never gain privileges back.</li>
   <li><code>--user "$(id -u):$(id -g)"</code> — runs the container process as the operator's UID/GID. Files written to the bind-mount (cert.pem, key.pem, cert.metadata.json) are owned by the operator on the host, so they can be inspected/backed-up/regenerated via normal user commands without sudo. The Dockerfile creates a <code>lawebsite</code> user inside the image for file-ownership defaults at build time; the <code>--user</code> override at runtime supersedes that.</li>
   <li><code>-v "${STATE_DIR_HOST}":/var/lib/la-website</code> — bind-mounts <code>./website/.runtime/state/</code> on the host onto the binary's hardcoded <code>STATE_DIR</code> inside the container. The host-side directory was created with mode 0700 by setup.sh (Section 24.7).</li>
-  <li><code>--memory 2g</code>, <code>--pids-limit 256</code> — bounded resource limits. The 2 GiB cap is sized for: ~80 MiB baseline (Rust runtime + glibc + dlopen'd libav* shared objects + axum + tokio 4-worker stacks + tracing buffers); plus ~25 MiB for the process-long-lived libavcodec H.264 decoder + libswscale Context owned by the decode-pipeline task (constructed once at process start, reused across all streaming sessions — Section 19.1; libswscale Context is rebuilt only on a frame-dimensions change); plus ~4 MiB per peer's str0m::Rtc + 128 KiB SCTP buffer + small ICE state; plus ~512 KiB governor DashMap (Section 13.7); plus a 256-slot mpsc holding at most ~256 × ~50 KiB worst-case AU payloads ≈ ~13 MiB transient; plus a 1-slot watch holding one ~2.7 MiB 720p RGB frame; plus headroom for glibc-malloc arena retention drift over multi-day uptime. Worst-case live working set at 50 concurrent viewers is ~333 MiB; the 2 GiB cap leaves ~6× headroom for the expected demo audience (single-digit to low-double-digit viewers). The container is not allowed to grow unbounded — if it ever needs &gt; 2 GiB, the kernel OOM-killer is the loud-failure signal we want.</li>
+  <li><code>--memory 2g</code>, <code>--pids-limit 256</code> — bounded resource limits. The 2 GiB cap is sized for: ~80 MiB baseline (Rust runtime + glibc + dlopen'd libav* shared objects + axum + tokio 4-worker stacks + tracing buffers); plus ~25 MiB for the process-long-lived libavcodec H.264 decoder + libswscale Context owned by the decode-pipeline thread (constructed once at process start, reused across all streaming sessions — Section 19.1; libswscale Context is rebuilt only on a frame-dimensions change); plus ~4 MiB per peer's str0m::Rtc + 128 KiB SCTP buffer + small ICE state; plus ~512 KiB governor DashMap (Section 13.7); plus a 256-slot mpsc holding at most ~256 × ~50 KiB worst-case AU payloads ≈ ~13 MiB transient; plus a 1-slot watch holding one ~2.7 MiB 720p RGB frame; plus headroom for glibc-malloc arena retention drift over multi-day uptime. Worst-case live working set at 50 concurrent viewers is ~333 MiB; the 2 GiB cap leaves ~6× headroom for the expected demo audience (single-digit to low-double-digit viewers). The container is not allowed to grow unbounded — if it ever needs &gt; 2 GiB, the kernel OOM-killer is the loud-failure signal we want.</li>
   <li><code>-e MALLOC_ARENA_MAX=2</code> — Caps glibc's per-thread arena count at 2 shared arenas instead of the platform default <code>8 × CPU_count</code> (which on the host's Intel Core Ultra 9 285K with 24 cores would default to ~192 arenas). Independent benchmarks on Tokio multi-thread workloads with high-frequency short-lived allocations — exactly our per-frame RGB + JPEG + Packet::copy + Arc-bump pattern — show 4–8× reduction in resident-set drift versus the default arena count. Without this, arena drift on this workload is ~30–50 MiB per 24 hours; with it, drift drops to ~5–15 MiB per 24 hours. The practical effect is that safe continuous uptime extends from ~30 days at the documented upper drift bound (before approaching the 2 GiB cap and triggering OOM-kill + auto-restart) to ~120+ days. No design surface change; purely a glibc tuning knob (verified at <code>https://www.gnu.org/software/libc/manual/html_node/Tunables-and-Glibc.html</code> — MALLOC_ARENA_MAX is the canonical knob for this).</li>
   <li><code>--log-driver json-file --log-opt max-size=10m --log-opt max-file=3 --log-opt compress=true</code> — caps log volume at ~30 MiB.</li>
 </ul>
@@ -6299,12 +6342,13 @@ async fn e2e_pipeline_keyframe_box_drain() -&gt; Result&lt;()&gt; {
 
     let (fsm_tx, fsm_rx) = tokio::sync::mpsc::channel::&lt;FsmCommand&gt;(256);
     let (phase_tx, phase_rx) = watch::channel(PhaseKind::Idle);
-    // spawn_sfu_for_test wires the entire three-task pipeline internally
-    // (SFU + decode + LA client) using the same channel topology as
-    // production §11.3, with la_host/la_port/etc. routed through TestCfg.
-    // Returns a single JoinHandle that resolves when ALL THREE tasks are
-    // done. The au_tx/au_rx and rgb_tx/rgb_rx channels live entirely inside
-    // the helper; the test does not need to construct them.
+    // spawn_sfu_for_test wires the production pipeline internally: the SFU
+    // actor and LA client as tokio tasks, PLUS the decode pipeline as a
+    // dedicated OS thread (§11.3 — the libswscale Context is !Send), using
+    // the same channel topology as production, with la_host/la_port/etc.
+    // routed through TestCfg. Returns a Future that resolves when both tasks
+    // AND the decode thread are done. The au_tx/au_rx and rgb_tx/rgb_rx
+    // channels all live inside the helper; the test does not construct them.
     let sfu_handle: JoinHandle&lt;Result&lt;()&gt;&gt; = tokio::spawn(spawn_sfu_for_test(
         sfu_udp, fsm_rx, phase_tx, TestCfg {
             la_host:     "127.0.0.1".into(),
@@ -6424,7 +6468,7 @@ async fn collect_phase_sequence(
 
 <p>The module exposes:</p>
 <ul>
-  <li><code>spawn_sfu_for_test(socket: UdpSocket, fsm_rx, phase_tx, cfg: TestCfg) -&gt; impl Future&lt;Output = anyhow::Result&lt;()&gt;&gt; + Send + 'static</code>: this helper wires the ENTIRE three-task production pipeline (SFU actor + decode-pipeline + LA WebSocket client per §11.3) using the same channel topology as production — the AU mpsc and the RGB watch live inside the helper. Routes LA host/port/auth-secret/public-host through an explicit struct rather than parsing them from clap. The returned Future joins all three internal tasks (e.g., via <code>tokio::try_join!</code>) so a failure in ANY of them propagates as the helper's <code>anyhow::Result</code>. <strong>The <code>Send + 'static</code> bound is load-bearing</strong> — <code>tokio::spawn</code> requires it even under <code>flavor = "current_thread"</code> (verified at <code>tokio-src/tokio/src/task/spawn.rs:174</code>). The implementation must use only <code>Send</code> types internally (no <code>Rc</code>, no <code>RefCell</code>; <code>Arc</code> + <code>Mutex</code> if shared state is needed).</li>
+  <li><code>spawn_sfu_for_test(socket: UdpSocket, fsm_rx, phase_tx, cfg: TestCfg) -&gt; impl Future&lt;Output = anyhow::Result&lt;()&gt;&gt; + Send + 'static</code>: this helper wires the production pipeline — the SFU actor and the LA WebSocket client as tokio tasks, PLUS the decode pipeline as a dedicated OS thread (§11.3) — using the same channel topology as production: the AU mpsc and the RGB watch live inside the helper. Routes LA host/port/auth-secret/public-host through an explicit struct rather than parsing them from clap. The returned Future joins the two tokio tasks (e.g., via <code>tokio::try_join!</code>) and joins the decode OS thread via <code>spawn_blocking(move || decode_thread.join())</code>, so a failure in ANY of them propagates as the helper's <code>anyhow::Result</code>. <strong>The <code>Send + 'static</code> bound applies to the two tokio tasks</strong> (<code>tokio::spawn</code> requires it — verified at <code>tokio-src/tokio/src/task/spawn.rs:174</code>) but NOT to the decode pipeline, which is a <code>std::thread</code> PRECISELY because its libswscale <code>scaling::Context</code> is <code>!Send</code> (§11.3); the two tokio tasks use only <code>Send</code> types (no <code>Rc</code>/<code>RefCell</code>).</li>
   <li><code>attach_and_extract_creds(fsm_tx, peer_id, Role) -&gt; Result&lt;PeerCreds&gt;</code>: synthesizes an <code>FsmCommand::AttachStreamer</code> (or <code>AttachViewer</code>) carrying an internally-constructed <code>Rtc</code>, then returns that Rtc's <code>local_dtls_fingerprint()</code>, <code>local_ice_credentials()</code>, and the SFU's local UDP <code>SocketAddr</code>. This is the integration-test analogue of the production WS handler's "build Rtc, call accept_offer, send AttachStreamer" sequence in Section 11.8 steps 3-7. Putting it in <code>test_support</code> keeps the WS handler's SDP-parsing path untouched while still exercising the FSM's AttachStreamer/AttachViewer code path.</li>
   <li><code>Role::{Streamer, Viewer}</code> enum.</li>
   <li><code>TestCfg { la_host: String, la_port: u16, auth_secret: String, public_host: String }</code> struct.</li>
