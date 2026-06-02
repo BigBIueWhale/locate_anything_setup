@@ -1766,7 +1766,17 @@ let (fsm_tx, fsm_rx) = tokio::sync::mpsc::channel::&lt;FsmCommand&gt;(256);
 // Phase fan-out to viewer WS tasks for observation.
 let (phase_tx, phase_rx) = tokio::sync::watch::channel(Phase::Idle);
 
-tokio::spawn(run_sfu(udp_socket, fsm_rx, phase_tx));
+// H.264 access-unit channel: SFU → decode-pipeline task (Section 19.1).
+// Capacity 256 ≈ 8.5 s @ 30 fps; non-coalescing, in-order.
+let (au_tx, au_rx) = tokio::sync::mpsc::channel::&lt;std::sync::Arc&lt;[u8]&gt;&gt;(256);
+
+// RGB frame channel: decode-pipeline → LA-WS-client task (Section 19.1).
+// 1-slot watch; coalescing safe because each RGB frame is self-contained.
+let (rgb_tx, rgb_rx) = tokio::sync::watch::channel::&lt;Option&lt;RgbFrame&gt;&gt;(None);
+
+tokio::spawn(run_sfu(udp_socket, fsm_rx, phase_tx, au_tx));
+tokio::spawn(run_decode_pipeline(au_rx, rgb_tx, fsm_tx.clone()));
+tokio::spawn(run_la_client(rgb_rx, fsm_tx.clone(), /* la host:port, prompt, mode */ /* ... */));
 </code></pre>
 
 <p>The run task:</p>
@@ -1774,6 +1784,7 @@ tokio::spawn(run_sfu(udp_socket, fsm_rx, phase_tx));
     socket: tokio::net::UdpSocket,
     mut rx: tokio::sync::mpsc::Receiver&lt;FsmCommand&gt;,
     phase_tx: tokio::sync::watch::Sender&lt;Phase&gt;,
+    au_tx:   tokio::sync::mpsc::Sender&lt;std::sync::Arc&lt;[u8]&gt;&gt;,
 ) -&gt; anyhow::Result&lt;()&gt; {
     use std::num::NonZeroU32;
     use std::time::Duration;
@@ -1803,6 +1814,7 @@ tokio::spawn(run_sfu(udp_socket, fsm_rx, phase_tx));
         socket,
         local_addr,
         stun_rate_limiter,
+        au_tx,
     };
 
     let mut tick = tokio::time::interval(Duration::from_millis(100));
@@ -1956,6 +1968,12 @@ pub struct Sfu {
     /// changes for the lifetime of the socket.
     pub local_addr:          std::net::SocketAddr,
     pub stun_rate_limiter:   RateLimiter&lt;IpAddr, DashMapStateStore&lt;IpAddr&gt;, DefaultClock&gt;,
+    /// Sender side of the bounded H.264 access-unit channel to the
+    /// decode-pipeline task (Section 19.1 step 1). The matching Receiver
+    /// is owned exclusively by that task. Capacity 256 (~8.5 s at 30 fps).
+    /// `try_send` returns `Err(Full)` if the decoder is wedged; the SFU
+    /// propagates this as anyhow::Error per the no-fallback rule.
+    pub au_tx:               tokio::sync::mpsc::Sender&lt;std::sync::Arc&lt;[u8]&gt;&gt;,
 }
 </code></pre>
 
@@ -1964,6 +1982,7 @@ pub struct Sfu {
   <li>The <code>video_mid: Option&lt;Mid&gt;</code> and <code>boxes_cid: Option&lt;ChannelId&gt;</code> are the load-bearing guards for the Option α reconnect sequence (Section 11.8 step 8) — both must be <code>Some</code> before a peer is a forwarding target.</li>
   <li>Each <code>Rtc</code> in <code>Vec&lt;Client&gt;</code> is independently <code>Send + Sync</code> (verified prior research), but the whole <code>Sfu</code> is owned by a single Tokio task (Section 11.3) so the actor pattern guarantees unique mutable access; no <code>Mutex</code> is needed.</li>
   <li><code>channel_open_at</code> is set in Section 11.8 step 8 on receipt of <code>Event::ChannelOpen</code>; it is otherwise advisory (not used by any control flow).</li>
+  <li><code>au_tx</code> is bounded (capacity 256); the matching Receiver lives in the decode-pipeline task and is the sole consumer. <code>try_send</code> on a full channel is the deliberate loud-drop signal (Section 19.1 step 1).</li>
 </ul>
 
 <h3>11.5.1 FsmCommand enumeration</h3>
@@ -2090,7 +2109,13 @@ impl Sfu {
     ///
     /// Per-viewer failures are isolated. We never propagate up — that
     /// would kill the streamer because one viewer's UDP path died.
+    ///
+    /// AU mpsc push to the decode-pipeline task is the OTHER half of this
+    /// handler (Section 19.1 step 1): every AU is sent in arrival order;
+    /// Err(Full) propagates because a wedged decoder is a loud failure,
+    /// not a silent backpressure event.
     fn on_streamer_media_data(&amp;mut self, streamer_id: PeerId, data: &amp;MediaData) -&gt; Result&lt;()&gt; {
+        // (a) Re-publish to every viewer. Per-viewer failures are isolated.
         for viewer in self.clients.iter_mut().filter(|c| c.id != streamer_id) {
             if !viewer.rtc.is_alive() {
                 continue;
@@ -2104,6 +2129,15 @@ impl Sfu {
                 viewer.rtc.disconnect();
             }
         }
+        // (b) Push the same AU to the decode-pipeline task. In-order,
+        // non-coalescing; `data.data` is `Arc&lt;[u8]&gt;` so the clone is a
+        // reference-count bump, not a byte-copy.
+        self.au_tx.try_send(data.data.clone())
+            .with_context(|| format!(
+                "AU mpsc push (cap=256) for streamer {} — Full means the \
+                 decode pipeline has wedged for ≳8.5 s; disconnecting streamer",
+                streamer_id
+            ))?;
         Ok(())
     }
 }
@@ -3663,7 +3697,7 @@ Without this sequence, the browser learns of disconnect only via ICE consent-fre
 
 <p><strong>PLI emission is fully event-driven; no application-level throttle is needed.</strong> Two structural rate-caps already sit below the SFU's application code:</p>
 <ul>
-  <li>str0m's <code>pending_request_keyframe: Option&lt;KeyframeRequestKind&gt;</code> field at <code>src/streams/receive.rs:80</code> collapses multiple <code>request_keyframe()</code> calls into one PLI per 50-millisecond TWCC pass.</li>
+  <li>str0m's <code>pending_request_keyframe: Option&lt;KeyframeRequestKind&gt;</code> field at <code>src/streams/receive.rs:80</code> is single-slot: <code>request_keyframe()</code> at <code>:221-222</code> ASSIGNS (<code>= Some(kind)</code>), so multiple calls within one drain window collapse to the most recent. The field is drained inside <code>Session::handle_timeout</code> (<code>src/session.rs:226-258</code>); the dominant recurring wakeup is the 50-millisecond <code>TWCC_INTERVAL</code> at <code>src/session.rs:42</code>, so the wall-clock cap on outbound PLI is ≤ one per ~50 ms.</li>
   <li>libwebrtc's <code>kMinKeyframeSendIntervalMs = 300</code> at <code>video/encoder_rtcp_feedback.cc:23-24</code> drops any PLI received within 300 ms of the last emitted IDR — the streamer's encoder physically cannot produce IDRs faster than ~3.3 / second regardless of the SFU's request rate.</li>
 </ul>
 <p>An application-level throttle on top of these two structural floors would be a third redundant layer with no behavioral effect; we omit it to honor the no-overengineered-options principle of Section 3. New-viewer attach (Section 11.7) and the <code>!contiguous</code> recovery path are the only PLI emitters.</p>
@@ -3781,13 +3815,21 @@ Result: approximately 8 to 15 milliseconds per 720p frame at quality 92 on a typ
 
 <p>The WebSocket connection to the LocateAnything-3B server can drop (LocateAnything-3B server restart, transient network blip on the LAN, the 05:00 router cycle). The client task wraps <code>tokio_tungstenite::connect_async</code> plus the send-loop in an outer <code>loop</code> with exponential-backoff retry: 500 milliseconds, 1 second, 2 seconds, 4 seconds, 8 seconds, capped at 10 seconds. No mid-frame retry; no buffering.</p>
 
-<p><strong>Keepalive ping during long Idle periods.</strong> The LocateAnything-3B server enforces a 60-second read-idle close (verified at <code>/home/user/Desktop/locate_anything_setup/docs/CLIENT_PROTOCOL.md:283</code> — Close code 1001 "server shutdown / 60 s read-idle"). The demo server's default state is <code>Idle</code> (no streamer), during which no frames are sent to LocateAnything-3B; without explicit keepalive the LA server's read-idle timer fires and silently 1001s the connection, then the first frame of the next streamer claim hits a reconnect-storm that drops ~500-2000 ms of streamer video. The LA WebSocket client task therefore sends a RFC 6455 <code>Message::Ping(Bytes::new())</code> on a 30-second interval while not actively sending frames. RFC 6455 Pings/Pongs are handled transparently by both <code>tokio-tungstenite</code> (sender side) and the LA server's underlying axum WS handler (receiver side); no application-level pong-tracking code is needed. Implementation shape:</p>
+<p><strong>Keepalive ping during long Idle periods.</strong> The LocateAnything-3B server enforces a 60-second read-idle close (verified at <code>/home/user/Desktop/locate_anything_setup/docs/CLIENT_PROTOCOL.md:294</code> — Close code 1001 "server shutdown / 60 s read-idle"). The demo server's default state is <code>Idle</code> (no streamer), during which no frames are sent to LocateAnything-3B; without explicit keepalive the LA server's read-idle timer fires and silently 1001s the connection, then the first frame of the next streamer claim hits a reconnect-storm that drops ~500-2000 ms of streamer video. The LA WebSocket client task therefore sends a RFC 6455 <code>Message::Ping(Bytes::new())</code> on a 30-second interval while not actively sending frames. RFC 6455 Pings/Pongs are handled transparently by both <code>tokio-tungstenite</code> (sender side) and the LA server's underlying axum WS handler (receiver side); no application-level pong-tracking code is needed. Implementation shape:</p>
 <pre><code>let mut keepalive = tokio::time::interval(Duration::from_secs(30));
 keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 loop {
     tokio::select! {
         biased;
-        Ok(()) = jpeg_rx.changed() =&gt; {
+        // Note: non-refutable binding. If the watch Sender is dropped (decoder
+        // task gone), `changed()` returns Err(RecvError) and propagates via `?`
+        // — the LA task exits loud. A refutable `Ok(()) = ...` pattern would
+        // SILENTLY DISABLE the branch on close (per tokio's select! macro at
+        // src/macros/select.rs:46, 85-87) and the task would hang waiting on
+        // the next keepalive tick — exactly the fail-silent mode Section 3
+        // forbids.
+        result = jpeg_rx.changed() =&gt; {
+            result.context("decoder pipeline closed unexpectedly")?;
             let frame = jpeg_rx.borrow_and_update().clone();
             send_frame(&amp;mut ws, frame).await
                 .context("send JPEG frame to LA")?;
@@ -4027,7 +4069,7 @@ let pc = web_sys::RtcPeerConnection::new_with_configuration(&amp;cfg)
   <li><strong>Use <code>KeyframeRequestKind::Pli</code></strong> (Picture Loss Indication), NOT <code>Fir</code> (Full Intra Request). FIR is reserved for mixer/composition scenarios per RFC 5104 and is explicitly disallowed for loss recovery. <strong>The str0m example file <code>examples/chat.rs:444</code> uses <code>Fir</code>; this is wrong per the RFC; the implementation agent MUST use Pli.</strong></li>
   <li><strong>PLI emitter #1 — new-viewer attach.</strong> Proactively send a Picture Loss Indication to the streamer when a new viewer's outbound video is ready, saving approximately one round-trip-time of black frames at the viewer's start. Implementation: when an <code>Event::MediaAdded</code> fires for a viewer Rtc's outbound video <code>Mid</code>, look up the streamer Rtc, find the inbound video stream, call <code>streamer_rtc.writer(STREAMER_VIDEO_MID).request_keyframe(None, KeyframeRequestKind::Pli)</code>.</li>
   <li><strong>PLI emitter #2 — decoder-loss recovery.</strong> The decode-pipeline task (Section 19.1) observes <code>MediaData.contiguous == false</code> when str0m's depacketizer has exhausted its hold-back window without recovering a lost packet via NACK/RTX. The task calls <code>decoder.flush()</code> AND emits one <code>KeyframeRequestKind::Pli</code> upstream to the streamer via an <code>FsmCommand::RequestStreamerPli</code> to the FSM. This is the str0m reference pattern (<code>examples/chat.rs:442-445</code>) verbatim — one event-driven PLI per packet-loss recovery event.</li>
-  <li><strong>No periodic scheduler, no application-level throttle.</strong> Two structural rate caps already sit below the SFU's application code: <strong>(i)</strong> str0m's <code>pending_request_keyframe: Option&lt;KeyframeRequestKind&gt;</code> field at <code>src/streams/receive.rs:80</code> coalesces redundant <code>request_keyframe()</code> calls into one PLI per 50-millisecond TWCC pass, and <strong>(ii)</strong> libwebrtc's <code>kMinKeyframeSendIntervalMs = 300</code> at <code>video/encoder_rtcp_feedback.cc:23-24</code> drops any PLI received within 300 ms of the last emitted IDR. The streamer's encoder physically cannot produce IDRs faster than ~3.3/second regardless of how many PLIs we issue. An application-level throttle on top of these two structural floors would be a third redundant layer with no behavioral effect; omitting it honors the no-overengineered-options principle of Section 3.</li>
+  <li><strong>No periodic scheduler, no application-level throttle.</strong> Two structural rate caps already sit below the SFU's application code: <strong>(i)</strong> str0m's <code>pending_request_keyframe: Option&lt;KeyframeRequestKind&gt;</code> field at <code>src/streams/receive.rs:80</code> is single-slot — <code>request_keyframe()</code> assigns, so multiple calls within one drain window collapse; the drain is inside <code>Session::handle_timeout</code> (<code>src/session.rs:226-258</code>) and the dominant recurring wakeup is the 50-millisecond <code>TWCC_INTERVAL</code> (<code>src/session.rs:42</code>), so the wall-clock cap on outbound PLI is ≤ one per ~50 ms. <strong>(ii)</strong> libwebrtc's <code>kMinKeyframeSendIntervalMs = 300</code> at <code>video/encoder_rtcp_feedback.cc:23-24</code> drops any PLI received within 300 ms of the last emitted IDR. The streamer's encoder physically cannot produce IDRs faster than ~3.3/second regardless of how many PLIs we issue. An application-level throttle on top of these two structural floors would be a third redundant layer with no behavioral effect; omitting it honors the no-overengineered-options principle of Section 3.</li>
   <li><strong>No periodic IDR cadence imposed by the demo server.</strong> The browser's encoder emits IDRs on its own natural cadence (libwebrtc default <code>keyFrameInterval = 3000</code> frames per <code>api/video_codecs/video_encoder.cc:36</code>, ≈ 100 seconds at 30 fps), plus on the two event-driven triggers above. Sampling to LocateAnything-3B is driven by LA's own per-frame latency via the watch-channel pattern (Section 19.1); the demo server runs no timer-driven PLI loop.</li>
 </ul>
 
@@ -5423,7 +5465,7 @@ done
   <li><code>--security-opt no-new-privileges</code> — a <code>setuid</code> ELF can never gain privileges back.</li>
   <li><code>--user "$(id -u):$(id -g)"</code> — runs the container process as the operator's UID/GID. Files written to the bind-mount (cert.pem, key.pem, cert.metadata.json) are owned by the operator on the host, so they can be inspected/backed-up/regenerated via normal user commands without sudo. The Dockerfile creates a <code>lawebsite</code> user inside the image for file-ownership defaults at build time; the <code>--user</code> override at runtime supersedes that.</li>
   <li><code>-v "${STATE_DIR_HOST}":/var/lib/la-website</code> — bind-mounts <code>./website/.runtime/state/</code> on the host onto the binary's hardcoded <code>STATE_DIR</code> inside the container. The host-side directory was created with mode 0700 by setup.sh (Section 24.7).</li>
-  <li><code>--memory 2g</code>, <code>--pids-limit 256</code> — bounded resource limits. The 2 GiB cap is sized for: ~80 MiB baseline (Rust runtime + glibc + dlopen'd libav* shared objects + axum + tokio 4-worker stacks + tracing buffers); plus ~25 MiB for the long-lived libavcodec H.264 decoder + libswscale Context owned by the decode-pipeline task (one set per streaming session — Section 19.1); plus ~4 MiB per peer's str0m::Rtc + 128 KiB SCTP buffer + small ICE state; plus ~512 KiB governor DashMap (Section 13.7); plus a 256-slot mpsc holding at most ~256 × ~50 KiB worst-case AU payloads ≈ ~13 MiB transient; plus headroom for glibc-malloc arena retention drift over multi-day uptime (~30–50 MiB per 24 hours of churn on this workload, dominated by per-frame Vec allocations in mozjpeg + Packet::copy + Arc bumps). Worst-case live working set at 50 concurrent viewers is ~330 MiB; the 2 GiB cap leaves ~6× headroom for the expected demo audience (single-digit to low-double-digit viewers). The container is not allowed to grow unbounded — if it ever needs &gt; 2 GiB, the kernel OOM-killer is the loud-failure signal we want.</li>
+  <li><code>--memory 2g</code>, <code>--pids-limit 256</code> — bounded resource limits. The 2 GiB cap is sized for: ~80 MiB baseline (Rust runtime + glibc + dlopen'd libav* shared objects + axum + tokio 4-worker stacks + tracing buffers); plus ~25 MiB for the process-long-lived libavcodec H.264 decoder + libswscale Context owned by the decode-pipeline task (constructed once at process start, reused across all streaming sessions — Section 19.1; libswscale Context is rebuilt only on a frame-dimensions change); plus ~4 MiB per peer's str0m::Rtc + 128 KiB SCTP buffer + small ICE state; plus ~512 KiB governor DashMap (Section 13.7); plus a 256-slot mpsc holding at most ~256 × ~50 KiB worst-case AU payloads ≈ ~13 MiB transient; plus a 1-slot watch holding one ~2.7 MiB 720p RGB frame; plus headroom for glibc-malloc arena retention drift over multi-day uptime (~30–50 MiB per 24 hours of churn on this workload, dominated by per-frame RGB and JPEG allocations + Packet::copy + Arc bumps). Worst-case live working set at 50 concurrent viewers is ~333 MiB; the 2 GiB cap leaves ~6× headroom for the expected demo audience (single-digit to low-double-digit viewers). The container is not allowed to grow unbounded — if it ever needs &gt; 2 GiB, the kernel OOM-killer is the loud-failure signal we want.</li>
   <li><code>--log-driver json-file --log-opt max-size=10m --log-opt max-file=3 --log-opt compress=true</code> — caps log volume at ~30 MiB.</li>
 </ul>
 
