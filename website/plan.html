@@ -1733,9 +1733,9 @@ fn canonical_templates_match_prompts_py_byte_for_byte() {
   <li><strong>Idle.</strong> No streamer is active. Any user can claim the slot. Viewers may or may not be connected, but they will see no video until a streamer claims.</li>
   <li><strong>Claimed.</strong> A user has just sent <code>SignalMessage::Claim</code>; the server has accepted and is awaiting the Session Description Protocol offer and the first Real-time Transport Protocol packet. Timeout: 10 seconds.</li>
   <li><strong>Streaming.</strong> Real-time Transport Protocol packets are flowing from the streamer; the Selective Forwarding Unit is republishing to viewers; the decode/JPEG/LA pipeline is producing bounding boxes that fan out via DataChannel. Watchdog timeouts: no Real-time Transport Protocol for 5 seconds → Draining; signaling WebSocket keepalive miss → Draining; Interactive Connectivity Establishment Disconnected → Draining.</li>
-  <li><strong>Draining.</strong> The streamer is leaving. On entry the server writes a "bye" DataChannel message to every connected peer, pumps <code>poll_output</code> a few times to flush, then calls <code>Rtc::disconnect()</code> on each — <strong>viewers are torn down immediately</strong> (they cannot watch a gone streamer; their own reconnect loops re-attach them once a streamer is live again — §1 data-flow item 9). The server RETAINS only the streamer slot (<code>owner</code> + <code>session_id</code>) so a <code>ResumeSession</code> can validate against it. New <code>Claim</code> messages are rejected with <code>SignalMessage::Error(code: "draining")</code> throughout. <strong>Two-class timeout</strong> (the deciding bit is <code>drain_resume_eligible</code>, set on entry — §11.5):
+  <li><strong>Draining.</strong> The streamer is leaving. On entry the server writes a "bye" DataChannel message to every connected peer, pumps <code>poll_output</code> a few times to flush, then calls <code>Rtc::disconnect()</code> on each — <strong>viewers are torn down immediately</strong> (they cannot watch a gone streamer; their own reconnect loops re-attach them once a streamer is live again — §1 data-flow item 9). The server RETAINS the streamer slot — the <code>Streamer</code> (peer_id + session_id) carried inside <code>Phase::Draining</code> — so a <code>ResumeSession</code> can validate against it. New <code>Claim</code> messages are rejected with <code>SignalMessage::Error(code: "draining")</code> throughout. <strong>Two-class timeout</strong> (the deciding bit is the <code>Resume</code> field on <code>Phase::Draining</code>, set on entry — §11.5):
     <ul>
-      <li><strong>Unintentional streamer drop</strong> (5 s RTP gap / ICE Disconnected / keepalive miss / bare network WS-close): resume-eligible. Held for <code>DRAIN_TIMEOUT</code> (30 s). A <code>ResumeSession</code> matching the retained <code>session_id</code> cancels the drain and re-enters <strong>Claimed</strong> (Option α rebuilds the <code>RTCPeerConnection</code>, so a fresh offer + first-RTP handshake follows — §11.8); if 30 s elapses with no matching resume, <code>owner</code> + <code>session_id</code> are cleared and the FSM goes to Idle.</li>
+      <li><strong>Unintentional streamer drop</strong> (5 s RTP gap / ICE Disconnected / keepalive miss / bare network WS-close): resume-eligible. Held for <code>DRAIN_TIMEOUT</code> (30 s). A <code>ResumeSession</code> matching the retained <code>session_id</code> cancels the drain and re-enters <strong>Claimed</strong> (Option α rebuilds the <code>RTCPeerConnection</code>, so a fresh offer + first-RTP handshake follows — §11.8); if 30 s elapses with no matching resume, the FSM goes to Idle (the <code>Streamer</code> is dropped when the phase becomes <code>Idle</code>).</li>
       <li><strong>Intentional release</strong> (explicit <code>Bye</code>/Release, prompt-rejection auto-release), <strong>CLAIM_TIMEOUT</strong> (claimer never streamed), and <strong>LaDown</strong>: NOT resume-eligible. Draining lasts only the bye-flush (~800 ms, §18.2), then → Idle, freeing the slot promptly. A <code>ResumeSession</code> in this window returns <code>ResumeExpired</code>.</li>
     </ul>
     "All peers dropped" is NOT itself an Idle trigger — peer drop is the normal Draining state; only the deadline (or a matching resume cancelling it) ends Draining.</li>
@@ -1748,7 +1748,7 @@ fn canonical_templates_match_prompts_py_byte_for_byte() {
   <tr><td>Claimed → Streaming</td><td>First Real-time Transport Protocol packet received from the claimer's WebRTC peer</td><td>n/a (immediate)</td></tr>
   <tr><td>Claimed → Draining</td><td>No Real-time Transport Protocol from claimer within 10 seconds of accept</td><td>10 seconds (<code>CLAIM_TIMEOUT</code>)</td></tr>
   <tr><td>Streaming → Draining</td><td>WebSocket close from streamer; OR no Real-time Transport Protocol from streamer for 5 seconds; OR <code>IceConnectionStateChange::Disconnected</code> event from str0m; OR signaling-WebSocket keepalive miss (see below); OR explicit <code>Bye</code> from streamer; OR <code>FsmCommand::LaDown</code> while in Streaming (Section 19.4)</td><td>5 seconds RTP gap (<code>RTP_TIMEOUT</code>); ~21.5 seconds ICE consent freshness (str0m's reduced timeout vs RFC 7675's nominal 30 s; see Section 20.11); 30 seconds signaling-WS keepalive (<code>KEEPALIVE_TIMEOUT</code>)</td></tr>
-  <tr><td>Draining → Idle</td><td>The drain <code>deadline</code> is reached with no matching <code>ResumeSession</code> having arrived (a matching resume cancels the drain instead — see Draining state in §11.1). <strong>"All client peer connections dropped" is NOT a trigger</strong> — peer drop is the normal Draining state (we disconnect viewers on entry, and the streamer's peer is the one that dropped); only the deadline ends Draining.</td><td>Resume-eligible drains (unintentional streamer drop): <strong>30 s (<code>DRAIN_TIMEOUT</code>)</strong> — sized to cover an iPhone WiFi↔cellular handover (~1–3 s re-attach plus ICE consent freshness of ~21.5 s per Section 20.11) so a streamer mid-handover can <code>ResumeSession</code> back into the still-Draining FSM rather than losing ownership. Tightening DRAIN_TIMEOUT below 25 s would cause iOS-on-cellular streamers to lose their slot on every Wi-Fi→cellular transition, contradicting the user's "if anybody disconnects, server cleanly reverts" requirement (where "cleanly" includes survival of common handovers). Non-resume-eligible drains (explicit Bye/Release, prompt-rejection auto-release, CLAIM_TIMEOUT, LaDown): a short bye-flush budget only (~800 ms, §18.2), then Idle — so a clean release frees the slot for the next claimant promptly rather than blocking it for 30 s.</td></tr>
+  <tr><td>Draining → Idle</td><td>The drain <code>until</code> instant is reached with no matching <code>ResumeSession</code> having arrived (a matching resume cancels the drain instead — see Draining state in §11.1). <strong>"All client peer connections dropped" is NOT a trigger</strong> — peer drop is the normal Draining state (we disconnect viewers on entry, and the streamer's peer is the one that dropped); only the deadline ends Draining.</td><td>Resume-eligible drains (unintentional streamer drop): <strong>30 s (<code>DRAIN_TIMEOUT</code>)</strong> — sized to cover an iPhone WiFi↔cellular handover (~1–3 s re-attach plus ICE consent freshness of ~21.5 s per Section 20.11) so a streamer mid-handover can <code>ResumeSession</code> back into the still-Draining FSM rather than losing ownership. Tightening DRAIN_TIMEOUT below 25 s would cause iOS-on-cellular streamers to lose their slot on every Wi-Fi→cellular transition, contradicting the user's "if anybody disconnects, server cleanly reverts" requirement (where "cleanly" includes survival of common handovers). Non-resume-eligible drains (explicit Bye/Release, prompt-rejection auto-release, CLAIM_TIMEOUT, LaDown): a short bye-flush budget only (~800 ms, §18.2), then Idle — so a clean release frees the slot for the next claimant promptly rather than blocking it for 30 s.</td></tr>
 </table>
 
 <h4>11.2.1 Signaling-WebSocket keepalive protocol</h4>
@@ -1772,8 +1772,9 @@ fn canonical_templates_match_prompts_py_byte_for_byte() {
 <pre><code>// All FSM input flows through this channel. Capacity 256 absorbs bursts.
 let (fsm_tx, fsm_rx) = tokio::sync::mpsc::channel::&lt;FsmCommand&gt;(256);
 
-// Phase fan-out to viewer WS tasks for observation.
-let (phase_tx, phase_rx) = tokio::sync::watch::channel(Phase::Idle);
+// Phase-discriminant fan-out to viewer WS tasks for observation (PhaseKind
+// only — the rich Phase, with its session_id, never leaves the SFU actor).
+let (phase_tx, phase_rx) = tokio::sync::watch::channel(PhaseKind::Idle);
 
 // H.264 access-unit channel: SFU → decode-pipeline task (Section 19.1).
 // Capacity 256 frames; non-coalescing, in-order. Sized as "many frames",
@@ -1797,7 +1798,7 @@ tokio::spawn(run_la_client(rgb_rx, fsm_tx.clone(), /* la host:port, prompt, mode
 <pre><code>async fn run_sfu(
     socket: tokio::net::UdpSocket,
     mut rx: tokio::sync::mpsc::Receiver&lt;FsmCommand&gt;,
-    phase_tx: tokio::sync::watch::Sender&lt;Phase&gt;,
+    phase_tx: tokio::sync::watch::Sender&lt;PhaseKind&gt;,
     au_tx:   tokio::sync::mpsc::Sender&lt;std::sync::Arc&lt;[u8]&gt;&gt;,
 ) -&gt; anyhow::Result&lt;()&gt; {
     use std::num::NonZeroU32;
@@ -1817,12 +1818,6 @@ tokio::spawn(run_la_client(rgb_rx, fsm_tx.clone(), /* la host:port, prompt, mode
 
     let mut sfu = Sfu {
         phase:              Phase::Idle,
-        owner:              None,
-        session_id:         None,
-        claim_deadline:     None,
-        rtp_deadline:       None,
-        drain_deadline:     None,
-        drain_resume_eligible: false,
         clients:            Vec::new(),
         la_reachable:       true,
         la_last_error:      None,
@@ -1875,12 +1870,17 @@ tokio::spawn(run_la_client(rgb_rx, fsm_tx.clone(), /* la host:port, prompt, mode
 // SFU actor task, iteration N:
 //   tokio::select! { biased; cmd = rx.recv() =&gt; ... } selects the Claim from A.
 //   Synchronous handle_claim():
-//       if self.phase == Idle {
-//           self.phase = Claimed { owner: A, deadline: now+10s };
-//           self.owner = Some(A);
-//           // … mint a random session_id …
-//           self.session_id = Some(session_id.clone()); // authoritative copy for handle_resume
-//           oA.send(ClaimResult::Granted{ session_id }).expect("...");
+//       if matches!(self.phase, Phase::Idle) {
+//           // Mint a random session_id, then build the phase in ONE move — owner +
+//           // session_id live inside Streamer, so there is no separate self.owner /
+//           // self.session_id to set (and therefore nothing to keep in sync):
+//           let session_id = mint_session_id();
+//           self.phase = Phase::Claimed {
+//               streamer: Streamer { peer_id: A, session_id: session_id.clone() },
+//               deadline: now + CLAIM_TIMEOUT,
+//           };
+//           let _ = self.phase_tx.send(self.phase.kind());
+//           let _ = oA.send(ClaimResult::Granted{ session_id });
 //           // No .await between phase check and phase set: TOCTOU-free.
 //       } else {
 //           let code = match self.phase {
@@ -1894,7 +1894,7 @@ tokio::spawn(run_la_client(rgb_rx, fsm_tx.clone(), /* la host:port, prompt, mode
 
 // SFU actor task, iteration N+1:
 //   Receives Claim from B.
-//   self.phase == Claimed (set by iteration N): reject with code error_code::OWNED.
+//   self.phase is Phase::Claimed (set by iteration N): reject with code error_code::OWNED.
 //   oB.send(ClaimResult::Rejected{ code: error_code::OWNED, ... })
 
 // SFU actor task, iteration N+2:
@@ -1903,7 +1903,7 @@ tokio::spawn(run_la_client(rgb_rx, fsm_tx.clone(), /* la host:port, prompt, mode
 
 <p>The three WebSocket handler tasks each receive a different <code>ClaimResult</code> — exactly one <code>Granted</code> (to A), two <code>Rejected</code> (to B and C). No race condition because the FSM is single-task and synchronous between <code>select!</code> arms; the test "is phase Idle?" and the write "phase := Claimed" are in the same straight-line block of code.</p>
 
-<p><strong>What would break this:</strong> introducing an <code>.await</code> between the phase check and the phase set — e.g., <code>let auth_ok = state.verify_token(...).await; if self.phase == Idle &amp;&amp; auth_ok { ... }</code>. The cancellation point would allow a second Claim to interleave. Mitigation rule for the implementation agent: <strong>no <code>.await</code> inside <code>handle()</code>'s match arms</strong>. All await-able work (e.g., constructing the actual WebRTC <code>Rtc</code>; doing the LocateAnything-3B <code>/v1/capabilities</code> cross-check; resolving DNS) happens BEFORE the Claim arrives at the FSM — at WebSocket-handler-task level, not at FSM-actor-task level. The FSM actor task does cheap, synchronous, never-await state transitions only.</p>
+<p><strong>What would break this:</strong> introducing an <code>.await</code> between the phase check and the phase set — e.g., <code>let auth_ok = state.verify_token(...).await; if matches!(self.phase, Phase::Idle) &amp;&amp; auth_ok { ... }</code>. The cancellation point would allow a second Claim to interleave. Mitigation rule for the implementation agent: <strong>no <code>.await</code> inside <code>handle()</code>'s match arms</strong>. All await-able work (e.g., constructing the actual WebRTC <code>Rtc</code>; doing the LocateAnything-3B <code>/v1/capabilities</code> cross-check; resolving DNS) happens BEFORE the Claim arrives at the FSM — at WebSocket-handler-task level, not at FSM-actor-task level. The FSM actor task does cheap, synchronous, never-await state transitions only.</p>
 
 <h3>11.5 Load-bearing types: <code>PeerId</code>, <code>Client</code>, <code>Phase</code>, <code>Sfu</code></h3>
 
@@ -1949,53 +1949,117 @@ pub struct Client {
     /// (logged via tracing::warn!, the Client is removed on the next
     /// `FsmCommand::Disconnect`).
     pub signal_tx:           tokio::sync::mpsc::Sender&lt;protocol::SignalMessage&gt;,
+    /// Wall-clock instant of this connection's last inbound liveness signal
+    /// (any `SignalMessage`, including `Keepalive`). The WS handler bumps it on
+    /// every inbound frame; `drive()` culls a VIEWER whose `last_seen` is older
+    /// than `KEEPALIVE_TIMEOUT` (30 s). Per-connection liveness lives here, NOT
+    /// on `Phase` — the streamer's liveness is already covered by the tighter
+    /// RTP (5 s) and CLAIM (10 s) watchdogs, so the ownership `Phase` needs no
+    /// keepalive field.
+    pub last_seen:           Instant,
 }
 
-/// The four-state ownership FSM phase: Idle / Claimed / Streaming / Draining.
+/// One peer's signaling identity for the streamer slot. `session_id` is the
+/// authoritative copy minted at Claim-grant; it stays a `String` to match the
+/// wire `ResumeSessionMsg` / `ResumeOkMsg` (Section 10) byte-for-byte.
+#[derive(Debug, Clone)]
+pub struct Streamer {
+    pub peer_id:    PeerId,
+    pub session_id: String,
+}
+
+/// Resume policy for a Draining slot. It exists ONLY inside `Phase::Draining`,
+/// so an out-of-Draining resume-eligibility is unrepresentable. `Eligible` is
+/// the 30 s unintentional-drop window (a matching `ResumeSession` cancels the
+/// drain); `Forbidden` is the ~800 ms fast bye-flush of an intentional release,
+/// CLAIM_TIMEOUT, or LaDown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Resume {
+    Eligible,
+    Forbidden,
+}
+
+/// THE single source of truth for the ownership lifecycle. Every datum that
+/// belongs to a state lives INSIDE its variant — the owning `Streamer`
+/// (peer_id + session_id), the per-state deadline, and Draining's `Resume`
+/// policy — so there is nothing to keep in sync and illegal combinations (an
+/// owner with no session, a session with no owner, a resume-policy outside
+/// Draining, a state with a forgotten deadline) are UNREPRESENTABLE. The former
+/// flat `Sfu` mirror fields (`owner`, `session_id`, the three `*_deadline`s,
+/// `drain_resume_eligible`) are deleted; `owner()` / `session_id()` / `kind()`
+/// below are derived projections, never stored.
 ///
-/// `Clone` is required because each transition broadcasts the new phase on a
-/// `tokio::sync::watch` channel (`phase_tx.send(self.phase.clone())`), and
-/// integration tests collect the published sequence via `rx.borrow().clone()`.
-/// `Debug` is required by the `tracing::debug!`/`warn!` formatters across the
-/// codebase. PeerId is u64 (Copy); Instant is Copy; both derives succeed
-/// without manual impls.
-#[derive(Clone, Debug)]
+/// `Clone` is intentionally NOT derived — the phase is only ever moved or
+/// replaced in place (never cloned), and the `watch` broadcast carries the Copy
+/// `PhaseKind` discriminant (via `kind()`), never the rich phase, so a
+/// `session_id` / `peer_id` never leaks to viewer tasks. `Debug` is kept for
+/// the `tracing` formatters.
+#[derive(Debug)]
 pub enum Phase {
     Idle,
-    Claimed   { owner: PeerId, deadline: Instant },
-    Streaming { owner: PeerId, last_rtp: Instant },
-    Draining  { deadline: Instant },
+    Claimed   { streamer: Streamer, deadline: Instant },
+    Streaming { streamer: Streamer, last_rtp: Instant },
+    Draining  { streamer: Streamer, until: Instant, resume: Resume },
+}
+
+impl Phase {
+    /// Current owner's PeerId; `None` only for `Idle`. Derived — never stored.
+    pub fn owner(&amp;self) -&gt; Option&lt;PeerId&gt; {
+        match self {
+            Phase::Idle =&gt; None,
+            Phase::Claimed { streamer, .. }
+            | Phase::Streaming { streamer, .. }
+            | Phase::Draining { streamer, .. } =&gt; Some(streamer.peer_id),
+        }
+    }
+    /// Current session_id; `None` only for `Idle`. Derived.
+    pub fn session_id(&amp;self) -&gt; Option&lt;&amp;str&gt; {
+        match self {
+            Phase::Idle =&gt; None,
+            Phase::Claimed { streamer, .. }
+            | Phase::Streaming { streamer, .. }
+            | Phase::Draining { streamer, .. } =&gt; Some(&amp;streamer.session_id),
+        }
+    }
+    /// Sanitized discriminant for the `watch` broadcast — never carries
+    /// session_id or peer_id. Derived via `match`, never stored.
+    pub fn kind(&amp;self) -&gt; PhaseKind {
+        match self {
+            Phase::Idle =&gt; PhaseKind::Idle,
+            Phase::Claimed { .. } =&gt; PhaseKind::Claimed,
+            Phase::Streaming { .. } =&gt; PhaseKind::Streaming,
+            Phase::Draining { .. } =&gt; PhaseKind::Draining,
+        }
+    }
+}
+
+/// Broadcast projection of `Phase` — the discriminant ONLY, fanned out on the
+/// `watch` channel to viewer WS tasks (for observation) and to the integration
+/// test. It carries neither `session_id` (a resume secret) nor `peer_id`;
+/// derived via `Phase::kind()`, never stored, so it cannot drift from `Phase`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PhaseKind {
+    Idle,
+    Claimed,
+    Streaming,
+    Draining,
 }
 
 /// The SFU actor's owned state. One instance per running server.
 pub struct Sfu {
+    /// SINGLE source of truth for the ownership lifecycle. The owning
+    /// `Streamer` (peer_id + session_id), the per-state deadline, and the
+    /// Draining `Resume` policy all live INSIDE the `Phase` variant — there is
+    /// no flat mirror to keep in sync, and illegal combinations are
+    /// unrepresentable. (The former `owner`, `session_id`, `claim_deadline`,
+    /// `rtp_deadline`, `drain_deadline`, and `drain_resume_eligible` fields are
+    /// deleted; use `self.phase.owner()` / `self.phase.session_id()` and match
+    /// the variant for the deadline and the resume policy.)
     pub phase:               Phase,
-    pub owner:               Option&lt;PeerId&gt;,
-    /// Authoritative session identifier for the current owner. Minted at
-    /// Claim-grant (ClaimResult::Granted), HELD across the Draining window so
-    /// `handle_resume` can validate an incoming ResumeSession against it, and
-    /// cleared (with `owner`) on the transition back to Idle. `Some` exactly
-    /// when `owner` is `Some`. The `Phase` enum deliberately does NOT carry
-    /// session_id — this `Sfu` working field is the single authoritative copy
-    /// (mirrors `owner`), so the broadcast `Phase` (and the integration test's
-    /// phase matchers) stay shape-only.
-    pub session_id:          Option&lt;String&gt;,
-    pub claim_deadline:      Option&lt;Instant&gt;,
-    pub rtp_deadline:        Option&lt;Instant&gt;,
-    pub drain_deadline:      Option&lt;Instant&gt;,
-    /// True only while in Draining AND the drain was caused by an UNINTENTIONAL
-    /// streamer drop (5 s RTP gap / ICE Disconnected / keepalive miss / bare
-    /// network WS-close) — i.e., a ResumeSession matching `session_id` may
-    /// cancel the drain (30 s window). False for intentional releases (explicit
-    /// Bye, prompt-rejection auto-release), CLAIM_TIMEOUT, and LaDown, which
-    /// drain fast (bye-flush only) and refuse resume. Set by
-    /// `transition_to_draining_with`; read by `handle_resume` and by the
-    /// `drive()` drain-deadline logic.
-    pub drain_resume_eligible: bool,
     pub clients:             Vec&lt;Client&gt;,
-    pub la_reachable:        bool,             // orthogonal bit; toggled by LaDown/LaUp commands
+    pub la_reachable:        bool,             // orthogonal infra bit; toggled by LaDown/LaUp — NOT part of the ownership lifecycle
     pub la_last_error:       Option&lt;String&gt;,   // for /v1/health and /v1/info
-    pub phase_tx:            watch::Sender&lt;Phase&gt;,
+    pub phase_tx:            watch::Sender&lt;PhaseKind&gt;,  // broadcasts the sanitized discriminant (no session_id/peer_id leak)
     pub socket:              UdpSocket,        // single UDP socket on port 51000
     /// Cached local socket address. Used by the UDP-demux loop when
     /// constructing `str0m::Input::Receive { destination: local_addr }`.
@@ -2277,7 +2341,7 @@ fn request_pli_from_streamer(streamer: &amp;mut Client, streamer_video_mid: Mid)
     async fn handle(&amp;mut self, cmd: FsmCommand) -&gt; anyhow::Result&lt;()&gt; {
         // INVARIANT: NO `.await` inside any match arm. This is what makes
         // concurrent Claim handling TOCTOU-free — the FSM tick that reads
-        // `self.phase == Idle` and writes `self.phase = Claimed` is one
+        // matching `self.phase` as `Phase::Idle` and writing `self.phase = Claimed` is one
         // straight-line block of synchronous code; no cancellation point
         // can interleave a second Claim between the check and the set.
         // All awaiting (UDP send, channel writes) lives OUTSIDE handle().
@@ -2288,23 +2352,30 @@ fn request_pli_from_streamer(streamer: &amp;mut Client, streamer_video_mid: Mid)
             }
             FsmCommand::ResumeSession { peer_id, session_id, reply } =&gt; {
                 // handle_resume semantics (specified). The incoming session_id is
-                // validated against self.session_id (the authoritative copy minted
-                // at Claim-grant). ALL accept-paths additionally require
-                // self.la_reachable (resuming into a dead LA is pointless — refuse):
-                //   Phase::Streaming if session_id == self.session_id → Ok (still-active)
-                //   Phase::Claimed   if session_id == self.session_id → Ok (mid-handshake)
-                //   Phase::Draining  if session_id == self.session_id AND
-                //                       self.drain_resume_eligible → Ok AND cancel drain,
-                //                       re-entering CLAIMED (NOT Streaming):
-                //       self.phase = Phase::Claimed { owner: peer_id, deadline: now + CLAIM_TIMEOUT };
-                //       self.drain_deadline = None;
-                //       broadcast new Phase on phase_tx.
+                // validated against self.phase.session_id() (the authoritative copy
+                // minted at Claim-grant, now living inside the phase's Streamer). ALL
+                // accept-paths additionally require self.la_reachable (resuming into a
+                // dead LA is pointless — refuse):
+                //   Phase::Streaming { streamer, .. } if session_id == streamer.session_id → Ok (still-active)
+                //   Phase::Claimed   { streamer, .. } if session_id == streamer.session_id → Ok (mid-handshake)
+                //   Phase::Draining  { streamer, resume, .. } if session_id == streamer.session_id
+                //                       AND resume == Resume::Eligible → Ok AND cancel drain,
+                //                       re-entering CLAIMED (NOT Streaming) with the SAME
+                //                       session_id but the NEW connection's peer_id:
+                //       self.phase = Phase::Claimed {
+                //           streamer: Streamer { peer_id, session_id: streamer.session_id.clone() },
+                //           deadline: now + CLAIM_TIMEOUT,
+                //       };
+                //       broadcast self.phase.kind() on phase_tx.
+                //       (No separate drain_deadline to clear — the old Draining's `until`
+                //        is dropped when self.phase is reassigned. Clone the Streamer out
+                //        of the matched variant first, then assign — no panic, per §4.)
                 //     Claimed (not Streaming) is correct: Option α (§11.8) rebuilds the
                 //     RTCPeerConnection, so the client follows ResumeOk with a fresh
                 //     SdpOffer and the FSM must await the first post-resume RTP before
                 //     Streaming — exactly the state AttachStreamer (§11.8 step 7) sets,
-                //     so the two now agree. This is the iPhone-handover case (§11.2).
-                //   Phase::Draining with !self.drain_resume_eligible (intentional release /
+                //     so the two agree. This is the iPhone-handover case (§11.2).
+                //   Phase::Draining with resume == Resume::Forbidden (intentional release /
                 //     CLAIM_TIMEOUT / LaDown), Phase::Idle, !self.la_reachable, or any
                 //     session_id mismatch → Expired.
                 let result = self.handle_resume(peer_id, session_id);
@@ -2320,10 +2391,10 @@ fn request_pli_from_streamer(streamer: &amp;mut Client, streamer_video_mid: Mid)
                 self.on_got_rtp(peer_id);  // Claimed -&gt; Streaming transition
             }
             FsmCommand::Disconnect { peer_id, reason, intentional } =&gt; {
-                // on_disconnect: if peer_id == self.owner, enter Draining with
-                // resume_eligible = !intentional (intentional Bye → fast, no
-                // resume); otherwise the peer is a viewer — cull it, no phase
-                // change.
+                // on_disconnect: if Some(peer_id) == self.phase.owner(), enter Draining
+                // with resume = if intentional { Resume::Forbidden } else { Resume::Eligible }
+                // (intentional Bye → fast, no resume); otherwise the peer is a viewer —
+                // cull it (remove its Client), no phase change.
                 self.on_disconnect(peer_id, &amp;reason, intentional);
             }
             FsmCommand::AddRemoteCandidate { peer_id, candidate } =&gt; {
@@ -2343,7 +2414,7 @@ fn request_pli_from_streamer(streamer: &amp;mut Client, streamer_video_mid: Mid)
                     // LaDown drains FAST and is NOT resume-eligible: resuming into a
                     // dead LA is pointless, and §19.4 already requires the streamer to
                     // re-claim once LA returns.
-                    self.transition_to_draining_with("la_unreachable", &amp;error, /* resume_eligible = */ false);
+                    self.transition_to_draining_with("la_unreachable", &amp;error, Resume::Forbidden);
                 }
             }
             FsmCommand::LaUp =&gt; {
@@ -2380,7 +2451,50 @@ fn request_pli_from_streamer(streamer: &amp;mut Client, streamer_video_mid: Mid)
 <tr><td><code>Shutdown</code></td><td>Signal-watcher task (Section 12 list item 2 + Section 18.1)</td></tr>
 </table>
 
-<p><strong>The <code>transition_to_draining_with(code, error, resume_eligible)</code> helper</strong> sends <code>SignalMessage::Error { code, message: format!("{error:#}") }</code> to the streamer's <code>signal_tx</code>, writes a DataChannel "bye" to every connected peer's "boxes" channel, and immediately disconnects every VIEWER's <code>Rtc</code> (viewers cannot watch a gone streamer; their own reconnect loops re-attach them later — §1 data-flow item 9). It RETAINS <code>self.owner</code> and <code>self.session_id</code> (so a <code>ResumeSession</code> can validate), sets <code>self.drain_resume_eligible = resume_eligible</code>, and sets the deadline: <code>self.phase = Phase::Draining { deadline: now + DRAIN_TIMEOUT }</code> with <code>DRAIN_TIMEOUT = 30 s</code> when <code>resume_eligible</code>, or a short bye-flush budget (~800 ms, matching §18.2) when not. The <code>drive()</code> tick transitions Draining → Idle when the deadline is reached with no matching <code>ResumeSession</code> (clearing <code>owner</code> + <code>session_id</code>); "all peers dropped" is NOT itself an Idle trigger. <strong>Caller resume-eligibility:</strong> the unintentional-drop callers (the RTP/ICE/keepalive watchdogs in <code>drive()</code>, and the bare-socket-close <code>Disconnect{intentional:false}</code>) pass <code>resume_eligible = true</code>; the intentional-release callers (explicit <code>Bye</code> <code>Disconnect{intentional:true}</code>, the prompt-rejection auto-release, the <code>CLAIM_TIMEOUT</code> never-streamed case, and <code>LaDown</code>) pass <code>false</code>.</p>
+<p><strong>The <code>transition_to_draining_with(code, error, resume)</code> helper</strong> sends <code>SignalMessage::Error { code, message: format!("{error:#}") }</code> to the streamer's <code>signal_tx</code>, writes a DataChannel "bye" to every connected peer's "boxes" channel, and immediately disconnects every VIEWER's <code>Rtc</code> (viewers cannot watch a gone streamer; their own reconnect loops re-attach them later — §1 data-flow item 9). It MOVES the current <code>Streamer</code> (peer_id + session_id) out of the active phase and into <code>self.phase = Phase::Draining { streamer, until, resume }</code> — so the slot is retained for a <code>ResumeSession</code> to validate, with NO separate owner/session_id mirror to keep in sync — where <code>until = now + DRAIN_TIMEOUT</code> (<code>DRAIN_TIMEOUT = 30 s</code>) when <code>resume == Resume::Eligible</code>, or <code>now +</code> a short bye-flush budget (~800 ms, matching §18.2) when <code>Resume::Forbidden</code>. <strong>Borrow note (§4 no-panic):</strong> because the <code>Streamer</code> is moved out of <code>&amp;mut self.phase</code>, the implementation clones the <code>Streamer</code> out of the matched variant (it derives <code>Clone</code>), builds the new <code>Phase</code>, then assigns — never <code>unwrap</code>/<code>expect</code>/<code>panic</code>. The <code>drive()</code> tick (§11.6.2) transitions Draining → Idle when <code>until</code> is reached with no matching <code>ResumeSession</code> (the <code>Streamer</code> is dropped when <code>self.phase</code> is reassigned to <code>Phase::Idle</code>); "all peers dropped" is NOT itself an Idle trigger. <strong>Caller resume policy:</strong> the unintentional-drop callers (the RTP/ICE/keepalive watchdogs in <code>drive()</code>, and the bare-socket-close <code>Disconnect{intentional:false}</code>) pass <code>Resume::Eligible</code>; the intentional-release callers (explicit <code>Bye</code> <code>Disconnect{intentional:true}</code>, the prompt-rejection auto-release, the <code>CLAIM_TIMEOUT</code> never-streamed case, and <code>LaDown</code>) pass <code>Resume::Forbidden</code>.</p>
+
+<h4>11.6.2 The <code>drive(now)</code> tick — sole reader of the in-variant deadlines</h4>
+<p>Because every deadline now lives INSIDE its <code>Phase</code> variant, the periodic <code>drive(now)</code> tick (the 100 ms <code>tick.tick()</code> arm of <code>run_sfu</code>, §11.3) is the single place that reads them — there is no parallel <code>Sfu.*_deadline</code> mirror to consult or keep in sync. It computes the next phase, THEN assigns (never matching <code>&amp;self.phase</code> while mutating it, never <code>unwrap</code>/<code>expect</code>/<code>panic</code> per §4); the <code>Streamer</code> is cloned out of the matched variant before reassignment:</p>
+<pre><code>fn drive(&amp;mut self, now: Instant) -&gt; anyhow::Result&lt;()&gt; {
+    // --- Streamer lifecycle: deadlines read straight off the active phase. ---
+    // The owner's signaling-WS keepalive is a BACKSTOP to the tighter RTP/CLAIM
+    // deadlines (the streamer almost always trips those first). `is_some_and`
+    // ⇒ a freshly-Claimed, not-yet-attached streamer (no Client yet) is NOT
+    // considered silent — it still has the full CLAIM_TIMEOUT to attach:
+    let owner_silent = |s: &amp;Streamer, clients: &amp;[Client]| clients.iter()
+        .find(|c| c.id == s.peer_id)
+        .is_some_and(|c| now.duration_since(c.last_seen) &gt; KEEPALIVE_TIMEOUT);
+
+    let next: Option&lt;Phase&gt; = match &amp;self.phase {
+        Phase::Claimed { streamer, deadline } if now &gt;= *deadline =&gt;        // CLAIM_TIMEOUT: never sent first RTP
+            Some(Phase::Draining { streamer: streamer.clone(), until: now + BYE_FLUSH, resume: Resume::Forbidden }),
+        Phase::Streaming { streamer, last_rtp }
+            if now.duration_since(*last_rtp) &gt; RTP_TIMEOUT
+               || owner_silent(streamer, &amp;self.clients) =&gt;            // unintentional drop / app-silent
+            Some(Phase::Draining { streamer: streamer.clone(), until: now + DRAIN_TIMEOUT, resume: Resume::Eligible }),
+        Phase::Draining { until, .. } if now &gt;= *until =&gt; Some(Phase::Idle),
+        _ =&gt; None,
+    };
+    if let Some(p) = next {
+        // Entering Draining also runs the bye + viewer-disconnect of
+        // transition_to_draining_with (factored into one helper); → Idle just
+        // drops the Streamer with the old phase.
+        self.phase = p;
+        let _ = self.phase_tx.send(self.phase.kind());
+    }
+
+    // --- Viewer liveness (orthogonal to the ownership phase): cull silent viewers. ---
+    let owner = self.phase.owner();
+    for c in self.clients.iter_mut().filter(|c| Some(c.id) != owner) {
+        if now.duration_since(c.last_seen) &gt; KEEPALIVE_TIMEOUT {
+            tracing::warn!(viewer_id = %c.id, "viewer keepalive timeout; disconnecting");
+            c.rtc.disconnect();
+        }
+    }
+    self.clients.retain(|c| c.rtc.is_alive());
+    Ok(())
+}</code></pre>
+<p>(Both the <code>Claimed</code> and <code>Streaming</code> arms bind <code>streamer</code> by shared reference and <code>clone()</code> it into the new <code>Phase::Draining</code>; the borrow of <code>&amp;self.phase</code> ends when the <code>match</code> expression completes, so the subsequent <code>self.phase = p</code> assignment is conflict-free — no <code>unwrap</code>/<code>expect</code>/<code>panic</code>, per §4.) This is the only reader of <code>Claimed.deadline</code> / <code>Streaming.last_rtp</code> / <code>Draining.until</code>; <code>RTP_TIMEOUT</code> (5 s), <code>CLAIM_TIMEOUT</code> (10 s), <code>DRAIN_TIMEOUT</code> (30 s), <code>KEEPALIVE_TIMEOUT</code> (30 s), and the bye-flush budget <code>BYE_FLUSH</code> (~800 ms, §18.2) are fixed protocol constants (no operator knobs — §3). ICE-<code>Disconnected</code> is event-driven (handled in the <code>poll_output</code> drain, not here) and enters Draining with <code>Resume::Eligible</code> exactly like the RTP-gap path. The viewer-cull pass is what gives <code>Client.last_seen</code> (§11.5) its purpose; the WebSocket handler bumps <code>last_seen</code> on every inbound <code>SignalMessage</code> (including <code>Keepalive</code>).</p>
 
 <p><strong>Policy on <code>signal_tx.try_send</code> failure.</strong> The per-peer outbound mpsc to the WebSocket handler has capacity 32 (Section 11.5). On <code>Err(TrySendError::Full)</code> OR <code>Err(TrySendError::Closed)</code>, the FSM logs at <code>tracing::warn!</code> AND immediately calls <code>client.rtc.disconnect()</code> on that peer's Rtc. <strong>Rationale:</strong> a Full mpsc means the peer's WS handler task is not draining its Receiver — either it is stuck on a blocked socket write (a frozen browser tab; cellular outage; etc.) or its task has stalled. A Closed mpsc means the WS handler has already exited. Either way the peer is dead on the wire; immediately disconnecting the Rtc triggers the standard cleanup path on the next select iteration (<code>FsmCommand::Disconnect</code> arrives from the WS handler's exit, OR the next UDP-receive tick observes <code>!rtc.is_alive()</code> and culls the Client). This is fail-loud per Section 3 — no consecutive-failure counter, no retry budget, no silent absorption.</p>
 
@@ -2445,7 +2559,7 @@ impl Sfu {
     /// auto-releases ownership after 500 ms (the auto-release is client-side,
     /// not FSM-side).
     fn on_la_error_result(&amp;mut self, frame_id: u64, code: String, message: String) -&gt; Result&lt;()&gt; {
-        let Some(streamer_id) = self.owner else { return Ok(()); };
+        let Some(streamer_id) = self.phase.owner() else { return Ok(()); };
         let Some(streamer) = self.clients.iter_mut().find(|c| c.id == streamer_id) else {
             return Ok(());
         };
@@ -2498,6 +2612,7 @@ match self.clients.iter_mut().find(|c| c.id == peer_id) {
         existing.boxes_cid        = None;
         existing.media_added_at   = None;
         existing.channel_open_at  = None;
+        existing.last_seen        = std::time::Instant::now();  // a reconnect is a fresh liveness signal
     }
     None =&gt; {
         // First attach for this peer_id.
@@ -2509,19 +2624,27 @@ match self.clients.iter_mut().find(|c| c.id == peer_id) {
             boxes_cid:        None,
             media_added_at:   None,
             channel_open_at:  None,
+            last_seen:        std::time::Instant::now(),
         });
     }
 }
-self.owner = Some(peer_id);
-// self.session_id is NOT minted or cleared here — it was set at Claim-grant
-// (§11.4.1) and is PRESERVED across a resume (handle_resume keeps it).
-// AttachStreamer only swaps in the freshly-built Rtc. On the resume path,
-// handle_resume has already cancelled the drain and set Phase::Claimed; this
-// AttachStreamer re-confirms Claimed with a fresh CLAIM_TIMEOUT to await the
-// first post-Option-α RTP — consistent with handle_resume (both land in Claimed).
-self.phase = Phase::Claimed { owner: peer_id, deadline: std::time::Instant::now() + Duration::from_secs(10) };
-let _ = self.phase_tx.send(self.phase.clone());</code></pre>
-    <strong>AttachViewer</strong> follows the same find-or-insert pattern but does NOT touch <code>self.owner</code> or <code>self.phase</code>.</li>
+// The session_id is NOT minted here — it was set at Claim-grant and is PRESERVED
+// across a resume (handle_resume re-enters Claimed with the same session_id and
+// the new peer_id). AttachStreamer re-confirms Claimed with a fresh CLAIM_TIMEOUT
+// to await the first post-Option-α RTP, carrying the existing session_id forward
+// from the current phase. Per §4 (no unwrap/expect/panic): if the phase somehow
+// holds no session_id (logically unreachable — AttachStreamer only ever follows a
+// granted Claim or an Ok resume) we log loud and bail rather than panic.
+let Some(session_id) = self.phase.session_id().map(str::to_string) else {
+    tracing::error!(peer_id, "AttachStreamer with no active session_id — dropping (unreachable)");
+    return;
+};
+self.phase = Phase::Claimed {
+    streamer: Streamer { peer_id, session_id },
+    deadline: std::time::Instant::now() + Duration::from_secs(10),
+};
+let _ = self.phase_tx.send(self.phase.kind());</code></pre>
+    <strong>AttachViewer</strong> follows the same find-or-insert pattern (including initializing <code>last_seen</code>) but does NOT touch <code>self.phase</code> — there is no <code>self.owner</code> any more; ownership is the phase's <code>Streamer</code>.</li>
   <li><strong>(FSM)</strong> Drive <code>poll_output</code> on the new <code>Rtc</code> as part of the regular SFU tick. Eventually two events fire:
     <ul>
       <li><code>Event::MediaAdded { mid, kind: MediaKind::Video, direction, .. }</code> — set <code>peer.video_mid = Some(mid)</code> and record <code>peer.media_added_at = Some(now)</code>. Direction filtering is per the role: for the streamer (incoming video), accept <code>RecvOnly | SendRecv</code>; for viewers (outgoing video), accept <code>SendOnly | SendRecv</code>. Verified at <code>/tmp/str0m-src/src/session.rs:707-717</code>.</li>
@@ -5963,7 +6086,7 @@ use str0m::rtp::{ExtensionValues, RtpWrite, SeqNo, Ssrc};
 use str0m::unversioned::{H264Packetizer, Packetizer};  // Packetizer trait in scope for .packetize()
 use str0m::{Candidate, Event, Input, Output, Rtc};
 
-use la_website_server::sfu::{FsmCommand, Phase, PeerId};
+use la_website_server::sfu::{FsmCommand, PhaseKind, PeerId};
 use la_website_server::test_support::{
     spawn_sfu_for_test, StubLaServer, Role, TestCfg,
 };
@@ -6119,7 +6242,7 @@ async fn e2e_pipeline_keyframe_box_drain() -&gt; Result&lt;()&gt; {
     let sfu_udp = UdpSocket::bind("127.0.0.1:0").await.context("SFU UdpSocket::bind")?;
 
     let (fsm_tx, fsm_rx) = tokio::sync::mpsc::channel::&lt;FsmCommand&gt;(256);
-    let (phase_tx, phase_rx) = watch::channel(Phase::Idle);
+    let (phase_tx, phase_rx) = watch::channel(PhaseKind::Idle);
     // spawn_sfu_for_test wires the entire three-task pipeline internally
     // (SFU + decode + LA client) using the same channel topology as
     // production §11.3, with la_host/la_port/etc. routed through TestCfg.
@@ -6213,7 +6336,7 @@ async fn e2e_pipeline_keyframe_box_drain() -&gt; Result&lt;()&gt; {
 
     let mut rx = phase_rx.clone();
     let phase_seq_ok = collect_phase_sequence(&amp;mut rx, Duration::from_secs(7),
-        &amp;[|p| matches!(p, Phase::Draining { .. }), |p| matches!(p, Phase::Idle)],
+        &amp;[|p| matches!(p, PhaseKind::Draining), |p| matches!(p, PhaseKind::Idle)],
     ).await?;
     assert!(phase_seq_ok, "FSM did not transition Streaming → Draining → Idle within 7s (fast-drain path)");
 
@@ -6224,8 +6347,8 @@ async fn e2e_pipeline_keyframe_box_drain() -&gt; Result&lt;()&gt; {
 }
 
 async fn collect_phase_sequence(
-    rx: &amp;mut watch::Receiver&lt;Phase&gt;, budget: Duration,
-    matchers: &amp;[fn(&amp;Phase) -&gt; bool],
+    rx: &amp;mut watch::Receiver&lt;PhaseKind&gt;, budget: Duration,
+    matchers: &amp;[fn(&amp;PhaseKind) -&gt; bool],
 ) -&gt; Result&lt;bool&gt; {
     let deadline = Instant::now() + budget;
     let mut idx = 0;
@@ -6623,7 +6746,7 @@ echo "scripts/lint/no_hardcoded_secrets.sh: clean."
 <ol>
   <li><strong>Repository skeleton.</strong> Create <code>website/Cargo.toml</code> (virtual workspace), <code>website/rust-toolchain.toml</code>, <code>website/Trunk.toml</code>, <code>website/.gitignore</code>, <code>website/.dockerignore</code>, <code>website/scripts/lib/common.sh</code>, <code>website/scripts/lib/versions.sh</code>, empty <code>server/Cargo.toml</code> and <code>server/src/main.rs</code>, empty <code>wasm-client/Cargo.toml</code> and <code>wasm-client/src/lib.rs</code> and <code>wasm-client/index.html</code> and <code>wasm-client/styles.css</code>, empty <code>protocol/Cargo.toml</code> and <code>protocol/src/lib.rs</code>. Verify: <code>cargo check --workspace</code> succeeds.</li>
   <li><strong>The <code>protocol</code> crate.</strong> Write the full <code>protocol/src/lib.rs</code> per Section 10, including the canonical template constants (Section 10.10). Add round-trip unit tests for every <code>SignalMessage</code> variant and <code>BoxMessage</code> shape. <strong>Add the <code>canonical_templates_match_prompts_py_byte_for_byte</code> unit test</strong> that uses <code>include_str!("../../../worker/prompts.py")</code> and asserts byte-equality of each canonical-template constant against the literal string parsed from the Python source. Verify: <code>cargo test -p protocol</code> passes (this test catches drift at build time).</li>
-  <li><strong>Server skeleton.</strong> Write <code>server/src/error.rs</code>, <code>server/src/state.rs</code>, <code>server/src/config.rs</code> (clap CLI for the four operator-required args + the opt-in flag — see Section 24.9), <code>server/src/tls.rs</code> (rcgen cert gen + persistence + wall-clock sanity), <code>server/src/main.rs</code> (tokio runtime, signal handling, <code>const STATE_DIR / DIST_DIR / TCP_PORT / UDP_PORT</code>, AppState construction), and <strong><code>server/src/lib.rs</code></strong> (declares <code>pub mod sfu;</code> unconditionally and <code>#[cfg(any(test, feature = "test-support"))] pub mod test_support;</code> for the integration-test seam — required so the e2e test in <code>server/tests/e2e_pipeline.rs</code> can do <code>use la_website_server::sfu::{FsmCommand, Phase, PeerId};</code>). Add <code>[lib]</code> and <code>[[bin]]</code> targets to <code>server/Cargo.toml</code> so both are built. Verify: <code>cargo build --release --bin la_website_server</code> succeeds. For host-side iteration (outside Docker), run the binary directly with the four CLI args; the binary will try to read/write <code>/var/lib/la-website</code> and serve from <code>/var/dist</code> — neither of which exists outside the container, so this is for compile-check only. Real validation happens inside Docker via <code>./setup.sh</code>.</li>
+  <li><strong>Server skeleton.</strong> Write <code>server/src/error.rs</code>, <code>server/src/state.rs</code>, <code>server/src/config.rs</code> (clap CLI for the four operator-required args + the opt-in flag — see Section 24.9), <code>server/src/tls.rs</code> (rcgen cert gen + persistence + wall-clock sanity), <code>server/src/main.rs</code> (tokio runtime, signal handling, <code>const STATE_DIR / DIST_DIR / TCP_PORT / UDP_PORT</code>, AppState construction), and <strong><code>server/src/lib.rs</code></strong> (declares <code>pub mod sfu;</code> unconditionally and <code>#[cfg(any(test, feature = "test-support"))] pub mod test_support;</code> for the integration-test seam — required so the e2e test in <code>server/tests/e2e_pipeline.rs</code> can do <code>use la_website_server::sfu::{FsmCommand, PhaseKind, PeerId};</code>). Add <code>[lib]</code> and <code>[[bin]]</code> targets to <code>server/Cargo.toml</code> so both are built. Verify: <code>cargo build --release --bin la_website_server</code> succeeds. For host-side iteration (outside Docker), run the binary directly with the four CLI args; the binary will try to read/write <code>/var/lib/la-website</code> and serve from <code>/var/dist</code> — neither of which exists outside the container, so this is for compile-check only. Real validation happens inside Docker via <code>./setup.sh</code>.</li>
   <li><strong>Authentication and rate limiting.</strong> Write <code>server/src/auth.rs</code> per Section 17 (the <code>auth_layer</code> tower middleware), and <code>server/src/http.rs</code> (the <code>fn build_router(state: Arc&lt;AppState&gt;) -&gt; Router</code> that composes <code>no_auth_routes</code> + <code>authed_routes</code> per Section 17.5, with the security-header layers applied at the outermost wrap per Section 17.4). Write integration tests using <code>reqwest = "=0.12.23", default-features = false, features = ["rustls-tls-no-provider"]</code> as a dev-dependency in <code>server/Cargo.toml</code> (NOT a runtime dependency); use it to exercise the single-surface-per-protocol policy (Authorization-header path, query-string path, the wrong-surface rejection branches, and the per-IP rate-limit overflow path) AND to verify that <code>GET /</code> succeeds WITHOUT an Authorization header (the SPA bundle is on <code>no_auth_routes</code>; see Section 17.5). The dev-only pin avoids dragging a second TLS-client stack into the runtime image.</li>
   <li><strong>CSP build pipeline + /v1/info.</strong> Write <code>server/build.rs</code> (Section 15.3), <code>server/src/csp.rs</code>, and <code>server/src/info.rs</code> (the <code>/v1/info</code> JSON handler per Section 12.3, reading <code>env!("LA_WEBSITE_GIT_SHA")</code> and the live cert metadata). Write minimal <code>wasm-client/index.html</code> with a placeholder <code>&lt;link data-trunk rel="rust"/&gt;</code>. Verify: <code>cargo build -p la_website_server</code> succeeds after a Trunk build has populated <code>wasm-client/dist/index.html</code>.</li>
   <li><strong>Signaling and FSM.</strong> Write <code>server/src/signaling.rs</code> (axum WebSocket handler) and <code>server/src/sfu.rs</code> (FSM actor task per Section 11). Initially without WebRTC integration: just claim/release/keepalive message handling. Verify: a hand-driven WebSocket client can claim, release, and observe correct rejection of concurrent claims.</li>
