@@ -4692,7 +4692,7 @@ There is therefore no cross-peer cascade to defend against: because each <code>R
 
 <pre><code>.video-stage { aspect-ratio: var(--video-aspect, 16 / 9); }</code></pre>
 
-<p><code>current_track_dimensions</code> is sourced from the <code>MediaStreamTrack.getSettings().width / .height</code> for the streamer path, and from the <code>VideoFrameCallbackMetadata.width / .height</code> of the most recently presented frame on the viewer path (Section 21.3). The default fallback <code>16 / 9</code> only applies before the first frame.</p>
+<p><code>current_track_dimensions</code> (an <code>RwSignal&lt;(u32, u32)&gt;</code>) is sourced from <code>MediaStreamTrack.getSettings().width / .height</code> (web-sys returns <code>i32</code>; cast to <code>u32</code> — already validated positive in §20.2) for the streamer path, and from <code>VideoFrameCallbackMetadata.width / .height</code> (already <code>u32</code>) of the most recently presented frame on the viewer path, updated only when the value changes (Section 21.3). The default fallback <code>16 / 9</code> only applies before the first frame.</p>
 
 <h4>21.0.6 The streamer-role and viewer-role stages — video occupies the full stage</h4>
 
@@ -5007,9 +5007,10 @@ fn App() -&gt; impl IntoView {
 
 <dl>
   <dt>Streamer path</dt>
-  <dd>The user's own browser captures via <code>getUserMedia</code>; the resulting MediaStream is assigned to a local <code>&lt;video&gt;</code> element via <code>HtmlMediaElement::set_src_object</code>. Display latency is essentially zero (browser-internal pipeline). The bounding-box overlay is drawn via <code>requestAnimationFrame</code> (NOT rVFC — rVFC's <code>metadata.rtpTimestamp</code> is absent for local <code>getUserMedia</code> tracks per WICG video-rvfc spec, since local sources have no RTP timeline). On each RAF tick the canvas reads <code>latest_box</code> via <code>RwSignal::with_untracked</code> (no Leptos reactive subscription — pure pull) and renders the most-recent BoxMessage's rectangles. Color: desaturated red <code>#dd5050</code>. A small corner badge displays the running median round-trip-time (computed as below), so the streamer knows exactly how stale their overlay is. The staleness is the LA cycle plus pipeline overhead — ~785 ms hybrid, ~937 ms slow, ~210 ms point_to as of LA-3B (per <code>/home/user/Desktop/locate_anything_setup/docs/DRONE_DETECTION.md:113-117</code>); a model swap changes this one-for-one without architectural change.
+  <dd>The user's own browser captures via <code>getUserMedia</code>; the resulting MediaStream is assigned to a local <code>&lt;video&gt;</code> element via <code>HtmlMediaElement::set_src_object</code>. Display latency is essentially zero (browser-internal pipeline). The bounding-box overlay is drawn via <code>requestAnimationFrame</code> (NOT rVFC — rVFC's <code>metadata.rtpTimestamp</code> is absent for local <code>getUserMedia</code> tracks per WICG video-rvfc spec, since local sources have no RTP timeline). On each RAF tick the canvas reads <code>latest_box</code> via <code>RwSignal::with_untracked</code> (no Leptos reactive subscription — pure pull) and renders the most-recent BoxMessage's rectangles. Color: desaturated red <code>#dd5050</code>. A small corner badge displays the running median overlay staleness (computed as below), so the streamer knows roughly how far behind live the overlay is. The staleness is the LA cycle plus pipeline overhead — ~785 ms hybrid, ~937 ms slow, ~210 ms point_to as of LA-3B (per <code>/home/user/Desktop/locate_anything_setup/docs/DRONE_DETECTION.md:113-117</code>); a model swap changes this one-for-one without architectural change.
 
-  <p><strong>RTT-badge construction (specified, wrap-safe).</strong> The streamer's RTC sender's outbound RTP timestamp advances at 90 kHz. On a 200-ms <code>tokio::time::interval</code> (or equivalent <code>setTimeout</code> loop on the WASM client), the client calls <code>pc.getStats(None).await</code>, finds the <code>outbound-rtp</code> stats entry for the video sender, and reads its <code>timestamp</code> field (a <code>DOMHighResTimeStamp</code> wall-clock millisecond) and a derived "most-recent rtp_ts" maintained by feature-detection on the available stats fields. The client maintains a small sliding window <code>VecDeque&lt;(u32 rtp_ts, instant::Instant) &gt;</code> of (sender-rtp_ts, wall-clock-Instant) pairs, capped at the most recent ~10 entries. On BoxMessage arrival with <code>msg.rtp_ts</code>, the client scans the window for the pair whose <code>rtp_ts</code> minimizes <code>msg.rtp_ts.wrapping_sub(pair.rtp_ts)</code> subject to the result being <code>&lt; 0x8000_0000</code> (i.e., pair's rtp_ts is forward-of-or-equal in cyclic order); RTT-sample is <code>Instant::now() - pair.instant</code>. A running median over the last ~16 samples drives the badge. Wrap-safe by the same RFC 1982 §3.2 logic as §21.3.1.</p></dd>
+  <p><strong>Staleness-badge construction (buildable, no <code>getStats</code>).</strong> The badge answers "how far behind live is my overlay?" — which, under Strategy A plus LocateAnything-3B's stop-and-wait pipeline, is essentially one inference cycle. Measure it directly and locally: on each <code>BoxMessage</code> arrival (in the "boxes" DataChannel <code>onmessage</code> closure, §21.3.1) push <code>web_sys::window().unwrap().performance().unwrap().now()</code> — a monotonic <code>DOMHighResTimeStamp</code> in milliseconds — into a small <code>VecDeque&lt;f64&gt;</code> capped at ~16 entries; the badge shows the running median of the consecutive-arrival deltas. No <code>getStats</code> poll loop, no RTP-timestamp correlation, no extra dependency.</p>
+  <p><strong>Why not a true send→box round-trip from <code>getStats</code>.</strong> A genuine "frame T sent → box for T returned" RTT would require mapping <code>msg.rtp_ts</code> to the wall-clock instant the streamer sent frame T — but the WebRTC statistics model exposes <strong>no outbound RTP timestamp</strong>: <code>RTCOutboundRtpStreamStats</code> (and the <code>RTCSentRtpStreamStats</code> / <code>RTCRtpStreamStats</code> it extends) carry no current-RTP-timestamp field to correlate against, and the local <code>getUserMedia</code> source has no RTP timeline at all (which is also why the streamer overlay uses <code>requestAnimationFrame</code>, not rVFC). The inter-arrival median captures the dominant term (inference latency, ~785 ms hybrid) honestly; the few-tens-of-milliseconds network legs it omits are noise at this scale. (<code>RTCRemoteInboundRtpStreamStats.roundTripTime</code> does exist, but it measures only the streamer↔SFU network hop, not the box pipeline — the wrong number for this badge.)</p></dd>
 
   <dt>Viewer path</dt>
   <dd>The user's browser receives a MediaStream from the server via <code>RTCPeerConnection.set_ontrack</code> callback's <code>RtcTrackEvent.streams[0]</code>; this stream is assigned to a local <code>&lt;video&gt;</code> element. End-to-end streamer-camera → viewer-screen latency is the sum of the streamer's encoder (libwebrtc default ~30–80 ms), LAN/Internet transit (~5–50 ms), the SFU re-publish (sub-ms, verified at <code>str0m 0.20.0 src/media/writer.rs:137-181</code> — no buffering, immediate drain via <code>already_happened</code> sentinel at <code>src/util/time_tricks.rs:52-54</code>), the viewer browser's adaptive jitter buffer (default ~20–150 ms; <strong>lowered via <code>RTCRtpReceiver.jitterBufferTarget = 50</code> in §21.2.1 below where supported</strong>), and viewer decode/render (~30 ms) — roughly ~120–250 ms typical with the jitter-buffer hint applied. The overlay is drawn via <code>requestVideoFrameCallback</code> when supported (it is, across the entire Section 22.1 matrix); the callback's frame-presentation tick is exactly when we want to redraw the canvas. Inside the callback, read <code>latest_box</code> via <code>RwSignal::with_untracked</code> and render. Color: saturated red <code>#ff3030</code>. The box arrives ~one LA cycle after the frame it describes was captured; by the time it lands at the viewer, the viewer's video is presenting a frame ~25 frames downstream — the rendered box is therefore drawn on a different frame than it was inferred from, which is exactly what the user permits.</dd>
@@ -5108,16 +5109,33 @@ pub fn has_rvfc(video: &amp;web_sys::HtmlVideoElement) -&gt; anyhow::Result&lt;b
 <p><strong>The <code>metadata.rtpTimestamp</code> field is no longer load-bearing for overlay rendering.</strong> Under Strategy A (§21.2 latest-wins), the rVFC callback simply pulls the most-recent <code>BoxMessage</code> from <code>latest_box</code> at frame-presentation time and draws it; no lookup by RTP timestamp is performed. <code>metadata.rtpTimestamp</code> is now used only for diagnostics (e.g., the streamer's "running median round-trip-time" badge in §21.2). For the streamer path, rVFC is replaced by <code>requestAnimationFrame</code> entirely, because the local <code>getUserMedia</code> source has no RTP timeline (WICG video-rvfc spec: "absent" for non-WebRTC sources).</p>
 
 <p>On the viewer path, the rVFC callback shape is:</p>
-<pre><code>// Inside the rVFC callback closure (called per presented video frame):
+<pre><code>// Inside the rVFC callback closure (called per presented video frame).
+// `css_dims` is the shared Rc&lt;Cell&lt;(f64, f64)&gt;&gt; the §21.8 ResizeObserver keeps
+// current; reading it here (not getBoundingClientRect per frame) avoids a
+// forced layout. draw_boxes clears the canvas first, then draws (§21.9).
+let (css_width, css_height) = css_dims.get();
 let latest = latest_box.with_untracked(|opt| opt.clone());
-if let Some(msg) = latest {
-    draw_boxes(&amp;ctx, &amp;msg, css_w, css_h, color);
+match latest {
+    Some(msg) =&gt; draw_boxes(&amp;ctx, &amp;msg, css_width, css_height, color),
+    // No current box (first frame, or cleared on a stream/prompt transition
+    // per §21.3.1): clear so nothing stale lingers on the new scene.
+    None      =&gt; ctx.clear_rect(0.0, 0.0, css_width, css_height),
 }
-// Optionally, if meta.rtp_timestamp() is Some(ts), update a diagnostic
-// signal for the badge UI. NOT load-bearing — purely observability.
+
+// Keep --video-aspect honest (§21.0.5): the viewer's track dimensions come
+// from the presented-frame metadata. Update ONLY on change, so the style is
+// not re-rendered every frame. For our forced square-pixel H.264 (42e01f,
+// §20.1) meta.width()/height() equal the display dimensions — no pixel-aspect
+// adjustment is needed (rVFC width/height carry no PAR).
+let (mw, mh) = (meta.width(), meta.height());
+if mw &gt; 0 &amp;&amp; mh &gt; 0 &amp;&amp; current_track_dimensions.get_untracked() != (mw, mh) {
+    current_track_dimensions.set((mw, mh));   // tracked: re-renders the --video-aspect style
+}
+
+// Diagnostic only (NOT load-bearing): expose the presented frame's rtp_ts.
+// reactive_graph 0.2.14 (Leptos 0.8.19's runtime) exposes update_untracked /
+// write_untracked; there is no `set_untracked`.
 if let Some(rtp_ts) = meta.rtp_timestamp() {
-    // reactive_graph 0.2.14 (Leptos 0.8.19's runtime) exposes Update::update_untracked
-    // and WriteUntracked::write_untracked; there is no `set_untracked` method.
     current_frame_rtp_ts.update_untracked(|v| *v = Some(rtp_ts));
 }
 // Schedule the next callback (rVFC is one-shot per registration).
@@ -5289,6 +5307,8 @@ pub fn attach_boxes_dc(
 
 <p><strong>Protocol-violation policy.</strong> Any binary frame on the "boxes" channel surfaces a loud error to the user and tears down the connection (in the receive callback above, we surface to <code>last_error</code> but do not actively close the channel from JS; the reconnect loop will pick that up on next signaling cycle). Any frame that fails JSON parsing surfaces the chained-anyhow parse error. Neither is silently dropped.</p>
 
+<p><strong>Resetting the slot.</strong> <code>latest_box</code> is set back to <code>None</code> whenever the client leaves the live view — on <code>ResumeExpired</code> and on a user-initiated <code>Bye</code>/Release (the §21.10.0 transitions that revert to the 7-card prompt-builder), and on a fresh <code>Claim</code> — so a box inferred for the previous prompt or scene never lingers over a new one. Because the per-frame draw clears the canvas whenever <code>latest_box</code> is <code>None</code> (§21.3, §21.9), the overlay goes blank immediately on reset rather than freezing the last detections.</p>
+
 <h3>21.4 <code>playsinline</code> attribute handling</h3>
 <p>The <code>playsInline</code> setter is not bound in <code>web-sys</code> 0.3.99 (verified by reading the same file). Set the attribute via Leptos's <code>view!</code> macro (which uses <code>setAttribute</code> under the hood) or via <code>Element::set_attribute("playsinline", "")</code> imperatively. Required for Apple iOS Safari to prevent the <code>&lt;video&gt;</code> element from going fullscreen on play.</p>
 
@@ -5393,25 +5413,44 @@ let sender: web_sys::RtcRtpSender = pc.add_track(&amp;video_track, &amp;media_st
 <h3>21.7 Canvas overlay positioning</h3>
 <p>Parent <code>&lt;div&gt;</code> with <code>position: relative</code>. The <code>&lt;video&gt;</code> is the natural-flow child sizing the parent. The <code>&lt;canvas&gt;</code> is <code>position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none;</code>. The overlay layout's CSS lives in <code>wasm-client/styles.css</code> (external CSS file; <strong>no inline styles per the CSP discipline of Section 16</strong>).</p>
 
-<h3>21.8 ResizeObserver</h3>
-<p>Observe the parent <code>&lt;div&gt;</code> (not the video element, because the video may letterbox inside its layout box). On every resize entry, recompute and apply the canvas backing-store dimensions:</p>
+<h3>21.8 ResizeObserver and device-pixel-ratio changes</h3>
+<p>Observe the parent <code>&lt;div&gt;</code> (not the video element, because the video may letterbox inside its layout box). On every resize entry, recompute the canvas backing-store dimensions, publish the current CSS size into the shared <code>css_dims: Rc&lt;Cell&lt;(f64, f64)&gt;&gt;</code> that the draw callback reads (§21.3, §21.9), and re-apply the device-pixel-ratio transform:</p>
 <pre><code>let dpr = window.device_pixel_ratio();
-canvas.set_width((css_width  * dpr) as u32);
-canvas.set_height((css_height * dpr) as u32);
-ctx.scale(dpr, dpr).map_err(js_err("ctx.scale"))?;  // accumulating transform
+css_dims.set((css_width, css_height));              // shared with the rVFC/RAF draw callback
+canvas.set_width((css_width  * dpr) as u32);        // set_width/set_height RESET the 2D context
+canvas.set_height((css_height * dpr) as u32);       // transform to identity (WHATWG bitmap-resize),
+ctx.scale(dpr, dpr).map_err(js_err("ctx.scale"))?;  // so this scale does NOT accumulate across resizes
 </code></pre>
+<p><strong>ResizeObserver does NOT fire on a device-pixel-ratio change when the CSS box is unchanged</strong> — e.g. dragging the window to a display with a different DPR, or browser page-zoom — leaving the backing store stale (blurry, or mis-scaled boxes) until some unrelated resize. So also register a self-re-arming <code>matchMedia(&amp;format!("(resolution: {dpr}dppx)"))</code> <code>change</code> listener; on fire, re-run the sizing block above (it re-reads <code>device_pixel_ratio()</code>, which resets the transform via <code>set_width</code>) and re-arm the listener against the new ratio. Both the ResizeObserver and this media-query listener are owned closures in the §21.11 inventory.</p>
 
 <h3>21.9 Bounding-box coordinate transform</h3>
-<p>Boxes arrive normalized in [0.0, 1.0]. The WebAssembly client multiplies by the current CSS width and height of the canvas. <strong>Note:</strong> <code>box</code> is a reserved keyword in Rust; the local binding is named <code>bb</code>:</p>
-<pre><code>for bb in box_message.boxes.iter() {
+<p>Boxes arrive normalized in [0.0, 1.0]. The WebAssembly client multiplies by the current CSS width and height of the canvas (<code>css_width</code>/<code>css_height</code> — read from the shared cell the §21.8 ResizeObserver keeps current, see §21.3, never <code>getBoundingClientRect</code> per frame). <strong><code>draw_boxes</code> clears the whole canvas first</strong>, so the previous inference's shapes never ghost; an <code>abstained</code> reply (empty <code>boxes</code> and <code>points</code>) therefore leaves a clean, blank overlay. The per-frame caller (viewer rVFC / streamer RAF) calls this every presented frame, and clears directly when <code>latest_box</code> is <code>None</code> (§21.3). <strong>Note:</strong> <code>box</code> is a reserved keyword in Rust; the local binding is named <code>bb</code>:</p>
+<pre><code>// Clear the whole canvas in CSS-pixel space (the ctx is already DPR-scaled,
+// §21.8) BEFORE drawing — otherwise each frame's shapes paint over the last
+// and the overlay smears.
+ctx.clear_rect(0.0, 0.0, css_width as f64, css_height as f64);
+
+for bb in box_message.boxes.iter() {
     let x = bb.x1 * css_width;
     let y = bb.y1 * css_height;
     let w = (bb.x2 - bb.x1) * css_width;
     let h = (bb.y2 - bb.y1) * css_height;
     ctx.stroke_rect(x as f64, y as f64, w as f64, h as f64);
 }
+
+// The `point` template (PromptTask::Point) returns points, not boxes (§10.7);
+// render each as a small crosshair so that template is not silently blank.
+// Points are normalized [0.0, 1.0] in the same space as box corners.
+for pt in box_message.points.iter() {
+    let (cx, cy, r) = ((pt.x * css_width) as f64, (pt.y * css_height) as f64, 6.0_f64);
+    ctx.begin_path();
+    ctx.move_to(cx - r, cy); ctx.line_to(cx + r, cy);
+    ctx.move_to(cx, cy - r); ctx.line_to(cx, cy + r);
+    ctx.stroke();
+}
 </code></pre>
 <p>Stroke styling: line width 2.0 pixels in CSS pixels. Stroke color <code>#ff3030</code> (saturated red) for viewer-side; <code>#dd5050</code> (desaturated red) for streamer-side. Optional label drawn above the box with a filled rectangle background (same color at 70 percent alpha) and white 12-pixel sans-serif text.</p>
+<p><strong>Accessibility.</strong> The canvas overlay is purely visual (<code>pointer-events: none</code>, no DOM semantics), so it is invisible to assistive technology. To leave a non-visual signal, the detection <em>count</em> (the same value the §21.0.6 pill shows) is mirrored into a visually-hidden <code>aria-live="polite"</code> region that updates only when the count changes — not every inference cycle, which would be too chatty for a screen reader.</p>
 
 <h3>21.10 WebSocket reconnect on the WebAssembly client</h3>
 
@@ -5478,7 +5517,9 @@ ctx.scale(dpr, dpr).map_err(js_err("ctx.scale"))?;  // accumulating transform
 <tr><td>RtcPeerConnection <code>oniceconnectionstatechange</code></td><td>Same <code>PcHandles</code></td><td>Same</td></tr>
 <tr><td>RtcDataChannel <code>onopen</code> / <code>onmessage</code> / <code>onclose</code> / <code>onerror</code> (the "boxes" channel)</td><td><code>DcHandles { _open: Closure&lt;...&gt;, _msg: Closure&lt;...&gt;, _close: Closure&lt;...&gt;, _err: Closure&lt;...&gt; }</code></td><td>One DataChannel</td></tr>
 <tr><td>ResizeObserver callback (canvas sizing)</td><td><code>ObserverHandles { _resize: Closure&lt;...&gt; }</code></td><td>One video pane component</td></tr>
-<tr><td><code>requestVideoFrameCallback</code> per-frame callback</td><td><code>RvfcHandles { _cb: Closure&lt;...&gt;, handle: u32 }</code></td><td>One viewer pane (cancelled via <code>cancel_video_frame_callback(handle)</code> on unmount)</td></tr>
+<tr><td><code>requestVideoFrameCallback</code> per-frame callback (viewer overlay)</td><td><code>RvfcHandles { _cb: Closure&lt;...&gt;, handle: u32 }</code></td><td>One viewer pane (cancelled via <code>cancel_video_frame_callback(handle)</code> on unmount)</td></tr>
+<tr><td><code>requestAnimationFrame</code> redraw loop (streamer overlay — local source has no RTP timeline, §21.2)</td><td><code>RafHandles { _cb: Closure&lt;...&gt;, handle: i32 }</code></td><td>One streamer pane (cancelled via <code>cancel_animation_frame(handle)</code> on unmount / camera switch)</td></tr>
+<tr><td><code>matchMedia("(resolution: …dppx)")</code> change listener (device-pixel-ratio change, §21.8)</td><td>Same <code>ObserverHandles</code> as the ResizeObserver</td><td>One video pane (re-armed against the new ratio on each fire)</td></tr>
 <tr><td><code>setTimeout</code> callback for reconnect-backoff sleep</td><td><strong>One-shot: <code>Closure::once_into_js(...)</code></strong></td><td>Self-leaks into JS GC; fires exactly once and is collected</td></tr>
 </table>
 
