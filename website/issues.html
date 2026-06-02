@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Plan Review — Open Issues & Principle-Violations — LocateAnything-3B Web Demo</title>
+<style>
+  :root {
+    --bg: #fafafa;
+    --fg: #1c1c1c;
+    --muted: #555;
+    --accent: #1a5490;
+    --code-bg: #f0ede4;
+    --code-fg: #1c1c1c;
+    --border: #c8c4ba;
+    --warn-bg: #fff3c4;
+    --warn-border: #d4a017;
+    --warn-fg: #6b4e07;
+    --critical-bg: #fde2e2;
+    --critical-border: #c0392b;
+    --critical-fg: #6b1d12;
+    --info-bg: #e2eaf8;
+    --info-border: #4a6fa5;
+    --info-fg: #1e3a5f;
+  }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    color: var(--fg);
+    background: var(--bg);
+    line-height: 1.6;
+    max-width: 860px;
+    margin: 0 auto;
+    padding: 2rem 1.5rem 6rem;
+  }
+  h1 { font-size: 1.85rem; margin-top: 0; }
+  h2 {
+    font-size: 1.35rem;
+    border-bottom: 2px solid var(--border);
+    padding-bottom: 0.3rem;
+    margin-top: 2.5rem;
+  }
+  code {
+    font-family: "SF Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace;
+    font-size: 0.88em;
+    background: var(--code-bg);
+    color: var(--code-fg);
+    padding: 0.08em 0.35em;
+    border-radius: 3px;
+    border: 1px solid var(--border);
+  }
+  .note { padding: 0.8rem 1rem; border-radius: 4px; margin: 1rem 0; }
+  .note-info { background: var(--info-bg); border-left: 4px solid var(--info-border); color: var(--info-fg); }
+  .note-warn { background: var(--warn-bg); border-left: 4px solid var(--warn-border); color: var(--warn-fg); }
+  .lead { color: var(--muted); font-style: italic; margin: 1rem 0; }
+  .issue {
+    margin: 0.9rem 0;
+    padding: 0.7rem 1rem;
+    background: #fff;
+    border: 1px solid var(--border);
+    border-left: 4px solid var(--accent);
+    border-radius: 4px;
+  }
+  .issue strong { color: var(--accent); }
+  .divider {
+    text-align: center;
+    color: var(--muted);
+    font-variant: small-caps;
+    letter-spacing: 0.05em;
+    margin: 1.8rem 0 0.6rem;
+  }
+  .closing { background: var(--warn-bg); border-left: 4px solid var(--warn-border); color: var(--warn-fg); padding: 0.8rem 1rem; border-radius: 4px; margin: 1.2rem 0; }
+  hr { border: 0; border-top: 1px solid var(--border); margin: 2.5rem 0; }
+</style>
+</head>
+<body>
+
+<h1>Plan Review — Open Issues &amp; Principle-Violations</h1>
+<p><strong>Companion to <code>plan.html</code>.</strong> Living open-issues register — first compiled 2026-06-02, last updated 2026-06-03.</p>
+
+<div class="note note-info">
+This is the <strong>living, single source of truth</strong> for open issues in <code>website/plan.html</code> — not a frozen snapshot. It began as the verbatim issue list from the plan review and is now kept by one rule: <strong>anything we confirm gets documented here; anything we fix in the plan gets removed.</strong> Each entry follows one shape: <em>why the planner reached for it</em> (it almost always had a good reason), and <em>why it may nonetheless be an issue</em> — including the ones that look perfectly legitimate but quietly violate a stated principle. These are arguments to have and bugs to consider, recorded for the operator's decision.
+</div>
+
+<hr>
+
+<h2>The lineup</h2>
+
+<p class="lead">Fair. Here it is as a rogues' gallery — each one: why the planner reached for it, why I'd squint at it.</p>
+
+<div class="note note-info">
+<strong>First, three I wrongly accused</strong> (the full read cleared them): the <code>--bind-all-interfaces</code> flag — you asked for it, charges dropped. The fast/hybrid/slow generation modes — hardcoded per template, never a menu, the planner behaved. The dropped bounding box — logged and counted, not snuck under the rug.
+</div>
+
+<p class="lead">Now the lineup.</p>
+
+<div class="issue"><strong>1. The one-strike prompt.</strong> Lock the prompt for the whole session and, the instant LocateAnything-3B (NVIDIA's 3-billion-parameter grounding model) sneers at it, auto-release ownership — clean, atomic, no half-claimed states. But one typo the model dislikes ejects you from the streamer's chair, on a demo whose entire sport is fiddling with prompts. Cruel.</div>
+
+<div class="issue"><strong>2. The clock bouncer.</strong> Refuse to boot if the wall clock reads before 2024, because Transport Layer Security can't validate a certificate against a 1970 clock — honest failure. But a "sovereign, never-goes-down" box that won't start until Network Time Protocol whispers it the time is a small external dependency wearing a large independence badge.</div>
+
+<div class="issue"><strong>3. The 30-second velvet rope.</strong> When the streamer drops, hold their slot for 30 seconds so an iPhone hopping Wi-Fi to cellular can stroll back in. But you said "if anybody disconnects, anybody can take over" — and for half a minute, nobody can. A defensible reading of "cleanly." Still a reading.</div>
+
+<div class="issue"><strong>4. Collective punishment.</strong> Streamer vanished, so tear down every viewer at once — you can't watch a ghost. But a three-second streamer hiccup therefore blacks out the whole audience, who all reconnect-storm in unison. One flaky phone, everyone's screen.</div>
+
+<div class="issue"><strong>5. The Internet-Protocol-version-4 doorman.</strong> You named <code>127.0.0.1</code> and <code>0.0.0.0</code>, neither is version 6, so: IPv4 only, no IPv6 socket, ever. But that reads "two example addresses" as "outlaw the other protocol," and silently bars every viewer stranded on an IPv6-only phone behind Carrier-Grade Network Address Translation. For "everybody viewing," that's a real somebody.</div>
+
+<div class="issue"><strong>6. The blurry star of the show.</strong> Cap capture at 1280×720 because the forced H.264 Constrained Baseline Level 3.1 codec can't legally climb higher. But we then hand the grounding model a deliberately shrunk frame — against its stated appetite for 1440p — and paint its answers a full second late over buttery video. The detection is the act; we dimmed the spotlight to make the curtains sway nicely.</div>
+
+<div class="issue"><strong>7. The unfair referee.</strong> If LocateAnything-3B blips, fast-drain the streamer — resuming into a dead model is pointless. But the streamer's own network blip earns a cozy 30-second grace, while the model's hiccup — not their fault in the slightest — ejects them on the spot. Punished hardest for the one thing they didn't do.</div>
+
+<div class="issue"><strong>8. One waiter, whole restaurant.</strong> Run the entire Selective Forwarding Unit on a single actor task — no locks, no shared-state races, gloriously correct. But "everybody viewing" then squeezes through one thread sized for ~50 guests, and the plan itself shrugs that 100 is untested. Correct, right up until it's a queue.</div>
+
+<p class="divider">— the correctness gremlins —</p>
+
+<div class="issue"><strong>9. The portrait trap.</strong> Clamp capture to 1280 wide, 720 tall, and reject anything taller than 720 or skinnier than 640 as out-of-spec. But hold a phone upright and you get 720×1280 — identical macroblock budget, yet it trips the "too tall" wire and gets bounced. We may be slamming the door on every streamer who didn't turn their phone sideways. Worth confirming before it ships.</div>
+
+<div class="issue"><strong>10. The untested heart valve.</strong> The automated test fabricates the bounding-box WebRTC DataChannel by hand, so the pipeline glows green. But that's the exact shortcut that hides the bug we already bled from — the one where the browser, not the server, must offer that channel. The plan literally says a real client "would have caught it." So use one.</div>
+
+<p class="divider">— the petty offenders —</p>
+
+<div class="issue"><strong>11. The mode that never runs.</strong> "Fast" generation mode is defined, demanded at startup, and chosen by exactly zero templates — the server refuses to boot over a capability it never once uses.</div>
+
+<div class="issue"><strong>12. The 16,384-character ghost.</strong> A maximum-prompt-length constant nobody enforces (the frontend stops at 200, the server validates nothing) — the same dead-constant smell the plan proudly swept out elsewhere.</div>
+
+<div class="issue"><strong>13. One key for the whole kingdom.</strong> The secret that lets you watch is the secret that lets you seize the camera. Charming when everyone with the link is a friend; spicy the moment the link wanders.</div>
+
+<div class="closing">
+If you only stare hard at four: #1 and #4 are behaviors I'd want you to re-decide on purpose; #9 and #10 are the correctness bugs I'd chase before anything reaches a real phone.
+</div>
+
+<hr>
+
+<h2>Deeper cuts</h2>
+
+<p class="lead">Oh, there's more — these are the ones hiding behind a sensible-sounding sentence. Same gallery, deeper cuts.</p>
+
+<div class="issue"><strong>The unpinned codec.</strong> "Pin all versions!" you said, and the planner obeyed beautifully — every Rust crate to the digit, every Docker base image to its Secure Hash Algorithm 256 fingerprint. Then left the Advanced Package Tool (APT) packages floating, "to absorb Debian security updates." So the one library actually decoding your video — <code>libavcodec</code> and its siblings — is whatever the Debian Trixie mirror serves the morning you rebuild. The pinned base-image digest doesn't save you; <code>apt-get install</code> reaches right past it. You asked for reproducible; this is reproducible-except-the-part-that-touches-the-pixels.</div>
+
+<div class="issue"><strong>The colorspace nobody measured.</strong> libswscale defaults to BT.601, webcams mostly mean BT.709, so the plan reaches through <code>as_mut_ptr()</code> and forces BT.709 limited→full — explicit, rigorous-sounding, it even shows its work. But it forces 709 blind: it never reads what the stream actually signaled, so a genuine BT.601 camera gets a silently-wrong matrix feeding the detector — the exact silent-wrong-in-the-detection-path the project forbids. (The unwritten helper hides a second trap: for RGB output libswscale ignores <code>dstRange</code> and keys full-range off <code>srcRange</code>, so "full destination range" is misleading.) The kicker: the signal isn't lost — the H.264 VUI rides the bitstream, <code>libavcodec</code> parses it onto the frame, and <code>ffmpeg-next</code> exposes <code>color_space()</code> / <code>color_range()</code>. We're guessing at a number the decoder already knows.</div>
+
+<div class="issue"><strong>The bouncer with an infinite guest book.</strong> The home-grown Session Traversal Utilities for Network Address Translation (STUN) server rate-limits per source address and sweeps its table every 60 seconds — tidy, sovereign, no amplification. But it's an unauthenticated public User Datagram Protocol port, and it files one entry per distinct source address until the next sweep. Spray it with spoofed sources and the table balloons for a full minute before the broom comes. The plan itself calls this bound "soft" — on the single most exposed surface in the system. Soft is not a word you want there.</div>
+
+<div class="issue"><strong>Three nurses, one pulse.</strong> You said deciding whether a user is still connected is sometimes "none of our business." The plan then checks each viewer's liveness three ways at once: an application-level keepalive every 15 seconds, a Transmission Control Protocol keepalive at ~25, and Interactive Connectivity Establishment consent-freshness at ~21.5. Each is defensible as zombie-task hygiene — but it's three overlapping mechanisms diligently answering the exact question you were wary of asking.</div>
+
+<div class="issue"><strong>The graceful exit nobody takes.</strong> The plan choreographs a lovely 8-second farewell: send every peer a DataChannel goodbye, flush it, then disconnect — so browsers see a clean handoff instead of a frozen frame. And then it names the Out-Of-Memory killer "the loud-failure signal we want." But the Out-Of-Memory killer is SIGKILL — it shoots the process mid-word, skips the entire farewell, and leaves every viewer frozen until consent-freshness expires ~21 seconds later. The safety net under the ballet is a trapdoor.</div>
+
+<div class="issue"><strong>No relay, no entry.</strong> Sovereign to the bone, the plan runs its own STUN and defers a Traversal Using Relays around Network Address Translation (TURN) server until failures cross 2 percent. But "everybody viewing" includes phones on captive or corporate Wi-Fi that block User Datagram Protocol entirely — and with no relay over Transmission Control Protocol port 443 to fall back to, those people don't get a stuttery stream. They get a spinner, forever, with no error. The most fire-and-forget failure in the document.</div>
+
+<div class="issue"><strong>The test in a parallel universe.</strong> The lone automated end-to-end test runs on a single-threaded runtime; production runs four worker threads. So the entire careful argument that two people can't grab the streamer slot at once — "no <code>.await</code> between checking ownership and setting it" — is proven on paper and then rehearsed on the one runtime where the race it defends against literally cannot happen.</div>
+
+<div class="issue"><strong>A design system for a one-camera demo.</strong> You asked for an interface "friendly for mobile and Desktop." The plan replied with roughly fifteen subsections of viewport choreography: dynamic-viewport-height units, safe-area insets for the iPhone notch, a heads-up display that auto-hides and breathes (unless you prefer reduced motion), three blessed scroll regions, a full light-and-dark palette. It's gorgeous couture — for one streamer and a grid of seven cards.</div>
+
+<div class="issue"><strong>The biennial tap on the shoulder.</strong> Apple's Security framework hard-caps a certificate at 825 days, so the plan mints an 824-day one and asks the operator to regenerate "every ~27 months." It honors your "don't let a certificate quietly kill it" wish as far as Apple physically permits — yet a box you wanted to forget about still taps you on the shoulder every two years. (This one's Apple's fault, not the planner's — but it's the residue of the very fear you named.)</div>
+
+<div class="closing">
+If I had to point at the two that are genuinely dangerous rather than merely philosophical: the infinite guest book (a remote stranger can bloat memory until the Out-Of-Memory killer restarts you — and #4 means that restart is ugly) and the unpinned codec (your "pin everything" rule has a hole exactly where the video flows). The rest are arguments worth having; those two are bugs worth closing.
+</div>
+
+</body>
+</html>
