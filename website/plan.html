@@ -399,7 +399,7 @@
   <li><strong>Relative project paths</strong> — e.g., <code>../wasm-client/dist/index.html</code> (from <code>server/build.rs</code> reaching the WASM bundle), <code>../../../worker/prompts.py</code> (from <code>protocol/src/lib.rs</code> reaching the sibling LocateAnything-3B project's <code>worker/</code> directory).</li>
   <li><strong>Versioned crate references</strong> — e.g., <code>str0m 0.20.0 src/lib.rs:1395</code> (anyone can re-fetch via <code>cargo download</code> or <code>https://docs.rs/str0m/0.20.0/src/</code>).</li>
   <li><strong>GitHub URLs pinned to a tag</strong> — e.g., <code>https://github.com/algesten/str0m/blob/0.20.0/src/lib.rs#L1395</code>.</li>
-  <li><strong>RFC and W3C specification numbers / URLs</strong> — e.g., <code>RFC 8489 §14.2</code>, <code>https://www.w3.org/TR/webrtc/#dom-rtcrtptransceiver-setcodecpreferences</code>.</li>
+  <li><strong>RFC and W3C specification numbers / URLs</strong> — e.g., <code>RFC 8489 §14.2</code>, <code>https://www.w3.org/TR/webrtc/#dom-rtcrtptransceiver-setcodecpreferences</code>. <strong>Cite an external section with the <code>§</code> symbol, never the word "Section"</strong> — the Section 24.10 lint reserves the word "Section N.M" for detecting plan references, so <code>RFC 6184 §8.2.2</code> passes the lint but <code>RFC 6184 Section 8.2.2</code> is (deliberately) flagged.</li>
   <li><strong>The user's own <code>https://github.com/BigBIueWhale/personal_server</code></strong> — permitted unversioned (it is the canonical reference for the host's deployment posture).</li>
 </ul>
 <p>Local-machine paths that MUST NOT appear in committed source:</p>
@@ -2714,7 +2714,7 @@ let _ = self.phase_tx.send(self.phase.kind());</code></pre>
 <p>The demo server process runs a Tokio multi-thread runtime with the following long-lived tasks:</p>
 
 <ol>
-  <li><strong>Main task</strong> (<code>tokio::main</code>): parses CLI arguments via clap, reads or generates the TLS certificate, validates wall-clock plausibility (refuses to start if <code>SystemTime::now()</code> is before 2024-01-01 or after 2040-01-01), <strong>performs the boot-time LocateAnything-3B capabilities cross-check</strong> (see Section 12.2), constructs <code>AppState</code>, spawns the helpers below, then awaits <code>axum_server::bind_rustls(addr, rustls_config).handle(handle).serve(make_service)</code> (see Section 17.6 for the exact pattern), with graceful shutdown driven via <code>Handle::graceful_shutdown(Some(Duration))</code> from a signal-watcher task, then JOINS the SFU / decode / LA task handles within the shutdown budget (§18.2 — a deterministic join, not a blind sleep), then exits.</li>
+  <li><strong>Main task</strong> (<code>tokio::main</code>): parses CLI arguments via clap, reads or generates the TLS certificate, validates wall-clock plausibility (refuses to start if <code>SystemTime::now()</code> is before 2024-01-01; deliberately no upper bound — see Section 14.5), <strong>performs the boot-time LocateAnything-3B capabilities cross-check</strong> (see Section 12.2), constructs <code>AppState</code>, spawns the helpers below, then awaits <code>axum_server::bind_rustls(addr, rustls_config).handle(handle).serve(make_service)</code> (see Section 17.6 for the exact pattern), with graceful shutdown driven via <code>Handle::graceful_shutdown(Some(Duration))</code> from a signal-watcher task, then JOINS the SFU / decode / LA task handles within the shutdown budget (§18.2 — a deterministic join, not a blind sleep), then exits.</li>
   <li><strong>Signal handler task</strong>: spawns a Tokio task that calls <code>tokio::select! { _ = tokio::signal::ctrl_c() =&gt; ..., _ = tokio::signal::unix::signal(SignalKind::terminate())?.recv() =&gt; ... }</code> and notifies the shutdown <code>Arc&lt;tokio::sync::Notify&gt;</code> on either signal.</li>
   <li><strong>Authentication rate-limit garbage-collection task</strong>: on a 60-second tokio::time::interval, calls <code>RateLimiter::retain_recent()</code> on the per-IP rate limiter to evict entries whose buckets have fully refilled.</li>
   <li><strong>Cert-expiry re-check task</strong>: on a 6-hour <code>tokio::time::interval</code>, re-parses the live <code>cert.pem</code> at <code>STATE_DIR/cert.pem</code> via <code>x509-parser</code> and re-runs the §14.5 three-band check against <code>SystemTime::now()</code>. <strong>If the cert has crossed into the &lt;30-day-from-expiry band</strong>, log a WARN identical to the boot-time WARN (idempotent — operator sees the same message every 6 hours regardless of how many days have elapsed). <strong>If the cert has crossed into the &lt;7-day-from-expiry band</strong>, log an ERROR at every interval AND flip a process-local <code>cert_expiring_soon: AtomicBool</code> flag that <code>/v1/health</code> reads and reports as <code>status: "degraded"</code>. The binary does NOT self-exit (existing TLS sessions stay valid); the operator monitoring <code>/v1/health</code> or <code>docker logs</code> gets a continuous loud signal. <strong>If the cert is past <code>notAfter</code></strong>, the same flag is set, plus <code>cert_valid: false</code> is reported in <code>/v1/health</code>. This closes the silent-stall window in which a binary that started with 7–30 days of cert remaining keeps running through expiry without proactive logging. The 6-hour cadence is generous (the band crossings only happen once every ~27 months in normal operation); not perf-coupled.</li>
@@ -3000,7 +3000,7 @@ For Punycode encoding of IDN hostnames, a Rust crate such as <code>idna</code> w
 
 <h3>14.5 Startup logic</h3>
 <ol>
-  <li>Run the wall-clock sanity check: refuse to start if <code>SystemTime::now()</code> is before 2024-01-01 or after 2040-01-01. The lower bound catches a fresh container booting before systemd-timesyncd's first sync (epoch-0 or a 1970 default). The upper bound is far enough in the future that the cert's typical <code>notAfter</code> values (824 days = ~27 months, with regenerations cumulating well past 2030) cannot trip it as a false positive. With <code>--restart unless-stopped</code> on the <code>docker run</code> invocation, Docker loops the container indefinitely until systemd-timesyncd lands a sync (this loop is intentionally unbounded — there is no max-retries cap on <code>unless-stopped</code>; if NTP is unreachable for hours, the container retries forever at 1-minute intervals, and the operator sees a clear "wall clock before 2024-01-01" message in <code>docker logs la-website</code>).</li>
+  <li>Run the wall-clock sanity check: refuse to start if <code>SystemTime::now()</code> is before 2024-01-01. This catches a fresh container booting before systemd-timesyncd's first sync (epoch-0 or a 1970 default), where TLS certificate validation cannot work correctly — a genuine cannot-function condition, so a hard refuse-to-start is correct. <strong>There is deliberately NO upper bound.</strong> An earlier draft also refused to start after 2040-01-01, but a hard future ceiling is a self-inflicted time-bomb that contradicts the sovereign "I don't want the API server to stop working ... for no reason" requirement — and it guards against nothing the system does not already surface loudly: a clock skewed far into the future makes the TLS cert appear expired, which the cert-expiry re-check task (Section 12.1) reports as <code>status: "degraded"</code> on <code>/v1/health</code> while live TLS handshakes fail visibly, all without halting the binary. With <code>--restart unless-stopped</code> on the <code>docker run</code> invocation, Docker loops the container indefinitely until systemd-timesyncd lands a sync (this loop is intentionally unbounded — there is no max-retries cap on <code>unless-stopped</code>; if NTP is unreachable for hours, the container retries forever at 1-minute intervals, and the operator sees a clear "wall clock before 2024-01-01" message in <code>docker logs la-website</code>).</li>
   <li>Try to read both <code>cert.pem</code> and <code>key.pem</code>. Parse via <code>rustls_pemfile</code>. Any error → regenerate (after backing up the old files).</li>
   <li>Decode the leaf certificate via <code>x509-parser</code>. Read <code>notAfter</code> and the Subject Alternative Name list.</li>
   <li>Compute the desired Subject Alternative Name set from current configuration (Section 14.3). Compare set-equality against the cert's actual SANs.</li>
@@ -4948,7 +4948,19 @@ button.primary  { background: var(--accent); color: #fff; border-color: var(--ac
 button:active,
 button.primary:active { background: var(--accent-active); border-color: var(--accent-active); }
 button:disabled       { color: var(--fg-disabled); cursor: not-allowed; }
-button:focus-visible  { outline: 2px solid var(--accent); outline-offset: 2px; }
+/* INSET focus ring (negative offset): drawn inside the border box, so it is
+   immune to clipping by any `overflow: clip` ancestor and by the overflow-y:auto
+   scroll regions — a focused control flush to a scrollport edge would otherwise
+   have an OUTSIDE ring cropped (an ancestor's overflow clips a descendant's
+   outline; CSS2 §11.1.1). overflow-clip-margin cannot help here (no effect on
+   auto/scroll; unsupported in Safari). Use this inset convention for EVERY
+   focusable element — buttons, the prompt cards, and the form inputs added at
+   implementation time — not just buttons. */
+button:focus-visible  { outline: 2px solid var(--accent); outline-offset: -2px; }
+/* On the accent-filled primary button an --accent ring would blend into the
+   fill; reuse the #fff the primary button already uses for its label so the
+   inset ring stays visible. */
+button.primary:focus-visible { outline-color: #fff; }
 @media (any-hover: hover) {
     button:hover:not(:disabled) { filter: brightness(1.08); }
 }</code></pre>
@@ -6851,12 +6863,15 @@ patterns=(
     '/home/[A-Za-z0-9_-]+/'             # operator-specific home paths
     '/Users/[A-Za-z0-9_-]+/'            # macOS operator-home paths
     # (c) Patterns matching this throwaway design document's filename and
-    #     section numbering. Word-boundary, case-insensitive for the literal
-    #     document filename; the section-numbering patterns are case-sensitive
-    #     to avoid false positives on natural language inside long strings
-    #     or doc-comments.
+    #     section numbering. Case-insensitive for the literal document filename.
+    #     The section-numbering pattern matches ONLY capitalized "Section N"
+    #     (not lowercase "section n"), so natural-language prose like "the
+    #     critical section 3 of this loop" is NOT flagged. External RFC/W3C
+    #     section references use the "§" symbol (e.g. RFC 6184 §8.2.2), which
+    #     this pattern does not match — the word "Section N" is reserved for,
+    #     and therefore catches, plan references like "see Section 11.7".
     '[Pp]lan\.html'
-    '\b(per |see |from |in |the )?[Ss]ection [0-9]+(\.[0-9]+)*( step [0-9]+)?\b'
+    '\b(per |see |from |in |the )?Section [0-9]+(\.[0-9]+)*( step [0-9]+)?\b'
     '\bAppendix [A-Z]\b'
 )
 
