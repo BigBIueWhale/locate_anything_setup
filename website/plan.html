@@ -1484,6 +1484,7 @@ pub enum GenerationMode {
 
 <h3>10.6 SignalMessage enum (sent over /v1/signal WebSocket as JSON text)</h3>
 <p>Internally tagged with <code>#[serde(tag = "type", rename_all = "snake_case")]</code>. Every variant's struct has <code>#[serde(deny_unknown_fields)]</code>. Examples on the wire: <code>{"type":"claim","prompt":"Point to: drone in the sky.","generation_mode":"slow"}</code>; <code>{"type":"sdp_offer","sdp":"v=0\r\no=...\r\n..."}</code>.</p>
+<p><strong>Wire-size bound.</strong> The <code>/v1/signal</code> <code>WebSocketUpgrade</code> sets a conservative <code>.max_message_size(64 * 1024)</code> and <code>.max_frame_size(...)</code>: axum 0.8.9 defaults to 64 MiB / 16 MiB — orders of magnitude larger than any legitimate SDP offer or ICE candidate — so without an explicit cap an authenticated-but-buggy-or-hostile peer could force large per-frame allocations (the only other backstop is the 2 GiB container limit, §22). An oversize frame triggers a loud WebSocket close, not a silent drop.</p>
 <pre><code>#[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct ClaimMsg {
@@ -1506,7 +1507,10 @@ pub struct SdpMsg {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct IceCandidateMsg {
-    pub candidate:      String,        // "candidate:..." line per RFC 8839; empty string allowed for end-of-candidates signal
+    pub candidate:      String,        // "candidate:..." line per RFC 8839; empty = end-of-candidates.
+                                       // The WS handler SKIPS an empty candidate (str0m has no
+                                       // end-of-candidates API and Candidate::from_sdp_string("")
+                                       // errors), converting + forwarding only non-empty ones.
     pub sdp_mid:        Option&lt;String&gt;,
     pub sdp_m_line_idx: Option&lt;u16&gt;,
 }
@@ -1562,7 +1566,7 @@ pub enum SignalMessage {
 <div class="note note-critical">
 <strong>DataChannel reliability config (verified by source-level research on 2026-06-01):</strong> <code>ordered: false, reliability: Reliability::MaxRetransmits { retransmits: 0 }</code>. <em>NOT</em> the previously-drafted <code>ordered: true, max_retransmits: None</code> (reliable+ordered) — that config is wrong for our use case.
 
-<p><strong>Why unordered + zero retransmits is strictly correct:</strong> Each BoxMessage carries an <code>rtp_ts</code> field identifying the video frame it was inferred from. The WebAssembly client uses Strategy A (latest-wins, §21.2): a single <code>latest_box: RwSignal&lt;Option&lt;BoxMessage&gt;&gt;</code> slot holds the most-recent inference result, with wrap-aware "newer-rtp_ts wins" comparison on the rare case a DataChannel reorder delivers an older box after a newer one (§21.3.1). Therefore receive-order is irrelevant — the freshest box always wins, the box overlay is always at most one inference cycle stale (a property the user has explicitly accepted).</p>
+<p><strong>Why unordered + zero retransmits is strictly correct:</strong> Each BoxMessage carries a monotonic, server-assigned <code>frame_id</code> (§10.7). The WebAssembly client uses Strategy A (latest-wins, §21.2): a single <code>latest_box: RwSignal&lt;Option&lt;BoxMessage&gt;&gt;</code> slot holds the most-recent inference result, with "newer-frame_id wins" comparison on the rare case a DataChannel reorder delivers an older box after a newer one (§21.3.1). Therefore receive-order is irrelevant — the freshest box always wins, the box overlay is always at most one inference cycle stale (a property the user has explicitly accepted).</p>
 
 <p>If we used <code>Reliable</code> + <code>ordered</code>, SCTP would retransmit lost packets AND hold back subsequent packets until the lost one is delivered (head-of-line blocking) — then deliver the now-stale BoxMessage. That is exactly the failure mode Section 10.7.1 warns against. The <code>Channel::write</code> <code>Ok(false)</code> drop-on-backpressure only handles local 128-kibibyte SCTP buffer pressure; it does NOT prevent in-flight retransmissions causing stale delivery. Unordered+zero-retransmits eliminates the head-of-line stall and guarantees that any datagram arriving at the client is either the freshest available or simply absent.</p>
 
@@ -1592,14 +1596,15 @@ pub struct Point {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct BoxMessage {
-    pub frame_id:    u64,            // monotonic, server-assigned per frame
-    pub rtp_ts:      u32,            // 32-bit RTP timestamp per RFC 3550 (90 kHz clock for video).
-                                     // Wraps modulo 2^32 (~13.25 hours of streaming).
-                                     // Type matches str0m's MediaData.time low 32 bits AND the
-                                     // VideoFrameCallbackMetadata.rtpTimestamp field on the
-                                     // WebAssembly viewer side (which is also unsigned-32-bit
-                                     // per WICG spec). Using u64 would have implied non-wrapping
-                                     // arithmetic semantics that are silently wrong.
+    pub frame_id:    u64,            // monotonic, server-assigned per frame (the LA-client's
+                                     // per-frame counter, echoed by LA and stamped onto the box).
+                                     // This is the viewer's "newer-wins" ordering key (§21.3.1):
+                                     // u64 so it never wraps, and — unlike a 90 kHz source RTP
+                                     // timestamp — it is actually sourceable end-to-end. (A source
+                                     // rtp_ts was dropped from this struct: the SFU→decode AU
+                                     // channel carries only bytes + the contiguous flag, NOT
+                                     // MediaData.time, so a meaningful rtp_ts could never reach
+                                     // the box; frame_id serves the ordering need without it.)
     pub prompt_task: PromptTask,
     pub abstained:   bool,
     pub boxes:       Vec&lt;BoundingBox&gt;,
@@ -2041,7 +2046,12 @@ pub enum Resume {
 /// replaced in place (never cloned), and the `watch` broadcast carries the Copy
 /// `PhaseKind` discriminant (via `kind()`), never the rich phase, so a
 /// `session_id` / `peer_id` never leaks to viewer tasks. `Debug` is kept for
-/// the `tracing` formatters.
+/// the `tracing` formatters. The `session_id` is the bearer secret a
+/// `ResumeSession` presents to reclaim the slot during the ~30 s Draining
+/// window, so `mint_session_id()` MUST draw it from a CSPRNG — `aws_lc_rs::
+/// SystemRandom` (already used for the auth secret), ≥128 bits, hex/base64url —
+/// never a counter, PID, or timestamp, which a token-holding viewer could guess
+/// to hijack the slot mid-drain.
 #[derive(Debug)]
 pub enum Phase {
     Idle,
@@ -2448,10 +2458,15 @@ fn request_pli_from_streamer(streamer: &amp;mut Client, streamer_video_mid: Mid)
                 self.on_disconnect(peer_id, &amp;reason, intentional);
             }
             FsmCommand::AddRemoteCandidate { peer_id, candidate } =&gt; {
-                if let Some(c) = self.clients.iter_mut().find(|c| c.id == peer_id) {
+                match self.clients.iter_mut().find(|c| c.id == peer_id) {
                     // `add_remote_candidate` returns unit (https://docs.rs/str0m/0.20.0/src/str0m/lib.rs.html#1323);
                     // no Result to discard.
-                    c.rtc.add_remote_candidate(candidate);
+                    Some(c) =&gt; c.rtc.add_remote_candidate(candidate),
+                    // A candidate trickled before its offer was processed. The
+                    // normal single-socket FIFO ordering makes this unreachable,
+                    // but a reordering/hostile client could hit it — log loudly
+                    // rather than drop silently (§3.1, no silent drop).
+                    None =&gt; tracing::warn!(%peer_id, "AddRemoteCandidate for unknown peer; ignoring"),
                 }
             }
             FsmCommand::LaDown { error } =&gt; {
@@ -5015,7 +5030,7 @@ fn App() -&gt; impl IntoView {
   <dd>The user's own browser captures via <code>getUserMedia</code>; the resulting MediaStream is assigned to a local <code>&lt;video&gt;</code> element via <code>HtmlMediaElement::set_src_object</code>. Display latency is essentially zero (browser-internal pipeline). The bounding-box overlay is drawn via <code>requestAnimationFrame</code> (NOT rVFC — rVFC's <code>metadata.rtpTimestamp</code> is absent for local <code>getUserMedia</code> tracks per WICG video-rvfc spec, since local sources have no RTP timeline). On each RAF tick the canvas reads <code>latest_box</code> via <code>RwSignal::with_untracked</code> (no Leptos reactive subscription — pure pull) and renders the most-recent BoxMessage's rectangles. Color: desaturated red <code>#dd5050</code>. A small corner badge displays the running median overlay staleness (computed as below), so the streamer knows roughly how far behind live the overlay is. The staleness is the LA cycle plus pipeline overhead — ~785 ms hybrid, ~937 ms slow, ~210 ms point_to as of LA-3B (per <code>/home/user/Desktop/locate_anything_setup/docs/DRONE_DETECTION.md:113-117</code>); a model swap changes this one-for-one without architectural change.
 
   <p><strong>Staleness-badge construction (buildable, no <code>getStats</code>).</strong> The badge answers "how far behind live is my overlay?" — which, under Strategy A plus LocateAnything-3B's stop-and-wait pipeline, is essentially one inference cycle. Measure it directly and locally: on each <code>BoxMessage</code> arrival (in the "boxes" DataChannel <code>onmessage</code> closure, §21.3.1) push <code>web_sys::window().unwrap().performance().unwrap().now()</code> — a monotonic <code>DOMHighResTimeStamp</code> in milliseconds — into a small <code>VecDeque&lt;f64&gt;</code> capped at ~16 entries; the badge shows the running median of the consecutive-arrival deltas. No <code>getStats</code> poll loop, no RTP-timestamp correlation, no extra dependency.</p>
-  <p><strong>Why not a true send→box round-trip from <code>getStats</code>.</strong> A genuine "frame T sent → box for T returned" RTT would require mapping <code>msg.rtp_ts</code> to the wall-clock instant the streamer sent frame T — but the WebRTC statistics model exposes <strong>no outbound RTP timestamp</strong>: <code>RTCOutboundRtpStreamStats</code> (and the <code>RTCSentRtpStreamStats</code> / <code>RTCRtpStreamStats</code> it extends) carry no current-RTP-timestamp field to correlate against, and the local <code>getUserMedia</code> source has no RTP timeline at all (which is also why the streamer overlay uses <code>requestAnimationFrame</code>, not rVFC). The inter-arrival median captures the dominant term (inference latency, ~785 ms hybrid) honestly; the few-tens-of-milliseconds network legs it omits are noise at this scale. (<code>RTCRemoteInboundRtpStreamStats.roundTripTime</code> does exist, but it measures only the streamer↔SFU network hop, not the box pipeline — the wrong number for this badge.)</p></dd>
+  <p><strong>Why not a true send→box round-trip from <code>getStats</code>.</strong> A genuine "frame T sent → box for T returned" RTT would require mapping a returned box back to the wall-clock instant the streamer sent that frame — but the WebRTC statistics model exposes <strong>no outbound RTP timestamp</strong>: <code>RTCOutboundRtpStreamStats</code> (and the <code>RTCSentRtpStreamStats</code> / <code>RTCRtpStreamStats</code> it extends) carry no current-RTP-timestamp field to correlate against, and the local <code>getUserMedia</code> source has no RTP timeline at all (which is also why the streamer overlay uses <code>requestAnimationFrame</code>, not rVFC). The inter-arrival median captures the dominant term (inference latency, ~785 ms hybrid) honestly; the few-tens-of-milliseconds network legs it omits are noise at this scale. (<code>RTCRemoteInboundRtpStreamStats.roundTripTime</code> does exist, but it measures only the streamer↔SFU network hop, not the box pipeline — the wrong number for this badge.)</p></dd>
 
   <dt>Viewer path</dt>
   <dd>The user's browser receives a MediaStream from the server via <code>RTCPeerConnection.set_ontrack</code> callback's <code>RtcTrackEvent.streams[0]</code>; this stream is assigned to a local <code>&lt;video&gt;</code> element. End-to-end streamer-camera → viewer-screen latency is the sum of the streamer's encoder (libwebrtc default ~30–80 ms), LAN/Internet transit (~5–50 ms), the SFU re-publish (sub-ms, verified at <code>str0m 0.20.0 src/media/writer.rs:137-181</code> — no buffering, immediate drain via <code>already_happened</code> sentinel at <code>src/util/time_tricks.rs:52-54</code>), the viewer browser's adaptive jitter buffer (default ~20–150 ms; <strong>lowered via <code>RTCRtpReceiver.jitterBufferTarget = 50</code> in §21.2.1 below where supported</strong>), and viewer decode/render (~30 ms) — roughly ~120–250 ms typical with the jitter-buffer hint applied. The overlay is drawn via <code>requestVideoFrameCallback</code> when supported (it is, across the entire Section 22.1 matrix); the callback's frame-presentation tick is exactly when we want to redraw the canvas. Inside the callback, read <code>latest_box</code> via <code>RwSignal::with_untracked</code> and render. Color: saturated red <code>#ff3030</code>. The box arrives ~one LA cycle after the frame it describes was captured; by the time it lands at the viewer, the viewer's video is presenting a frame ~25 frames downstream — the rendered box is therefore drawn on a different frame than it was inferred from, which is exactly what the user permits.</dd>
@@ -5023,7 +5038,7 @@ fn App() -&gt; impl IntoView {
 
 <p><strong>Why not just RAF on both paths?</strong> Using rVFC on the viewer path lets the canvas redraw tick match the actual video-frame-presentation cadence (which can be lower than 60 Hz under congestion or thermal throttle on mobile), avoiding wasted draws and visible canvas-vs-video mismatch during low-framerate playback. On the streamer path the local video has effectively no jitter buffer and runs at the camera's actual cadence, so RAF (which fires at display-refresh rate) is the natural fit; rVFC offers no advantage AND has the spec-mandated <code>rtpTimestamp == undefined</code> for local sources.</p>
 
-<p>The legacy strict-no-fallback rule on missing <code>metadata.rtpTimestamp</code> (a previous draft rejected the overlay loudly) is repurposed in §21.3 to apply only to the viewer path — and even there, it is now diagnostic only (the rtp_ts is used for ordering boxes on the receive side, not for sync).</p>
+<p>The legacy strict-no-fallback rule on missing <code>metadata.rtpTimestamp</code> (a previous draft rejected the overlay loudly) is repurposed in §21.3 to apply only to the viewer path — and even there, it is now diagnostic only (the presented-frame rtpTimestamp is an observability signal; box ordering uses the monotonic <code>BoxMessage.frame_id</code>, §21.3.1, not this).</p>
 
 <h3>21.3 The <code>requestVideoFrameCallback</code> extern declaration</h3>
 <p>The <code>requestVideoFrameCallback</code> method is not bound in <code>web-sys</code> version 0.3.99 (verified by reading <code>wasm-bindgen-0.2.122/crates/web-sys/src/features/gen_HtmlVideoElement.rs</code>). The WebAssembly client declares the binding manually. The complete extern includes the <code>VideoFrameCallbackMetadata</code> dictionary type with all ten fields per the WICG <em>HTMLVideoElement.requestVideoFrameCallback()</em> draft specification (verified live on 2026-06-01):</p>
@@ -5069,9 +5084,9 @@ extern "C" {
     /// RTP packet header. WebRTC video runs at 90 kHz per RFC 3550, so the
     /// units are 1/90000 second ticks, monotonically increasing modulo 2^32.
     /// This value matches the `data.time` MediaTime that str0m exposes on
-    /// the server side via Event::MediaData — the demo server uses this for
-    /// the BoxMessage.rtp_ts field, and the WASM viewer's wrap-aware
-    /// "newer-rtp_ts wins" latest-wins ordering key (§21.3.1).
+    /// the server side via Event::MediaData. The WASM viewer keeps this
+    /// presented-frame rtpTimestamp only as an observability diagnostic
+    /// (current_frame_rtp_ts, §21.3); box ordering uses BoxMessage.frame_id.
     pub type VideoFrameCallbackMetadata;
 
     #[wasm_bindgen(method, getter, js_name = "presentationTime")]
@@ -5217,9 +5232,8 @@ pub struct DcState {
     /// render the most recent BoxMessage on whatever frame is currently
     /// being presented, exactly as the user's stated goal allows ("no need
     /// for bounding boxes to come in at the same time as the frame being
-    /// presented"). The `rtp_ts` field on BoxMessage is retained for
-    /// diagnostics and for ordering (newer rtp_ts wins on the rare DC
-    /// reorder), not for sync.
+    /// presented"). The `frame_id` field on BoxMessage is the ordering
+    /// key (newer frame_id wins on the rare DC reorder), not a sync key.
     pub latest_box:         RwSignal&lt;Option&lt;BoxMessage&gt;&gt;,
 }
 
@@ -5257,22 +5271,18 @@ pub fn attach_boxes_dc(
             };
             // Strategy A: keep the latest BoxMessage only. On the rare case
             // a reordered datagram delivers an older box AFTER a newer one
-            // (unordered DataChannel, unreliable), `wrapping_sub` lets us
-            // detect this and reject — newer-rtp_ts wins, never overwrite
-            // backwards. Note that under stop-and-wait LA + LAN transport,
-            // reordering is essentially impossible; this guard is defense.
+            // (unordered DataChannel, unreliable), reject the stale one —
+            // newer-frame_id wins, never overwrite backwards. Under stop-and-wait
+            // LA + LAN transport reordering is essentially impossible; this guard
+            // is defense. We order by `frame_id` (u64, monotonic, server-assigned
+            // — §10.7), NOT a 90 kHz RTP timestamp: frame_id is actually sourceable
+            // end-to-end (the SFU→decode AU channel carries bytes + the contiguous
+            // flag only, never MediaData.time) and, being u64, never wraps — so a
+            // plain `>` is correct, no RFC-1982 serial arithmetic needed.
             buf_for_msg.update(|slot| {
                 let accept = match slot {
                     None =&gt; true,
-                    Some(cur) =&gt; {
-                        // Treat msg as "newer" if (msg.rtp_ts - cur.rtp_ts)
-                        // mod 2^32 is in the forward half (≤ 2^31). This is
-                        // RFC 1982 §3.2 serial-number-arithmetic sequence-comparison
-                        // for u32 RTP timestamps; tolerates the ~13-hour
-                        // wrap-around cleanly.
-                        let diff = msg.rtp_ts.wrapping_sub(cur.rtp_ts);
-                        diff != 0 &amp;&amp; diff &lt; 0x8000_0000
-                    }
+                    Some(cur) =&gt; msg.frame_id &gt; cur.frame_id,
                 };
                 if accept {
                     *slot = Some(msg);
@@ -5306,7 +5316,7 @@ pub fn attach_boxes_dc(
 }
 </code></pre>
 
-<p><strong>Why latest-wins instead of frame-keyed lookup.</strong> The user explicitly granted permission for boxes and frames to be desynchronized: "no need for the bounding boxes to come in at the same time as the frame being presented." Under that constraint, frame-keyed lookup is over-engineered AND broken at realistic LA latency: LocateAnything-3B's hybrid mode takes ~785 ms; by the time the box for frame X arrives at the viewer, the video has advanced ~24 frames past X. An exact-rtp_ts <code>BTreeMap::get</code> would never find a match — boxes would pile up unused and viewers would see nothing. Latest-wins draws the most-recent inference result on whatever frame the rVFC callback (or RAF, for the streamer's local source) is currently presenting; the staleness is honestly one full inference cycle.</p>
+<p><strong>Why latest-wins instead of frame-keyed lookup.</strong> The user explicitly granted permission for boxes and frames to be desynchronized: "no need for the bounding boxes to come in at the same time as the frame being presented." Under that constraint, frame-keyed lookup is over-engineered AND broken at realistic LA latency: LocateAnything-3B's hybrid mode takes ~785 ms; by the time the box for frame X arrives at the viewer, the video has advanced ~24 frames past X. An exact-frame-keyed <code>BTreeMap::get</code> would never find a match — boxes would pile up unused and viewers would see nothing. Latest-wins draws the most-recent inference result on whatever frame the rVFC callback (or RAF, for the streamer's local source) is currently presenting; the staleness is honestly one full inference cycle.</p>
 
 <p><strong>Wrap-aware comparison.</strong> The 32-bit RTP timestamp at 90 kHz wraps modulo 2^32 every ~13.25 hours. The accept-newer-only guard uses RFC 1982 §3.2 serial-number arithmetic: <code>(new - current) mod 2^32 &lt; 2^31</code> means "new is forward of current in the cyclic order". This handles the wrap edge correctly without needing an explicit "did we wrap" flag — at <code>cur = 0xFFFF_FF00, new = 0x0000_0100</code>, the wrapping subtraction yields <code>0x200</code> which is well under <code>0x8000_0000</code>, so new is correctly accepted as forward across the wrap.</p>
 
@@ -6637,7 +6647,7 @@ str0m = { version = "=0.20.0", features = ["unversioned"] }   # H264Packetizer +
 <ul>
   <li><code>curl</code>'s WebSocket support (added in curl 7.86.0, October 2022) is experimental and gated behind <code>--enable-websockets</code> at compile time. Debian Trixie's <code>curl</code> package's WebSocket compile-time enablement is not pinned; relying on it is fragile.</li>
   <li>Even when available, curl's WebSocket mode is byte-stream-oriented; constructing a properly-framed WebSocket text message with the right masking from shell is brittle.</li>
-  <li>The integration test in 24.4.2 already exercises the full Selective Forwarding Unit code path including the WebSocket signaling round-trip in-process via str0m. There is no additional load-bearing flow that layer 3 would cover that 24.4.2 doesn't.</li>
+  <li>The integration test in 24.4.2 exercises the SFU's media + DataChannel fan-out against a real <code>UdpSocket</code>, but via the <code>test_support</code> DirectApi credentials seam — it does NOT drive the live <code>/v1/signal</code> WebSocket, the auth middleware, or <code>accept_offer</code> SDP parsing (per 24.4.2.3's honest-gaps list). Those are covered by the live HTTP probes (24.4.1) plus manual testing; layer 3 was dropped because a third smoke layer would only have duplicated the HTTP probes, NOT because 24.4.2 covers signaling. <strong>A scripted client driving the real offer/answer + DataChannel negotiation end-to-end would be a worthwhile addition</strong> — it would, for instance, have caught the §10.7 "the client must offer the boxes DataChannel" bug that 24.4.2's DirectApi-manufactured channel masks.</li>
   <li>Adding Python or a tiny Rust binary into the runtime image solely to make this one probe work expands the runtime image's attack surface for no proportional gain.</li>
 </ul>
 
