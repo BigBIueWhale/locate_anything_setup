@@ -643,11 +643,23 @@ let offer = wasm_bindgen_futures::JsFuture::from(pc.create_offer())
 <h4>4.5.9 <code>rcgen::Error</code> (rcgen 0.14.8)</h4>
 <p><strong>Error impl status: VERIFIED.</strong> <code>impl std::error::Error for Error {}</code> at <code>rcgen-src/rcgen/src/error.rs:109</code>. The enum is <code>#[non_exhaustive]</code> (line 4); use <code>_ =&gt;</code> in any match.</p>
 <pre><code>use anyhow::Context;
-use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256};
+use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256,
+            ExtendedKeyUsagePurpose, SanType};
+use std::net::IpAddr;
 
 let mut params = CertificateParams::new(vec![])
-    .context("rcgen CertificateParams::new (empty SAN vec, will populate below)")?;
-// ... set params ...
+    .context("rcgen CertificateParams::new (empty SAN vec, populated below)")?;
+
+// Apple trustd REJECTS a TLS server cert — even a user-trusted self-signed one,
+// with NO user-interface bypass — unless it carries serverAuth EKU, validity
+// &lt;= 825 days, AND a matching SAN (§14.1-§14.3). rcgen 0.14.8 supplies none of
+// these by default: extended_key_usages starts empty and not_after defaults to
+// the year 4096. They MUST be set explicitly, or every iPhone/iPad/macOS Safari
+// (the bulk of a camera demo's audience) silently fails to connect:
+params.extended_key_usages.push(ExtendedKeyUsagePurpose::ServerAuth);
+params.not_before = not_before;          // now_utc() - 60 s (clock skew); §14.2
+params.not_after  = not_after;           // not_before + 824 days; §14.2
+params.subject_alt_names = san_list;     // Vec&lt;SanType&gt; built per §14.3
 
 let key_pair = KeyPair::generate_for(&amp;PKCS_ECDSA_P256_SHA256)
     .context("rcgen KeyPair::generate_for(ECDSA_P256_SHA256) via aws-lc-rs")?;
@@ -2951,7 +2963,7 @@ fn build_binding_response(req: &amp;[u8], src: SocketAddr) -&gt; Option&lt;Vec&l
 
 <h3>14.2 Validity period: 824 days</h3>
 <div class="note note-critical">
-<strong>This is binding.</strong> The Apple Security framework (<code>trustd</code> on Apple iOS, Apple iPadOS, and Apple macOS) enforces a maximum 825-day cert validity for all TLS server certificates issued on or after 2020-09-01, including user-trusted self-signed certs. There is no user-interface bypass. Empirically verified by independent researcher Michal Špaček: a certificate with 825-day notAfter loads in Apple Safari; 826-day fails. To stay just under the cliff, the cert generation uses 824 days.
+<strong>This is binding.</strong> The Apple Security framework (<code>trustd</code> on Apple iOS, Apple iPadOS, and Apple macOS) enforces a maximum 825-day cert validity for all TLS server certificates issued on or after 2020-09-01, including user-trusted self-signed certs. There is no user-interface bypass. Empirically verified by independent researcher Michal Špaček: a certificate with 825-day notAfter loads in Apple Safari; 826-day fails. To stay just under the cliff, the cert generation uses 824 days. <strong>Two implementation traps would silently trip this cliff (both verified against rcgen 0.14.8 and wired correctly in the §4.5.9 cert-generation code):</strong> (1) the computed <code>not_before</code>/<code>not_after</code> MUST be ASSIGNED to <code>params.not_before</code>/<code>params.not_after</code> — rcgen's default <code>not_after</code> is the year 4096, so merely computing the dates without assigning them yields a ~2070-year cert that exceeds the cap and is rejected; (2) Apple trustd ALSO requires <code>ExtendedKeyUsage = serverAuth</code> on the leaf — the same support.apple.com requirements list, the same no-bypass rejection — and rcgen leaves the EKU vector empty by default, so <code>params.extended_key_usages.push(ExtendedKeyUsagePurpose::ServerAuth)</code> is mandatory. Together with the §14.3 SAN and the §14.1 ECDSA-P256 key, these are the four iOS-13+ trusted-leaf requirements; the demo bakes in all four (none is an operator option).
 </div>
 
 <p>Construction: <code>let not_before = OffsetDateTime::now_utc() - time::Duration::seconds(60);</code> (60-second back-skew for clock-drift tolerance on first boot); <code>let not_after = not_before + time::Duration::days(824);</code>.</p>
@@ -2960,9 +2972,9 @@ fn build_binding_response(req: &amp;[u8], src: SocketAddr) -&gt; Option&lt;Vec&l
 <p>Always-baked: <code>IpAddress(127.0.0.1)</code>. The <code>DnsName("localhost")</code> SAN is NOT included by default because on most Linux/macOS systems <code>/etc/hosts</code> maps <code>localhost</code> to BOTH <code>127.0.0.1</code> AND <code>::1</code>; modern browsers' Happy-Eyeballs / RFC 6724 destination-address-selection prefers IPv6 first and will try <code>[::1]:8443</code>, fail (no IPv6 listener; see Section 1's IPv4-only posture), and fall back to <code>127.0.0.1</code> only after a multi-second timeout. Operators visiting the demo should type <code>https://127.0.0.1:8443/#&lt;token&gt;</code>, NOT <code>https://localhost:8443/...</code> — and the cert reflects that. If the operator passes <code>--public-host localhost</code> (rare but possible), only then is <code>DnsName("localhost")</code> baked in, alongside a single <code>tracing::warn!</code> at startup explaining the IPv6 fallback hazard.</p>
 <p>Plus the resolved address(es) of <code>--public-host</code>:</p>
 <ul>
-  <li>If <code>--public-host</code> parses as <code>std::net::Ipv4Addr</code>: use directly as <code>SanType::IpAddress(addr)</code>.</li>
+  <li>If <code>--public-host</code> parses as <code>std::net::Ipv4Addr</code>: add as <code>SanType::IpAddress(IpAddr::V4(addr))</code> — rcgen's <code>SanType::IpAddress</code> wraps <code>std::net::IpAddr</code>, not <code>Ipv4Addr</code>, so the <code>Ipv4Addr</code> must be lifted to <code>IpAddr::V4</code> (or <code>.into()</code>).</li>
   <li>If <code>--public-host</code> parses as <code>std::net::Ipv6Addr</code> or any other <code>IpAddr</code> variant that is not IPv4: refuse to start with a chained anyhow error explaining the IPv4-only constraint (the binary does not listen on any IPv6 socket; baking an IPv6 SAN into the cert would mislead browsers that resolve the hostname to AAAA records first).</li>
-  <li>Otherwise (DNS hostname): resolve via <code>tokio::net::lookup_host(format!("{host}:51000"))</code> which uses the standard C library <code>getaddrinfo</code> on a Tokio blocking thread; returns all A and AAAA records. <strong>Filter to A records only</strong>; AAAA records (IPv6) are dropped with a single <code>tracing::info!</code> log line noting that they were ignored. If the filtered set is empty (the hostname has no A record), refuse to start with a chained error. Add each surviving IPv4 address as <code>SanType::IpAddress(addr)</code>, plus the original hostname as <code>SanType::DnsName(host_ia5)</code> (so cert is valid for both name and IPv4 literal).</li>
+  <li>Otherwise (DNS hostname): resolve via <code>tokio::net::lookup_host(format!("{host}:51000"))</code> which uses the standard C library <code>getaddrinfo</code> on a Tokio blocking thread; returns all A and AAAA records. <strong>Filter to A records only</strong>; AAAA records (IPv6) are dropped with a single <code>tracing::info!</code> log line noting that they were ignored. If the filtered set is empty (the hostname has no A record), refuse to start with a chained error. Add each surviving IPv4 address as <code>SanType::IpAddress(IpAddr::V4(addr))</code>, plus the original hostname as <code>SanType::DnsName(host_ia5)</code> (so cert is valid for both name and IPv4 literal).</li>
 </ul>
 
 <div class="note note-warn">
