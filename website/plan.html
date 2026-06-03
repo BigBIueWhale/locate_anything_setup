@@ -2667,7 +2667,7 @@ impl Sfu {
 <ol>
   <li><strong>(WS handler)</strong> Identify the peer by <code>peer_id</code> (the WebSocket session id, NOT a per-Rtc identifier).</li>
   <li><strong>(WS handler)</strong> The old <code>Rtc</code> (if any) is owned by the FSM, not by the WS handler. The WS handler signals "I have a fresh offer for this peer_id" via the new <code>FsmCommand::AttachStreamer</code> in step 7, which causes the FSM to drop the old <code>Rtc</code> (pure-value-drop per <code>/tmp/str0m-src/src/lib.rs:869-891</code>: owned-field-only struct, no <code>impl Drop</code> in the crate). The old <code>Rtc</code> releases SCTP/ICE/packetizer/BWE state with the implicit Drop. No background tasks, no cancel calls.</li>
-  <li><strong>(WS handler)</strong> Construct a fresh <code>Rtc</code>: <code>let mut rtc = Rtc::builder().clear_codecs().enable_h264(true).enable_bwe(Some(Bitrate::kbps(2500))).set_ice_lite(true).build(std::time::Instant::now());</code>. The <code>build(Instant)</code> argument is required as of str0m 0.20.0 (verified at <code>/tmp/str0m-src/src/config.rs:612</code>: <code>pub fn build(self, start: Instant) -&gt; Rtc</code>). The <code>set_ice_lite(true)</code> pin is documented per Section 20.4.</li>
+  <li><strong>(WS handler)</strong> Construct a fresh <code>Rtc</code> with the SAME forced-<code>42e01f</code> config as Section 20.4 — advertise ONLY <code>42e01f</code>, NOT <code>enable_h264(true)</code>, or the reconnect path re-opens the server-side profile gap Section 20.4 closes (factor the builder into a shared constructor so the two can never drift): <code>let mut builder = Rtc::builder().clear_codecs().enable_bwe(Some(Bitrate::kbps(2500))).set_ice_lite(true); builder.codec_config().add_h264(108.into(), Some(109.into()), true, 0x42e01f); let mut rtc = builder.build(std::time::Instant::now());</code>. The <code>build(Instant)</code> argument is required as of str0m 0.20.0 (verified at <code>/tmp/str0m-src/src/config.rs:612</code>: <code>pub fn build(self, start: Instant) -&gt; Rtc</code>). The <code>set_ice_lite(true)</code> pin is documented per Section 20.4.</li>
   <li><strong>(WS handler)</strong> Add local ICE candidates: for each resolved address of <code>--public-host</code>, call <code>rtc.add_local_candidate(Candidate::host(SocketAddr::new(addr, 51000), "udp")?)</code>.</li>
   <li><strong>(WS handler)</strong> Do NOT add a DataChannel here. The boxes channel is offered by the CLIENT (it calls <code>create_data_channel_with_data_channel_dict("boxes", …)</code> before <code>createOffer</code> — §10.7, §21.3.1), so the incoming offer already carries the <code>m=application</code> line. An answerer cannot add an m-section the offer omits (RFC 8829 §5.3.1), so a server-side <code>add_channel_with_config</code> before <code>accept_offer</code> would be silently dropped and the channel would never open. The server obtains the channel via <code>Event::ChannelOpen</code> (step 8) and writes to it via <code>rtc.channel(cid)</code>.</li>
   <li><strong>(WS handler)</strong> <code>let sdp_answer = rtc.sdp_api().accept_offer(offer)?;</code> → <code>let answer_str = sdp_postprocess::inject_bandwidth_caps(sdp_answer.to_sdp_string(), 2500)?;</code> (Section 20.3 details the post-processing). Send <code>answer_str</code> back over the WebSocket as <code>SignalMessage::SdpAnswer</code>.</li>
@@ -4137,6 +4137,35 @@ the !Send libswscale Context). Sync fn run via std::thread (Section 11.3):
                   if errno == ffmpeg_next::error::EAGAIN =&gt; continue, // cold-start, benign (h264_slice.c:1376-1383)
               Err(e) =&gt; return Err(e).context("libavcodec receive_frame"),
           }
+          // Server-side WebRTC INGRESS validation. The SDP only PROMISES Constrained
+          // Baseline 42e01f; str0m does not police the bitstream, and libwebrtc emits
+          // out-of-level frames without downscaling (Section 20.2). These two fail-loud
+          // checks enforce level + profile at the data plane, not merely request them
+          // of the client. The level check is orientation-agnostic (macroblock count,
+          // NOT the axis-locked w&lt;=1280 &amp;&amp; h&lt;=720 that would wrongly reject a
+          // 720x1280 portrait phone — same in-level 3600-MB budget).
+          let mbs = ((yuv.width() as usize + 15) / 16) * ((yuv.height() as usize + 15) / 16);
+          if mbs &gt; 3600 {
+              anyhow::bail!(
+                  "decoded frame {}x{} = {} macroblocks exceeds H.264 Level 3.1 MaxFS \
+                   (3600); a conforming streamer cannot produce this — refusing \
+                   out-of-level ingress",
+                  yuv.width(), yuv.height(), mbs
+              );
+          }
+          // decoder.profile() reads libavcodec's parsed-SPS profile (ffmpeg-next 7.1.0
+          // codec/decoder/opened.rs:73). The Section 20.4 config guarantees we only
+          // ANSWERED 42e01f, but a non-browser peer could negotiate it and then send
+          // Main/High bytes; this catches that. Lenient on a not-yet-known profile.
+          if let ffmpeg_next::codec::profile::Profile::H264(p) = decoder.profile() {
+              if !matches!(p, ffmpeg_next::codec::profile::H264::ConstrainedBaseline) {
+                  anyhow::bail!(
+                      "decoded H.264 profile {p:?} is not Constrained Baseline (42e01f); \
+                       the negotiated profile was Constrained Baseline but the bitstream \
+                       is non-conforming — refusing out-of-profile ingress"
+                  );
+              }
+          }
           // Colour-convert this frame and publish. We convert EVERY decoded frame
           // (not just the ones LA consumes): on this hardware the swscale of the
           // ~29 frames/sec LA skips is irrelevant, and gating it on an LA-demand
@@ -4401,7 +4430,7 @@ The defense is belt-and-braces: configure both ends to advertise H.264 only.
 </div>
 
 <h4>20.1.1 Server-side: force <code>str0m</code> to advertise H.264 only</h4>
-<p>In the <code>str0m::Rtc::builder()</code> chain (Section 20.4), call <code>.clear_codecs()</code> followed by <code>.enable_h264(true)</code>. Do NOT call <code>.enable_vp8(...)</code>, <code>.enable_vp9(...)</code>, or <code>.enable_av1(...)</code>. After <code>clear_codecs</code>, str0m's <code>codec_config.params</code> is empty; <code>enable_h264(true)</code> inserts <strong>seven</strong> H.264 payload-type entries (verified against <code>src/format/codec_config.rs:243-261</code> on 2026-06-02): profiles <code>42001f</code>, <code>42e01f</code>, and <code>4d001f</code> each in BOTH packetization-mode 1 and packetization-mode 0, PLUS <code>64001f</code> in packetization-mode 1 ONLY — that is 3×2 + 1 = 7, not 8, because <code>64001f</code> has no packetization-mode-0 variant (this is why the count is seven). The <code>42e01f</code> packetization-mode-1 entry (payload type 108) is the one our pipeline expects. The resulting answer m-line lists only H.264 payload-types that intersect the offer, and any offer that doesn't carry H.264 results in a clean SDP-negotiation failure.</p>
+<p>In the <code>str0m::Rtc::builder()</code> chain (Section 20.4), call <code>.clear_codecs()</code>, then add a SINGLE H.264 entry: <code>builder.codec_config().add_h264(108.into(), Some(109.into()), true, 0x42e01f)</code> (the <code>codec_config()</code> accessor is public — <code>src/config.rs:194-197</code>; <code>add_h264</code> at <code>src/format/codec_config.rs:125-145</code> sets <code>level_asymmetry_allowed</code> and the packetization-mode for you). Do NOT call <code>.enable_h264(true)</code>: it inserts <strong>seven</strong> H.264 payload-type entries — profiles <code>42001f</code>, <code>42e01f</code>, <code>4d001f</code> in BOTH packetization-modes plus <code>64001f</code> packetization-mode 1 (verified at <code>src/format/codec_config.rs:243-261</code>) — so the server would also advertise Main (<code>4d001f</code>) and High (<code>64001f</code>) and ACCEPT them: str0m matches H.264 on the exact <code>profile-level-id</code> (<code>src/format/payload_params.rs:404-442</code>), and its own test (<code>src/format/codec_config.rs:717-730</code>) asserts a <code>4d001f</code> offer locks at its payload type. Advertising ONLY the <code>42e01f</code> packetization-mode-1 entry (payload type 108) makes the server rigid: any other profile mismatches and is dropped from the answer, and a peer offering only a non-<code>42e01f</code> profile gets a clean empty-intersection failure — the same loud rejection the non-H.264 (VP8) case already produces. The profile is thus enforced server-side, not merely requested of the client (Section 20.1.2), satisfying the verbatim "extremely strict server-side input validation" requirement (Section 2). <code>.enable_vp8/.enable_vp9/.enable_av1/.enable_opus</code> are likewise not called.</p>
 
 <h4>20.1.2 Client-side: WebAssembly calls <code>setCodecPreferences()</code> BEFORE <code>createOffer()</code></h4>
 <p>To prevent Apple Safari from preferring <code>640c1f</code> (Constrained High) over the demo's required <code>42e01f</code> (Constrained Baseline), and to prevent any browser from offering VP8/VP9/AV1 at all (defense-in-depth on top of 20.1.1), the WebAssembly client calls <code>RtcRtpTransceiver::set_codec_preferences()</code> on the video transceiver before <code>pc.createOffer()</code>. The preference list contains only H.264 <code>RtcRtpCodecCapability</code> entries whose <code>sdp_fmtp_line</code> contains both <code>profile-level-id=42e01f</code> AND <code>packetization-mode=1</code>, plus pass-through entries for <code>video/rtx</code>, <code>video/red</code>, and <code>video/ulpfec</code> (required by Chromium per <code>pc/rtp_transceiver.cc:456</code> and <code>media/session/media_session.cc:633-2237</code>).</p>
@@ -4471,7 +4500,7 @@ Call sites: after adding the video track via <code>pc.add_track_0(&amp;video_tra
 </ul>
 
 <h4>20.1.3 Failure mode if H.264 is unavailable on a specific browser</h4>
-<p>On a browser without H.264 capability (extremely rare in 2026 — only some highly-restricted Chromium builds with H.264 compiled out), the client-side call returns the "no acceptable H.264 codec capability" error. The user-visible message identifies the cause. The server side's <code>clear_codecs + enable_h264</code> means: even if a misbehaving client offers VP8, the server's answer either matches H.264 (success) or produces an empty intersection causing the SDP exchange to fail with a clean error.</p>
+<p>On a browser without H.264 capability (extremely rare in 2026 — only some highly-restricted Chromium builds with H.264 compiled out), the client-side call returns the "no acceptable H.264 codec capability" error. The user-visible message identifies the cause. The server side's <code>clear_codecs()</code> + single-<code>42e01f</code> <code>add_h264</code> (Section 20.1.1) means: any offer carrying no codec we advertise — VP8, or Main/High H.264, or a non-conforming client filtered to a different profile — produces an empty intersection and fails the SDP exchange with a clean error. The decode-thread profile and level assertions (Section 19.1) then catch a peer that negotiates <code>42e01f</code> but sends a non-conforming bitstream anyway.</p>
 
 <h3>20.2 Capture parameters (browser-side <code>getUserMedia</code> constraints)</h3>
 <pre><code>{
@@ -4569,15 +4598,30 @@ fn check_capture_dimensions(width: i32, height: i32) -&gt; anyhow::Result&lt;Opt
 </ul>
 
 <h3>20.4 str0m configuration</h3>
-<pre><code>let mut rtc = str0m::Rtc::builder()
+<pre><code>// clear_codecs() empties codec_config; we then add ONLY the Constrained Baseline
+// 42e01f packetization-mode-1 entry via the low-level codec_config() accessor
+// (public: config.rs:194-197 -&gt; CodecConfig::add_h264, codec_config.rs:125-145).
+// This makes the SERVER itself rigid: an offer carrying Main (4d001f) / High
+// (64001f) / plain Baseline (42001f) mismatches on profile-level-id
+// (payload_params.rs:404-442 requires an exact profile match), is dropped from
+// the answer, and a peer offering only such a profile gets an empty intersection
+// and a clean negotiation failure — symmetric with the VP8 case, no longer
+// trusting the client setCodecPreferences filter (Section 20.1.2). codec_config()
+// returns &amp;mut, so the fluent builder chain is split here.
+let mut builder = str0m::Rtc::builder()
     .clear_codecs()                                     // drops default VP8/VP9/AV1/H.264/Opus
-    .enable_h264(true)                                  // re-enables ONLY H.264 (4 profiles × 2 packetization-modes)
-    // intentionally NOT calling enable_vp8 / enable_vp9 / enable_av1
-    // intentionally NOT calling enable_opus (we use audio: false on the streamer)
+    // intentionally NOT enable_h264 (advertises all 7 profiles), nor
+    // enable_vp8 / enable_vp9 / enable_av1 / enable_opus (audio: false)
     .enable_bwe(Some(str0m::bwe::Bitrate::kbps(2500))) // seeds BWE
-    .set_ice_lite(true)                                 // ICE controlling role pinned to SFU; see note below
-    // Add own-host candidates explicitly. NO auto-interface-discovery.
-    .build(std::time::Instant::now());                  // str0m 0.20.0 build(Instant) is required
+    .set_ice_lite(true);                                // ICE controlling role pinned to SFU; see note below
+builder.codec_config().add_h264(
+    108.into(),        // pt: the 42e01f pktz-1 payload type our pipeline expects
+    Some(109.into()),  // resend (RTX) pt
+    true,              // packetization_mode 1 (RFC 7742 mandates mode 1)
+    0x42e01f,          // Constrained Baseline Level 3.1 — the ONLY profile we accept
+);
+// Add own-host candidates explicitly. NO auto-interface-discovery.
+let mut rtc = builder.build(std::time::Instant::now()); // str0m 0.20.0 build(Instant) is required
 
 for resolved_addr in resolved_public_host_addrs {  // IPv4-only, A records of --public-host; see tls.rs
     let socket_addr = std::net::SocketAddr::new(resolved_addr, 51000);
@@ -4586,7 +4630,7 @@ for resolved_addr in resolved_public_host_addrs {  // IPv4-only, A records of --
     rtc.add_local_candidate(candidate);
 }
 </code></pre>
-<p>The <code>clear_codecs().enable_h264(true)</code> sequence is load-bearing — it forces str0m's SDP answer to advertise H.264 payload-types only. Without it, the default codec_config has VP8 listed first and Chrome's offer (which also lists VP8 first) gets a VP8-first answer, leading to VP8 negotiation. The H.264 entries inserted by <code>enable_h264(true)</code> include profile-level-id <code>42e01f</code> packetization-mode 1 — the exact entry our pipeline expects.</p>
+<p>The <code>clear_codecs()</code> + single-<code>42e01f</code> <code>add_h264</code> sequence is load-bearing twice over. First, <code>clear_codecs()</code> forces str0m's SDP answer to advertise H.264 only — without it the default config lists VP8 first and a Chrome offer (also VP8-first) negotiates VP8. Second, advertising ONLY <code>42e01f</code> (rather than <code>enable_h264(true)</code>'s seven profiles) makes the server itself reject Main/High/Baseline at negotiation — the codec profile is enforced server-side, not merely requested of the client (Section 20.1.2). str0m does NOT police the actual RTP payload against the negotiated profile (its depacketizer is sequence-number-based), so the decode thread carries the data-plane companion check (Section 19.1: a per-frame <code>decoder.profile()</code> + macroblock-count assertion that fails loud on a non-conforming bitstream).</p>
 
 <p><strong>What <code>enable_bwe(Some(Bitrate::kbps(2500)))</code> actually does:</strong> per <code>str0m-src/src/config.rs:352-369</code>, this is the seed for the <strong>send-side</strong> Bandwidth Estimator on this Rtc instance. It governs str0m's own pacing decisions when sending RTP packets — relevant for RTX (retransmissions) and forward-keyframe traffic to the streamer, AND for the SFU→viewer pacer. <strong>It does NOT cause str0m to advertise a bandwidth in the SDP</strong> (see Section 20.3 note about <code>b=AS</code> requiring post-processing). The estimator is fed by <code>bwe.update(records, now)</code> at <code>src/session.rs:618-620</code> based on incoming TWCC feedback about packets str0m sent. The estimate surfaces as <code>Event::EgressBitrateEstimate(BweKind::Twcc(bitrate))</code> (<code>src/lib.rs:971</code>). For our SFU, this means each viewer's Rtc instance produces its own egress bitrate estimate; that estimate is surfaced for observability only — the SFU does NOT act on it to police, throttle, or evict a viewer (fire-and-forget; see Section 20.10, which records why per-viewer eviction was considered and rejected).</p>
 
@@ -7090,7 +7134,7 @@ echo "scripts/lint/no_hardcoded_secrets.sh: clean."
 
 <ol>
   <li>Use <code>KeyframeRequestKind::Pli</code>, NOT <code>Fir</code>. The str0m <code>chat.rs</code> example is wrong per RFC 5104.</li>
-  <li><strong>Force H.264 on both sides.</strong> Server: <code>str0m::Rtc::builder().clear_codecs().enable_h264(true)...</code>. Client (WebAssembly): <code>RtcRtpTransceiver::set_codec_preferences()</code> with H.264 <code>profile-level-id=42e01f packetization-mode=1</code> only, before <code>createOffer()</code>. WITHOUT this, default str0m + default Chrome negotiate VP8 (str0m's <code>codec_config.rs:65-76</code> default order is VP8-first; <code>sdp.rs:1483-1498</code> emits answer in local order, not offerer order). Apple Safari prefers <code>640c1f</code> (Constrained High); client-side filter forces <code>42e01f</code>.</li>
+  <li><strong>Force H.264 on both sides — and enforce it server-side.</strong> Server: <code>str0m::Rtc::builder().clear_codecs()</code> then <code>builder.codec_config().add_h264(108.into(), Some(109.into()), true, 0x42e01f)</code> — advertise ONLY <code>42e01f</code>, NOT <code>enable_h264(true)</code> (which advertises all seven profiles incl. Main/High and accepts them: str0m matches H.264 on exact profile, <code>payload_params.rs:404-442</code>, and its own test locks <code>4d001f</code>, <code>codec_config.rs:717-730</code>). Client (WebAssembly): <code>RtcRtpTransceiver::set_codec_preferences()</code> with H.264 <code>profile-level-id=42e01f packetization-mode=1</code> only, before <code>createOffer()</code>. Plus a decode-thread data-plane assertion (<code>decoder.profile()</code> + macroblock count, Section 19.1), since str0m does not police RTP payload against the negotiated profile. WITHOUT <code>clear_codecs()</code>, default str0m + default Chrome negotiate VP8 (default order is VP8-first, <code>codec_config.rs:65-76</code>; answer is in local order, <code>sdp.rs:1483-1498</code>). Apple Safari prefers <code>640c1f</code> (Constrained High); client-side filter forces <code>42e01f</code>.</li>
   <li>Call <code>compress.set_optimize_scans(false)</code> on every mozjpeg <code>Compress</code>. The default is the 45-times-slower path.</li>
   <li>The Leptos crate version is <code>=0.8.19</code>. <strong>Version <code>0.8.18</code> never existed on crates.io</strong> (verified 2026-06-01 via crates.io API). The correct pin is <code>=0.8.19</code>.</li>
   <li><code>ffmpeg-next</code> is version <code>7.1.0</code>, not <code>8.1.0</code>. Debian Trixie ships FFmpeg 7.1.4.</li>
