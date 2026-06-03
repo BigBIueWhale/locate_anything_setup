@@ -273,3 +273,97 @@ HOUSEHOLD_PROMPTS = {
     "street":      detect_categories(["person", "car", "bus", "bicycle", "traffic light", "stop sign"]),
     "demo":        detect_categories(["person", "laptop", "bottle", "cup", "book", "monitor", "keyboard"]),
 }
+
+
+# ===========================================================================
+# Typed PromptRequest constructors — the wire-v2 shape that
+# /v1/capabilities.preset_prompts advertises (A.5). With the request now a
+# typed sum (mirroring rust_server/src/protocol.rs::PromptRequest, internally
+# tagged on `task`), advertising bare prompt STRINGS would be
+# wire-inconsistent: a client cannot send a string, only a typed request. So
+# the preset bundles below are lists of {label, request, generation_mode}
+# objects whose `request` is exactly a PromptRequest dict.
+#
+# Each `task` value is one of TEMPLATE_WIRE_NAMES; the slot field names match
+# the Rust *Req structs (DetectionReq.categories, PhraseReq.phrase,
+# TextReq.text, DescReq.description, SceneTextReq{}). Slot rules are now
+# server-authoritative (validated in the Rust builder), but presets are kept
+# clean here (strip + non-empty) so every advertised preset is accepted as-is.
+# ===========================================================================
+
+
+def _clean_slot(s: str, what: str) -> str:
+    if not isinstance(s, str) or not s.strip():
+        raise ValueError(f"{what} requires a non-empty string")
+    return s.strip()
+
+
+def req_detection(categories: Iterable[str]) -> dict:
+    """Typed detection request (task `detection`). Mirrors DetectionReq."""
+    cats = [c.strip() for c in categories if isinstance(c, str) and c.strip()]
+    if not cats:
+        raise ValueError("req_detection requires at least one category")
+    return {"task": "detection", "categories": cats}
+
+
+def req_phrase_single(phrase: str) -> dict:
+    """Typed single-instance phrase grounding (task `phrase_single`)."""
+    return {"task": "phrase_single", "phrase": _clean_slot(phrase, "req_phrase_single")}
+
+
+def req_phrase_multi(phrase: str) -> dict:
+    """Typed multi-instance phrase grounding (task `phrase_multi`)."""
+    return {"task": "phrase_multi", "phrase": _clean_slot(phrase, "req_phrase_multi")}
+
+
+def req_text_grounding(text: str) -> dict:
+    """Typed text grounding (task `text_grounding`). Mirrors TextReq."""
+    return {"task": "text_grounding", "text": _clean_slot(text, "req_text_grounding")}
+
+
+def req_scene_text() -> dict:
+    """Typed scene-text detection (task `scene_text`). Mirrors SceneTextReq{}."""
+    return {"task": "scene_text"}
+
+
+def req_gui_box(description: str) -> dict:
+    """Typed GUI-region grounding (task `gui_box`). Mirrors DescReq."""
+    return {"task": "gui_box", "description": _clean_slot(description, "req_gui_box")}
+
+
+def req_point(phrase: str) -> dict:
+    """Typed pointing request (task `point`). Mirrors PhraseReq."""
+    return {"task": "point", "phrase": _clean_slot(phrase, "req_point")}
+
+
+def _preset(label: str, request: dict, generation_mode: str) -> dict:
+    """One advertised preset: a label, a typed PromptRequest, and a mode."""
+    if generation_mode not in ("fast", "hybrid", "slow"):
+        raise ValueError(
+            f"preset generation_mode={generation_mode!r} must be "
+            "'fast'|'hybrid'|'slow'"
+        )
+    return {"label": label, "request": request, "generation_mode": generation_mode}
+
+
+# Typed equivalents of DRONE_PROMPTS_RANKED, in the same ranked order. `point`
+# is the structurally cleanest drone prompt (few output tokens, MTP fast path);
+# slow mode is the most accurate for the off-distribution aerial use case.
+DRONE_PRESETS_RANKED: List[dict] = [
+    _preset("drone (point)",                 req_point("drone in the sky"),                                   "slow"),
+    _preset("drone (detect)",                req_detection(["drone"]),                                        "slow"),
+    _preset("small drone (phrase, multi)",   req_phrase_multi("a small drone in the sky"),                    "slow"),
+    _preset("quadcopter (point)",            req_point("quadcopter"),                                         "slow"),
+    _preset("drone/uav/aircraft (detect)",   req_detection(["drone", "quadcopter", "uav", "aircraft"]),       "slow"),
+    _preset("flying object (phrase, multi)", req_phrase_multi("a flying object in the sky"),                  "slow"),
+    _preset("the drone (phrase, single)",    req_phrase_single("the drone"),                                  "slow"),
+]
+
+# Typed equivalents of HOUSEHOLD_PROMPTS (closed-class detection bundles).
+HOUSEHOLD_PRESETS: List[dict] = [
+    _preset("office",      req_detection(["bottle", "cup", "laptop", "keyboard", "mouse", "monitor", "book"]),   "hybrid"),
+    _preset("living_room", req_detection(["person", "dog", "cat", "couch", "tv", "laptop", "book", "cup"]),       "hybrid"),
+    _preset("kitchen",     req_detection(["bottle", "cup", "bowl", "knife", "spoon", "refrigerator", "microwave"]), "hybrid"),
+    _preset("street",      req_detection(["person", "car", "bus", "bicycle", "traffic light", "stop sign"]),      "hybrid"),
+    _preset("demo",        req_detection(["person", "laptop", "bottle", "cup", "book", "monitor", "keyboard"]),   "hybrid"),
+]

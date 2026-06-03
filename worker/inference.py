@@ -935,22 +935,26 @@ def _force_vit_flash_attn_2(config, model_dir: str) -> None:
 # 2-coord points. The Rust validator at rust_server/src/prompt_validator
 # .rs classifies every accepted prompt into one of these seven wire names
 # and forwards it through the IPC header as `prompt_task`. `run()` uses
-# this map to FILTER off-shape parse output before stamping the response:
-# a 4-coord box that escapes through a Point prompt's response (or a
-# 2-coord point that escapes through a detection prompt's response) is
-# by-definition off-distribution and must not land in the typed field for
-# the other shape.
+# this map to drive the A.3 model-output→variant mapping: it decides
+# whether the valid-for-task geometry is the box list (a `boxes` variant)
+# or the point list (a `points` variant), and which parsed geometry is
+# OFF-CONTRACT for the task — a 4-coord box under a Point prompt, or a
+# 2-coord point under a box prompt — and therefore must be dropped and
+# counted (folded into `deviations_dropped`), never emitted in the typed
+# field for the other shape.
 #
 # Empirically the model does not emit off-shape at the trained sampling
 # parameters: zero cross-shape events were observed in 3,444 trials
 # spanning all 7 templates × adversarial prompts (including a Point
-# prompt literally containing the substring "bounding box"). The filter
-# is therefore a forward-compat guard rail, not a frequent rejection
-# path. Crucially it does NOT silently drop the deviation: the off-shape
-# count is surfaced in `off_shape_count` (and the verbatim tokens stay in
-# `raw_answer`), and `abstained` is computed from the PRE-filter parse — so
-# a model that emitted geometry in the wrong shape is reported as a loud,
-# queryable deviation, never misreported as "the model abstained".
+# prompt literally containing the substring "bounding box"). The
+# off-contract handling is therefore a forward-compat guard rail, not a
+# frequent path. Crucially it does NOT silently drop the deviation: the
+# dropped-item count is surfaced in `deviations_dropped` (and the verbatim
+# tokens stay in `raw_answer`); a frame that produced ONLY off-contract
+# geometry (zero valid-for-task) becomes a loud `model_deviation` error,
+# and a frame that produced NO geometry at all becomes the `abstained`
+# variant — so a model that emitted geometry in the wrong shape is never
+# misreported as "the model abstained". See run() for the full A.3 mapping.
 #
 # Keys MUST equal worker/prompts.py::TEMPLATE_WIRE_NAMES AND the wire
 # names in rust_server/src/prompt_validator.rs::TemplateKind::wire_name;
@@ -968,32 +972,56 @@ EXPECTED_SHAPE = {
 }
 
 
+# Variant kinds the A.3 mapping resolves a frame into. Exactly one is set
+# on every InferenceResult.kind — the faithful sum: boxes XOR points XOR
+# abstained XOR model_deviation. `la_worker._infer` maps these to the A.2
+# wire `type`: KIND_BOXES/KIND_POINTS/KIND_ABSTAINED stay as-is; KIND_DEVIATION
+# becomes `{"type":"error","code":"model_deviation",...}`.
+KIND_BOXES = "boxes"
+KIND_POINTS = "points"
+KIND_ABSTAINED = "abstained"
+KIND_DEVIATION = "model_deviation"
+
+
 @dataclass
 class InferenceResult:
+    """The variant outcome of one inference plus the shared Meta fields.
+
+    `kind` is the discriminant (faithful sum — see KIND_* above):
+      * KIND_BOXES     — `boxes` is the non-empty list of valid LabeledBox
+                         dicts; `points` is []. The valid-for-task geometry of
+                         a box-shaped prompt.
+      * KIND_POINTS    — `points` is the non-empty list of valid LabeledPoint
+                         dicts; `boxes` is []. The valid-for-task geometry of a
+                         `point` prompt.
+      * KIND_ABSTAINED — neither list populated; the model produced NO parseable
+                         geometry block of ANY shape (only possibly the trained
+                         `<box>None</box>` abstention literal or plain text).
+                         `deviations_dropped` is 0.
+      * KIND_DEVIATION — the model emitted geometry block(s) but ZERO were
+                         valid-for-task (all off-shape and/or unlabeled), so
+                         there is nothing usable to return. `deviation_message`
+                         carries the human-readable cause; `la_worker._infer`
+                         turns this into an `error{code:"model_deviation"}`
+                         reply (no geometry, no Meta on the wire).
+    """
+    kind: str
+    # Valid-for-task geometry. Exactly one of these is non-empty, and only on
+    # the matching success kind (boxes/points); both are [] on abstained and
+    # on model_deviation.
+    boxes: list   # list[dict] — LabeledBox dicts (label, bbox_norm, bbox_px)
+    points: list  # list[dict] — LabeledPoint dicts (label, point_norm, point_px)
+    # Human-readable cause, set ONLY when kind == KIND_DEVIATION; None otherwise.
+    deviation_message: "str | None"
+    # ----- Meta (A.2 §Meta) — present for boxes/points/abstained; ignored by
+    # _infer on the model_deviation path (the error body carries no Meta). -----
     raw_answer: str
-    detections: list  # list[dict]
-    points: list      # list[dict]
-    # True iff the model produced NO parseable geometry at all — no boxes
-    # and no points — evaluated BEFORE the task→shape filter. An off-shape
-    # emission (geometry in the wrong shape for the task) is NOT abstention:
-    # it is filtered out of `detections`/`points`, counted in
-    # `off_shape_count`, and leaves this False. Stamped explicitly so naive
-    # clients can branch without re-parsing. NVIDIA's eval pipeline has no
-    # aggregate `abstained` concept; empty parsed output is the
-    # aggregate-no-result signal there too (inference_grounding_ddp.py:282-300
-    # + metrics/other_metric.py:140-156). Per-category abstention in a
-    # multi-category detect prompt is NOT signalled here — it's recoverable
-    # from `raw_answer` as the set difference between the prompt's category
-    # list and `{d['label'] for d in detections}`.
-    abstained: bool
-    # Number of parsed geometries the model emitted in the WRONG shape for
-    # the task (a box under a `point` prompt, or a point under a box prompt)
-    # and that were therefore filtered out of `detections`/`points`. Normally
-    # 0. Non-zero is a loud, queryable signal of a model task→shape deviation:
-    # the output is NOT silently dropped (verbatim tokens remain in
-    # `raw_answer`) and does NOT count as abstention. Empirically 0 across
-    # 3,444 trials at the trained sampling params (see EXPECTED_SHAPE).
-    off_shape_count: int
+    # Number of off-contract geometry items the model emitted that were DROPPED
+    # while keeping the valid-for-task geometry (off-shape geometry for the
+    # task + unlabeled/orphan/empty-ref boxes-or-points). Folded into the wire
+    # field `deviations_dropped`. Usually 0; non-fatal — the valid geometry is
+    # still returned. The verbatim tokens stay in `raw_answer`. 0 on abstained.
+    deviations_dropped: int
     # True iff `raw_answer` does NOT end with the model's <|im_end|>
     # end-of-turn marker. Per the custom .generate() loop at
     # models/LocateAnything-3B/modeling_locateanything.py:464,500-501
@@ -1006,16 +1034,6 @@ class InferenceResult:
     # the implicit-only signal as a typed boolean so clients no longer
     # need to substring-check raw_text themselves.
     model_output_truncated: bool
-    # Wire name of the canonical template the prompt was classified as
-    # by the Rust validator (one of EXPECTED_SHAPE.keys()). Echoed in
-    # the client-facing Result body so the client can branch on the
-    # authoritative field WITHOUT re-classifying the prompt themselves:
-    # for `prompt_task == "point"` look at `points[]`; for any other
-    # wire name look at `detections[]`. Per the trained task→shape
-    # contract, the OTHER list is always empty (off-shape outputs are
-    # filtered out of `detections`/`points` and counted in
-    # `off_shape_count`; see run()).
-    prompt_task: str
     latency_ms: float
     image_size: tuple
     resize_plan: dict
@@ -1284,9 +1302,11 @@ class LocateAnythingInference:
 
         `prompt_task` is the wire name of the canonical template the
         prompt was classified as (Rust validator output forwarded through
-        the IPC header; see EXPECTED_SHAPE for valid values). Used to
-        filter off-shape model output (counted in `off_shape_count`, not
-        silently dropped) per the trained task→shape contract.
+        the IPC header; see EXPECTED_SHAPE for valid values). Drives the
+        A.3 model-output→variant mapping at the tail of this method: which
+        parsed geometry is valid-for-task vs off-contract (dropped+counted
+        into `deviations_dropped`, never silently lost), and which variant
+        (boxes / points / abstained / model_deviation) the frame resolves to.
 
         JPEG decoded inside this method — Python's PIL is the canonical
         decoder for the LocateAnything image processor.
@@ -1525,46 +1545,109 @@ class LocateAnythingInference:
             # Defensive — if generate ever returns tensors here, decode.
             answer = self.tokenizer.decode(answer, skip_special_tokens=False)
 
-        detections = [d.to_json() for d in parse_boxes(answer, image.width, image.height)]
-        points     = [p.to_json() for p in parse_points(answer, image.width, image.height)]
-        # `abstained` must reflect the MODEL, not the task-shape filter below:
-        # snapshot whether the model produced ANY parseable geometry BEFORE we
-        # filter to the trained shape, so an off-shape emission is never
-        # misreported as "the model abstained".
-        parsed_geometry = bool(detections or points)
-        # Trained task→shape enforcement: a `point` task returns points and
-        # every other task returns boxes. Off-shape output (a box under a point
-        # prompt, or vice-versa) is filtered out of the typed lists — but NOT
-        # silently dropped: it is COUNTED in `off_shape_count` (verbatim tokens
-        # remain in `raw_answer`), turning a model deviation into a loud,
-        # queryable signal instead of an empty response. See EXPECTED_SHAPE.
-        off_shape_count = 0
+        # Parse geometry. Each parser returns (valid_labeled_items,
+        # off_contract_count): off_contract_count is the number of orphan /
+        # empty-ref geometry blocks of THAT shape (no non-empty <ref> label),
+        # which are off-contract for wire v2 and dropped+counted, never
+        # emitted (see worker/parsing.py module docstring).
+        boxes_objs, box_off = parse_boxes(answer, image.width, image.height)
+        points_objs, point_off = parse_points(answer, image.width, image.height)
+        box_dicts   = [d.to_json() for d in boxes_objs]
+        point_dicts = [p.to_json() for p in points_objs]
+
+        # ---- A.3 MODEL-OUTPUT → VARIANT mapping (per-item; keep valid data) ----
+        # Separate parsed geometry into valid-for-task vs off-contract, then
+        # resolve to exactly one variant (boxes XOR points XOR abstained XOR
+        # model_deviation):
+        #   * ≥1 valid-for-task geometry → success variant with the valid
+        #     geometry; everything else (off-shape geometry for the task +
+        #     unlabeled/orphan/empty-ref of either shape) is DROPPED and counted
+        #     in `deviations_dropped` — kept faithful (NVIDIA's eval keeps
+        #     co-emitted valid detections; a whole-frame error would discard
+        #     them).
+        #   * zero valid-for-task BUT ≥1 geometry block emitted (all off-shape
+        #     / unlabeled) → `model_deviation` error: nothing usable to return.
+        #   * zero geometry of ANY shape (only `<box>None</box>` literal or plain
+        #     text) → `abstained` (deviations_dropped = 0).
+        # Degenerate / zero-area VALID boxes are NOT a deviation — _make_box
+        # clamps+corner-sorts and keeps them (matches NVIDIA's is_abnormal eval).
         expected = EXPECTED_SHAPE[prompt_task]
         if expected == "point":
-            off_shape_count = len(detections)
-            detections = []
-        elif expected == "box":
-            off_shape_count = len(points)
-            points = []
+            valid_kind = KIND_POINTS
+            valid_count = len(point_dicts)
+            # Off-contract for a point task: cross-shape boxes (valid-labeled
+            # OR off-contract) + off-contract points.
+            dropped = len(box_dicts) + box_off + point_off
+        else:  # expected == "box"
+            valid_kind = KIND_BOXES
+            valid_count = len(box_dicts)
+            # Off-contract for a box task: cross-shape points (valid-labeled
+            # OR off-contract) + off-contract boxes.
+            dropped = len(point_dicts) + point_off + box_off
+        # Did the model emit ANY geometry block at all (valid-for-task,
+        # cross-shape, or off-contract)? `<box>None</box>` matches none of the
+        # numeric regexes, so a pure-abstention / pure-text response is False.
+        any_geometry_block = bool(
+            box_dicts or point_dicts or box_off or point_off
+        )
+
+        model_output_truncated = not answer.endswith("<|im_end|>")
+        image_size = (image.width, image.height)
+        resize_plan = {
+            "dst_w": plan.dst_w,
+            "dst_h": plan.dst_h,
+            "n_llm_tokens": plan.n_llm_tokens,
+            "scale": round(plan.scale, 4),
+        }
+
+        if valid_count > 0:
+            # Success: keep the valid-for-task geometry; the other list is [].
+            return InferenceResult(
+                kind=valid_kind,
+                boxes=box_dicts if valid_kind == KIND_BOXES else [],
+                points=point_dicts if valid_kind == KIND_POINTS else [],
+                deviation_message=None,
+                raw_answer=answer,
+                deviations_dropped=dropped,
+                model_output_truncated=model_output_truncated,
+                latency_ms=latency_ms,
+                image_size=image_size,
+                resize_plan=resize_plan,
+            )
+        if any_geometry_block:
+            # Geometry present but zero valid-for-task: a loud model_deviation.
+            shape_word = "point" if expected == "point" else "box"
+            return InferenceResult(
+                kind=KIND_DEVIATION,
+                boxes=[],
+                points=[],
+                deviation_message=(
+                    f"model emitted geometry but zero valid {shape_word}(s) for "
+                    f"the '{prompt_task}' task: dropped {dropped} off-contract "
+                    "item(s) (off-shape geometry and/or boxes/points with no "
+                    "non-empty <ref> label) and nothing usable remained. The "
+                    "verbatim model output is preserved in raw_text. This is a "
+                    "task->shape / labeling deviation from the trained output "
+                    "contract (empirically 0 across 3,444 trials at the trained "
+                    "sampling params)."
+                ),
+                raw_answer=answer,
+                deviations_dropped=dropped,
+                model_output_truncated=model_output_truncated,
+                latency_ms=latency_ms,
+                image_size=image_size,
+                resize_plan=resize_plan,
+            )
+        # Zero geometry of any shape: the model abstained.
         return InferenceResult(
+            kind=KIND_ABSTAINED,
+            boxes=[],
+            points=[],
+            deviation_message=None,
             raw_answer=answer,
-            detections=detections,
-            points=points,
-            # True only if the model produced no parseable geometry at all
-            # (pre-filter). An off-shape emission leaves this False; see
-            # off_shape_count. See InferenceResult.abstained docstring.
-            abstained=not parsed_geometry,
-            off_shape_count=off_shape_count,
-            # Explicit truncation signal. See InferenceResult.model_output_truncated
-            # docstring.
-            model_output_truncated=not answer.endswith("<|im_end|>"),
-            prompt_task=prompt_task,
+            deviations_dropped=0,
+            model_output_truncated=model_output_truncated,
             latency_ms=latency_ms,
-            image_size=(image.width, image.height),
-            resize_plan={
-                "dst_w": plan.dst_w,
-                "dst_h": plan.dst_h,
-                "n_llm_tokens": plan.n_llm_tokens,
-                "scale": round(plan.scale, 4),
-            },
+            image_size=image_size,
+            resize_plan=resize_plan,
         )

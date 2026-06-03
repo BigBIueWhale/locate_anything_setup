@@ -149,8 +149,8 @@ per `--restart unless-stopped`.
 
 | Failure | What the client receives |
 |---|---|
-| Timeout (LA_INFERENCE_TIMEOUT_S) | `type:"error"` JSON with `code:504` and message `"inference timeout: exceeded LA_INFERENCE_TIMEOUT_S=600.0s. The worker is restarting..."`, followed *immediately* by `Close(1011) "worker_unavailable"` as the worker exits. |
-| OOM | Same shape with `code:500` and message `"CUDA out of memory: ... The worker is restarting..."`, followed by `Close(1011)`. |
+| Timeout (LA_INFERENCE_TIMEOUT_S) | `type:"error"` JSON with `code:"internal"` and message `"inference timeout: exceeded LA_INFERENCE_TIMEOUT_S=600.0s. The worker is restarting..."`, followed *immediately* by `Close(1011) "worker_unavailable"` as the worker exits. |
+| OOM | Same shape with `code:"internal"` and message `"CUDA out of memory: ... The worker is restarting..."`, followed by `Close(1011)`. |
 
 Both are sent in that order on the same WebSocket — the worker awaits
 the UDS write of the per-frame error before calling `os._exit`, so the

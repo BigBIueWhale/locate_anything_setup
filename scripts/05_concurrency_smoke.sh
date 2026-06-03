@@ -24,7 +24,13 @@ _SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 source "${_SCRIPT_DIR}/lib/common.sh"
 load_versions
 
-LA_DEFAULT_PROMPT='Locate all the instances that matches the following description: bottle</c>book</c>cup</c>laptop.'
+# Typed request (A.1) sent by every client/frame: closed-class detection of
+# the same four household categories that 04_smoke_test.sh uses. The client
+# builds the wire `request` object from these flags; the concurrency probe
+# only cares that the request is a normally-accepted one (so any per-frame
+# error under load is a real concurrency fault, not a bad request).
+LA_DEFAULT_TASK='detection'
+LA_DEFAULT_CATEGORIES='bottle,book,cup,laptop'
 LA_DEFAULT_NUM_CLIENTS=2
 LA_DEFAULT_FRAMES_PER_CLIENT=4
 LA_DEFAULT_SEND_INTERVAL=2.0
@@ -144,7 +150,8 @@ docker exec "${LA_CONTAINER_NAME}" \
     python /opt/locate_anything/scripts/lib/concurrency_smoke_client.py \
         --url "ws://127.0.0.1:${LA_INTERNAL_PORT}/v1/stream" \
         --image "/opt/locate_anything/test_data/calibration.jpg" \
-        --prompt "${LA_DEFAULT_PROMPT}" \
+        --task "${LA_DEFAULT_TASK}" \
+        --categories "${LA_DEFAULT_CATEGORIES}" \
         --mode "hybrid" \
         --num-clients "${LA_NUM_CLIENTS}" \
         --frames-per-client "${LA_FRAMES_PER_CLIENT}" \

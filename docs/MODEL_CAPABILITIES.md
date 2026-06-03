@@ -48,22 +48,28 @@ the resize itself (uniform random long edge, Lanczos) is `augmentation.py:81,43`
 
 The model supports seven canonical task templates (detection, single /
 multi phrase grounding, text grounding, scene-text detection, GUI box,
-GUI point / pointing). **The single source of truth for those templates
-is [`worker/prompts.py`](../worker/prompts.py)** — verbatim NVIDIA forms
+GUI point / pointing). A client never types a prompt string — it sends a
+typed `request` (a sum over those seven tasks; see
+[`docs/CLIENT_PROTOCOL.md`](./CLIENT_PROTOCOL.md)) and the server
+**compiles** it into the exact trained prompt. **The single source of
+truth for the template literals is
+[`worker/prompts.py`](../worker/prompts.py)** — verbatim NVIDIA forms
 with the trained `matches` / `match` asymmetry and the `</c>` category
-separator. The Rust validator at
+separator. The Rust compiler at
 [`rust_server/src/prompt_validator.rs`](../rust_server/src/prompt_validator.rs)
-mirrors those constants byte-for-byte and enforces them at the WebSocket
-edge; a boot-time check fails the container if the two ever drift.
+mirrors those constants byte-for-byte; a boot-time check fails the
+container if the two ever drift.
 
-Clients should either call the `detect_categories`, `ground_single`,
-`ground_multi`, `ground_text`, `detect_text`, `ground_gui`, or `point_to`
-helpers from `worker/prompts.py`, or pull pre-built well-formed prompts
-from `/v1/capabilities.preset_prompts`. The same `/v1/capabilities`
-response also carries `prompt_templates_reference_url` pointing at
-`worker/prompts.py`, and every per-frame rejection diagnostic includes
-that URL so the client always knows where to look. **Do not paraphrase**
-— per-word deviations move you off the training distribution.
+Because the client only supplies typed slot values, the trained
+scaffolding (the `matches` / `match` asymmetry, the `</c>` separator, the
+trailing `.`) is never the client's to get wrong — it is assembled
+server-side, so paraphrasing the template out of distribution is
+structurally impossible. Clients either construct a typed `request`
+directly, or lift a ready-made one from `/v1/capabilities.preset_prompts`
+(now typed `{label, request, generation_mode}` objects). The same
+`/v1/capabilities` response carries `prompt_templates_reference_url`
+pointing at `worker/prompts.py`, and every per-frame slot-rejection
+diagnostic includes that URL so the client always knows where to look.
 
 ## What it does NOT do well
 
@@ -217,32 +223,41 @@ placeholder. The training corpus has 22 M explicit negative queries
 `Embodied/evaluation/inference_grounding_ddp.py:282-300` — so
 `<box>None</box>` silently does not match and is dropped.
 
-The Result body's `"abstained": true` is the AGGREGATE signal: it fires
-iff the model produced NO parseable geometry at all — no boxes and no
-points, evaluated BEFORE the task→shape filter. This deliberately
-collapses "all categories abstained" with "model produced unparseable
-output"; both are "nothing to render" from the client's perspective. It
-does NOT collapse an off-shape emission (geometry in the wrong shape for
-the task): that is filtered from `detections`/`points` but reported in
-`off_shape_count` and leaves `abstained` false — so a model that DID
-localize the object, just in the wrong shape, is never misreported as
-having abstained. NVIDIA's own eval pipeline has no aggregate `abstained`
-concept either — `Embodied/evaluation/metrics/other_metric.py:140-156`
-only tracks per-category None. The `abstained` boolean is derived from
-the pre-filter parse and never from a substring scan over `raw_text`: a
-substring scan would flip the aggregate flag True for any multi-category
-response that contained an absent-category `<ref>X</ref><box>None</box>`
-triple — even when real detections were returned for other categories —
-and silently mislead a client that treats `abstained=true` as "no objects
-detected".
+The answer space is a strict **sum**: a frame's reply is exactly one of
+`boxes` / `points` / `abstained` / `error` (see
+[`docs/CLIENT_PROTOCOL.md`](./CLIENT_PROTOCOL.md)). **`abstained` is a
+VARIANT, not a boolean** — it is the reply the server returns iff the
+model produced NO parseable geometry at all (no boxes and no points):
+every `<box>None</box>` or empty output. It deliberately collapses "all
+categories abstained" with "model produced unparseable output"; both are
+"nothing to render" from the client's perspective. NVIDIA's own eval
+pipeline has no aggregate-abstention concept either —
+`Embodied/evaluation/metrics/other_metric.py:140-156` only tracks
+per-category None.
+
+Off-contract output is handled **per-item**, orthogonally to the
+abstained variant: geometry in the wrong shape for the task (a point on a
+box-shaped task, or vice-versa) and any box/point with no non-empty
+`<ref>` label are dropped from the returned array but **counted** in the
+`deviations_dropped` metadata field, while the valid co-emitted geometry
+is still returned in the `boxes`/`points` variant. So a model that DID
+localize the object — just emitted some surplus off-shape tokens
+alongside — is never misreported as having abstained. The decision is
+made on the parse, never from a substring scan over `raw_text` (a
+substring scan would mis-trip on an absent-category
+`<ref>X</ref><box>None</box>` triple co-occurring with real detections).
+A frame where the model emitted geometry but **zero** of it was valid for
+the task (all off-shape / unlabeled), or where the output was
+unparseable, is an `error{code:"model_deviation"}` — not `abstained`,
+because the model did not actually decline; it deviated.
 
 For per-category abstention in a multi-category detection prompt,
 clients recover the absent categories as the set difference between
-the prompt's category list and `{d.label for d in detections}` — the
-`<ref>X</ref><box>None</box>` triples for those categories are also
-present verbatim in `raw_text` if needed. **`abstained` is not a
-calibrated confidence** — treat it as "no usable output", not "model
-is confident there is nothing".
+the request's category list and `{b.label for b in boxes}` (on a
+`boxes` reply) — the `<ref>X</ref><box>None</box>` triples for those
+categories are also present verbatim in `raw_text` if needed.
+**`abstained` is not a calibrated confidence** — treat it as "no usable
+output", not "model is confident there is nothing".
 
 ## Coordinate system
 
@@ -274,10 +289,13 @@ which contains 1001 discrete coord tokens `<0>` … `<1000>`).
   2240 px square image, 1 coord-token = 2.24 px. For 1920 px wide,
   1 coord-token = 1.92 px.
 
-The server returns:
+Each box (under the `boxes` variant) and each point (under the `points`
+variant) carries a required `label` plus both coordinate forms:
 
-- `bbox_norm: [x1, y1, x2, y2]` — canonical integer box in `[0,1000]`: each
-  coord clamped to the grid and corners min/max-sorted (`x1<=x2`, `y1<=y2`),
-  matching NVIDIA's eval. The verbatim token-order emission is in `raw_text`.
-- `bbox_px:   [x1, y1, x2, y2]` — pixels relative to the **source**
-  image dimensions (float, rounded to 2 decimal places).
+- `bbox_norm: [x1, y1, x2, y2]` (boxes) / `point_norm: [x, y]` (points) —
+  canonical integer coords in `[0,1000]`: each coord clamped to the grid
+  and, for boxes, corners min/max-sorted (`x1<=x2`, `y1<=y2`), matching
+  NVIDIA's eval. The verbatim token-order emission is in `raw_text`.
+- `bbox_px: [x1, y1, x2, y2]` (boxes) / `point_px: [x, y]` (points) —
+  pixels relative to the **source** image dimensions (float, rounded to
+  2 decimal places).

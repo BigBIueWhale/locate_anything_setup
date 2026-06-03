@@ -29,22 +29,27 @@ NVIDIA's eval-time `<ref>(category)</ref>((?:<box>.*?</box>)+)` capture
 `inference_detection_ddp.py:282-300`) so every sibling box inherits the
 ref's label.
 
-Aggregate abstention ("the frame returned nothing usable") means the model
-produced NO parseable geometry at all — no boxes and no points. The response's
-`abstained` field at `InferenceResult.abstained` is derived in
-`worker/inference.py` from the PRE-(task-shape-)filter parse, so an off-shape
-emission (geometry in the wrong shape for the task) is reported as a deviation
-(`off_shape_count`), NOT as abstention. It deliberately does NOT scan raw_text
-for `<box>None</box>`, because per-category abstention triples are emitted
-alongside real detections in multi-category prompts and a substring scan would
-flip the aggregate flag to True even when other categories returned valid
-boxes. NVIDIA's own pipeline has no aggregate `abstained` concept either —
-`metrics/other_metric.py:140-156` only tracks per-category None.
+CONTRACT (wire v2): a Detection/Point is only emitted when it carries a
+non-empty `<ref>` label. The seven canonical templates ALWAYS emit a
+`<ref>label</ref>` before each box/point run, so a labeled geometry is the
+only on-contract shape. Two off-contract shapes can appear in non-conforming
+model output and are explicitly NOT turned into label=None detections:
+  * an ORPHAN box/point — one with no preceding `<ref>` run at all; and
+  * an EMPTY-REF box/point — one inside a `<ref></ref>` run whose label
+    strips to the empty string.
+Both are dropped from the returned geometry and COUNTED in the second
+element of the (geometry, off_contract_count) tuple `parse_boxes`/
+`parse_points` return. `worker/inference.py` applies the A.3 mapping over
+those return values: it keeps the valid geometry, folds the off-contract
+count (plus any cross-shape geometry for the task) into
+`deviations_dropped`, abstains only on zero geometry of any kind, and emits
+a `model_deviation` error only when geometry was present but zero of it was
+valid for the task. The verbatim token-order emission is always recoverable
+from `InferenceResult.raw_answer`.
 
 `has_abstention` is retained as a substring utility used by the BOOT SELF-TEST
 in `worker/calibration.py` to distinguish "model emitted the trained explicit
 abstention literal" from "model emitted gibberish the parser couldn't consume".
-It is NOT the truth source for the response field.
 
 Verified against NVlabs/Eagle's `Embodied/locateanything_worker.py`
 (LocateAnythingWorker.parse_boxes) and the model's `generate_utils.py`.
@@ -52,7 +57,7 @@ Verified against NVlabs/Eagle's `Embodied/locateanything_worker.py`
 
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Tuple
 import re
 
 # Regex for a <ref>label</ref> ref-run followed by ONE OR MORE sibling <box>
@@ -84,7 +89,7 @@ _REF_RUN_RE = re.compile(
     flags=re.DOTALL,
 )
 # Regex for a single <box>...</box> with exactly 4 numeric coords.
-# Used both standalone (orphan-box pass-2 fallback) and inside the captured
+# Used both standalone (orphan-box pass-2 detection) and inside the captured
 # boxes group of _REF_RUN_RE.
 _BOX_RE = re.compile(r"<box><(\d+)><(\d+)><(\d+)><(\d+)></box>")
 # Regex for a single <box>...</box> with exactly 2 numeric coords (point).
@@ -96,8 +101,13 @@ _NONE_RE = re.compile(r"<box>[Nn]one</box>")
 
 @dataclass(frozen=True)
 class Detection:
-    """A bounding-box detection with its label (if any)."""
-    label: Optional[str]
+    """A bounding-box detection with its (required, non-empty) label.
+
+    Per the wire-v2 contract a Detection is ONLY constructed for a box that
+    carries a non-empty `<ref>` label; orphan / empty-ref boxes are
+    off-contract and never become a Detection (see module docstring). The
+    label is therefore non-optional."""
+    label: str
     # Canonical [0, 1000] integer box: each coord clamped to the 1001-token
     # grid (<0>..<1000>) and corners min/max-sorted so x1<=x2 and y1<=y2. The
     # model decodes the 4 coordinate positions INDEPENDENTLY (no monotonicity
@@ -114,7 +124,11 @@ class Detection:
 
 @dataclass(frozen=True)
 class Point:
-    label: Optional[str]
+    """A point detection with its (required, non-empty) label.
+
+    Like Detection, a Point is only constructed for a 2-coord box that carries
+    a non-empty `<ref>` label; orphan / empty-ref points are off-contract."""
+    label: str
     point_norm: list  # [x, y]
     point_px:   list  # [x, y] in pixels relative to source image
 
@@ -122,10 +136,21 @@ class Point:
         return {"label": self.label, "point_norm": self.point_norm, "point_px": self.point_px}
 
 
-def parse_boxes(answer: str, image_width: int, image_height: int) -> List[Detection]:
-    """
-    Parse all <box>...</box> blocks (with optional preceding <ref>) into
-    Detection objects. Coordinates are scaled to the SOURCE image size.
+def parse_boxes(
+    answer: str, image_width: int, image_height: int
+) -> Tuple[List[Detection], int]:
+    """Parse `<ref>label</ref><box>...</box>` runs into Detection objects.
+
+    Returns a `(detections, off_contract_count)` tuple:
+      * `detections` — every VALID labeled box (non-empty `<ref>` label),
+        coordinates scaled to the SOURCE image size and canonicalized by
+        `_make_box` (clamp to [0,1000] + corner-sort). Degenerate / zero-area
+        boxes are kept (NVIDIA forces valid-detection coords to 0 and keeps
+        them); a box is NEVER dropped on corner order or range.
+      * `off_contract_count` — the number of boxes that are off-contract for
+        the wire-v2 shape and were therefore NOT emitted: orphan boxes (no
+        preceding `<ref>` run) and empty-ref boxes (`<ref></ref>` label strips
+        to empty). `worker/inference.py` folds this into `deviations_dropped`.
 
     Note: the LocateAnything README's parse_boxes uses the ORIGINAL image
     width/height. The model emits coords relative to whatever image it
@@ -138,26 +163,35 @@ def parse_boxes(answer: str, image_width: int, image_height: int) -> List[Detect
 
     Two-pass design:
       (1) Find each <ref>label</ref> ref-run via _REF_RUN_RE. For each run,
-          extract every valid 4-coord <box> inside via _BOX_RE, attributing
-          all of them to the run's label. This is the shape NVIDIA trained
-          on for templates 1-6 (one <ref> followed by ≥1 siblings; template 3
-          is the only one that legitimately emits multiple siblings).
+          extract every valid 4-coord <box> inside via _BOX_RE. If the run's
+          label is non-empty, attribute all of them to that label (valid
+          detections); if the label strips to empty, the boxes are
+          off-contract and only counted. This is the shape NVIDIA trained on
+          for templates 1-6 (one <ref> followed by ≥1 siblings; template 3 is
+          the only one that legitimately emits multiple siblings).
       (2) Find orphan <box> blocks — boxes whose span does NOT overlap any
-          ref-run from pass 1. Attribute them as label=None. None of the
-          seven canonical templates emit bare boxes, but we accept them
-          defensively for off-pattern model output.
+          ref-run from pass 1. None of the seven canonical templates emit
+          bare boxes; an orphan box is off-contract and only counted.
 
     Interval-overlap check: `a.start < b.end AND b.start < a.end`.
     """
     out: List[Detection] = []
+    off_contract = 0
     consumed_intervals: List[tuple] = []
 
-    # Pass 1: each <ref>…</ref><box>…</box>[<box>…</box>…] run emits one
-    # Detection per VALID box inside the run, ALL sharing the ref's label.
+    # Pass 1: each <ref>…</ref><box>…</box>[<box>…</box>…] run. A non-empty
+    # label yields one Detection per VALID box inside the run, all sharing the
+    # label. An empty-ref run's boxes are off-contract (counted, not emitted).
     for m in _REF_RUN_RE.finditer(answer):
         consumed_intervals.append(m.span())
-        label = m.group("label").strip() or None
-        for bm in _BOX_RE.finditer(m.group("boxes")):
+        label = m.group("label").strip()
+        boxes_in_run = list(_BOX_RE.finditer(m.group("boxes")))
+        if not label:
+            # Empty `<ref></ref>` run: every valid box inside is off-contract
+            # (no non-empty label to attribute it to).
+            off_contract += len(boxes_in_run)
+            continue
+        for bm in boxes_in_run:
             x1, y1, x2, y2 = (int(bm.group(k)) for k in (1, 2, 3, 4))
             # No geometric reject: `_make_box` clamps to [0,1000] and
             # canonicalizes corner order (min/max), so a box the model
@@ -166,18 +200,24 @@ def parse_boxes(answer: str, image_width: int, image_height: int) -> List[Detect
                                  image_width, image_height))
 
     # Pass 2: orphan boxes — boxes whose span does NOT overlap any ref-run.
+    # Off-contract for wire v2 (no <ref> label): counted, never emitted.
     for m in _BOX_RE.finditer(answer):
         s, e = m.span()
         if any(s < ie and is_ < e for (is_, ie) in consumed_intervals):
             continue
-        x1, y1, x2, y2 = (int(m.group(k)) for k in (1, 2, 3, 4))
-        out.append(_make_box(None, x1, y1, x2, y2, image_width, image_height))
+        off_contract += 1
 
-    return out
+    return out, off_contract
 
 
-def parse_points(answer: str, image_width: int, image_height: int) -> List[Point]:
-    """Parse <box><x><y></box> point blocks. Two coords only.
+def parse_points(
+    answer: str, image_width: int, image_height: int
+) -> Tuple[List[Point], int]:
+    """Parse `<ref>label</ref><box><x><y></box>` point runs into Point objects.
+
+    Returns a `(points, off_contract_count)` tuple with the same contract as
+    `parse_boxes`: valid points carry a non-empty `<ref>` label; orphan and
+    empty-ref points are off-contract (counted, never emitted).
 
     Mirrors NVIDIA's eval-time parser at
     NVlabs/Eagle's `Embodied/evaluation/inference_grounding_ddp.py:564-587`,
@@ -186,12 +226,13 @@ def parse_points(answer: str, image_width: int, image_height: int) -> List[Point
 
     Two-pass design:
       (1) For each <ref>label</ref><box>...</box>... ref-run, extract every
-          valid 2-coord <box> inside via _POINT_RE, attributing them to the
-          run's label. Template 7 (`Point to: PHRASE.`) emits this shape:
+          valid 2-coord <box> inside via _POINT_RE. A non-empty label yields
+          Points; an empty-ref run's points are off-contract (counted).
+          Template 7 (`Point to: PHRASE.`) emits this shape:
           `<ref>PHRASE</ref><box><x><y></box>` — single labeled point per
           query.
       (2) Orphan points — 2-coord blocks not inside any ref-run and not
-          shadowed by a 4-coord box span. These get label=None. The model
+          shadowed by a 4-coord box span. Off-contract (counted). The model
           can also emit bare points without a <ref> prefix.
 
     De-dup rule: a 2-coord <box><x><y></box> is a strict substring of the
@@ -207,11 +248,13 @@ def parse_points(answer: str, image_width: int, image_height: int) -> List[Point
     """
     box_spans: List[tuple] = [m.span() for m in _BOX_RE.finditer(answer)]
     out: List[Point] = []
+    off_contract = 0
     consumed_point_spans: List[tuple] = []
 
-    # Pass 1: labeled points inside <ref>...</ref><box>...</box>... ref-runs.
+    # Pass 1: points inside <ref>...</ref><box>...</box>... ref-runs. Non-empty
+    # label → Points; empty-ref → off-contract (counted).
     for m in _REF_RUN_RE.finditer(answer):
-        label = m.group("label").strip() or None
+        label = m.group("label").strip()
         boxes_text = m.group("boxes")
         boxes_offset = m.start("boxes")
         for pm in _POINT_RE.finditer(boxes_text):
@@ -225,6 +268,11 @@ def parse_points(answer: str, image_width: int, image_height: int) -> List[Point
             x, y = int(pm.group(1)), int(pm.group(2))
             if not (0 <= x <= 1000 and 0 <= y <= 1000):
                 continue
+            consumed_point_spans.append((abs_start, abs_end))
+            if not label:
+                # Empty-ref point: off-contract (no non-empty label).
+                off_contract += 1
+                continue
             out.append(
                 Point(
                     label=label,
@@ -233,10 +281,9 @@ def parse_points(answer: str, image_width: int, image_height: int) -> List[Point
                               round(y / 1000.0 * image_height, 2)],
                 )
             )
-            consumed_point_spans.append((abs_start, abs_end))
 
     # Pass 2: orphan points — 2-coord blocks not inside any 4-coord box
-    # and not already emitted by pass 1.
+    # and not already emitted/counted by pass 1. Off-contract (counted).
     for m in _POINT_RE.finditer(answer):
         s, e = m.span()
         if any(s < ie and bs < e for (bs, ie) in box_spans):
@@ -246,15 +293,8 @@ def parse_points(answer: str, image_width: int, image_height: int) -> List[Point
         x, y = int(m.group(1)), int(m.group(2))
         if not (0 <= x <= 1000 and 0 <= y <= 1000):
             continue
-        out.append(
-            Point(
-                label=None,
-                point_norm=[x, y],
-                point_px=[round(x / 1000.0 * image_width, 2),
-                          round(y / 1000.0 * image_height, 2)],
-            )
-        )
-    return out
+        off_contract += 1
+    return out, off_contract
 
 
 def has_abstention(answer: str) -> bool:
@@ -267,11 +307,10 @@ def has_abstention(answer: str) -> bool:
     it ONLY when you specifically want to know whether the model emitted
     the trained abstention literal at all (e.g. in `worker/calibration.py`
     to distinguish "model produced recognized output" from "model emitted
-    gibberish" at boot). For the aggregate "did this frame return
-    anything usable" question, use `InferenceResult.abstained` (derived in
-    `worker/inference.py` from the pre-(task-shape-)filter parse) — it
-    matches NVIDIA's eval pipeline which has no aggregate abstained concept
-    (see module docstring)."""
+    gibberish" at boot). The aggregate "did this frame return anything
+    usable" question is answered by the variant `worker/inference.py`
+    selects (the `abstained` variant ⇔ zero parsed geometry of any kind);
+    this substring probe is only the parser-drift self-test signal."""
     return _NONE_RE.search(answer) is not None
 
 
@@ -285,7 +324,7 @@ def _clamp_coord(c: int) -> int:
 
 
 def _make_box(
-    label: Optional[str],
+    label: str,
     x1: int,
     y1: int,
     x2: int,

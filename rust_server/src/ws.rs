@@ -5,22 +5,27 @@
 //!      (`GET /v1/capabilities`).
 //!   2. Client sends a Frame binary message:
 //!      `[ 4-byte BE u32 header_len ][ header JSON ][ JPEG bytes ]`.
-//!   3. Server runs one inference and replies with one `Result` Text
-//!      OR one `Error` Text — never both, never multiples.
+//!   3. Server runs one inference and replies with exactly one typed
+//!      [`Response`] Text frame (`boxes` XOR `points` XOR `abstained` XOR
+//!      `error`) — never both, never multiples.
 //!   4. Repeat from step 2 until the client closes (or the server
 //!      shuts down, in which case we send a clean Close 1001).
 //!
 //! Error surfaces — exactly two, per docs/CLIENT_PROTOCOL.md:
 //!   * **Framing-fatal → Close(1008)**: the binary framing is unparseable
 //!     so the next Frame cannot be located in the bytestream. Header
-//!     length-prefix wrong, header JSON unparseable, frame_id missing —
-//!     all collapse the connection because there is no way to send a
-//!     correlated error.
-//!   * **Per-frame → Text(`{type:"error", frame_id, code, message}`)**:
-//!     framing is intact but the content of THIS Frame is rejected
-//!     (bad prompt template, generation_mode invalid, JPEG malformed,
-//!     image dims off, etc.). The WebSocket stays open and the next
-//!     Frame proceeds normally — the client can correct and retry.
+//!     length-prefix wrong, header JSON unparseable (including an unknown
+//!     field, a malformed `request`, or a `generation_mode` that is not one
+//!     of fast/hybrid/slow — serde rejects these at parse time), frame_id
+//!     missing — all collapse the connection because there is no way to send
+//!     a correlated error.
+//!   * **Per-frame → `Response::Error` Text(`{type:"error", frame_id, code,
+//!     message}`)**: framing is intact but the content of THIS Frame is
+//!     rejected. `code` is one of the A.2 `ErrorCode`s: `invalid_request`
+//!     (typed-slot validation failed, or jpeg_len ≠ payload), `invalid_image`
+//!     (signature/decode/dimension/patch-cap), or `internal` (a runtime
+//!     fault). The WebSocket stays open and the next Frame proceeds normally
+//!     — the client can correct and retry.
 //!
 //! The model is stateless across calls; many WebSockets handle many
 //! clients concurrently via asyncio inside the worker, but each individual
@@ -36,10 +41,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, instrument, warn};
 
-use crate::ipc::{self, InferOutcome};
+use crate::ipc;
 use crate::jpeg;
 use crate::prompt_validator;
-use crate::protocol::{InferHeader, MAX_PROMPT_CHARS, MIN_IMAGE_DIM};
+use crate::protocol::{ErrorBody, ErrorCode, InferHeader, Response, MIN_IMAGE_DIM};
 use crate::state::AppState;
 
 /// Cadence at which the server sends WebSocket ping control frames to
@@ -142,7 +147,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
         // Parse + validate the Frame. Three outcomes:
         //   Pending → forward to worker
         //   FatalFraming → Close(1008), connection cannot continue
-        //   PerFrame    → emit `type:"error"` Text, keep WS open
+        //   PerFrame    → emit a typed `Response::Error`, keep WS open
         let pending = match process_binary(bytes, max_jpeg_bytes, max_image_dim).await {
             BinaryOutcome::Pending(p) => p,
             BinaryOutcome::FatalFraming(reason) => {
@@ -150,12 +155,11 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                 return;
             }
             BinaryOutcome::PerFrame { frame_id, code, message } => {
-                let payload = serde_json::json!({
-                    "type":     "error",
-                    "frame_id": frame_id,
-                    "code":     code,
-                    "message":  message,
-                }).to_string();
+                let payload = serialize_response(&Response::Error(ErrorBody {
+                    frame_id,
+                    code,
+                    message,
+                }));
                 if ws_tx.send(Message::Text(payload.into())).await.is_err() {
                     return;
                 }
@@ -163,20 +167,25 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
             }
         };
 
-        // Forward to the worker. Success → type:"result"; WorkerError →
-        // type:"error". Either way the body flows through verbatim with
-        // type + frame_id stamped on. A transport error closes the WS
-        // because the framed UDS may now be desynced.
-        let frame_id = pending.header.frame_id.clone();
+        // Forward to the worker. The reply is already a typed `Response`
+        // (a boxes/points/abstained success OR a Response::Error — egress
+        // schema-enforced in ipc::infer). We serialize it straight to the
+        // client; frame_id is a typed field on each variant, so there is no
+        // post-hoc stamping. A transport/protocol error closes the WS because
+        // the framed UDS may now be desynced.
         let payload = match conn.infer(
-            &pending.header, pending.jpeg, pending.prompt_task.wire_name(),
+            &pending.header.frame_id,
+            &pending.prompt,
+            pending.prompt_task,
+            pending.header.generation_mode,
+            pending.header.jpeg_len,
+            pending.jpeg,
         ).await {
-            Ok(InferOutcome::Success(v))     => stamp_response(v, "result", &frame_id),
-            Ok(InferOutcome::WorkerError(v)) => stamp_response(v, "error",  &frame_id),
+            Ok(response) => serialize_response(&response),
             Err(e) => {
-                // Worker transport error. The framed UDS may now be desynced,
-                // so we close the WS rather than try to resync on this
-                // connection. The next WS will get a fresh worker conn.
+                // Worker transport/protocol error. The framed UDS may now be
+                // desynced, so we close the WS rather than try to resync on
+                // this connection. The next WS will get a fresh worker conn.
                 send_close(&mut ws_tx, CLOSE_SERVER_ERROR,
                            &format!("worker: {e}")).await;
                 return;
@@ -191,11 +200,16 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
 struct PendingFrame {
     header: InferHeader,
     jpeg: Bytes,
-    /// The validated template kind, carried separately from the InferHeader
-    /// (which is the public client-facing schema). Forwarded to the worker
-    /// as the IPC header's `prompt_task` field for trained-correct
-    /// task→shape filter enforcement. See `prompt_validator::TemplateKind`.
-    prompt_task: prompt_validator::TemplateKind,
+    /// The COMPILED trained prompt string, assembled from the client's typed
+    /// `header.request` by `prompt_validator::compile`. Forwarded to the
+    /// worker as the IPC header's `prompt` field (the typed request never
+    /// crosses the UDS).
+    prompt: String,
+    /// The `prompt_task` wire-name for the compiled prompt (one of
+    /// `prompt_validator::TemplateKind::wire_name`). Forwarded to the worker
+    /// for trained-correct task→shape routing of off-shape model output. See
+    /// worker/inference.py::EXPECTED_SHAPE.
+    prompt_task: &'static str,
 }
 
 /// The three possible outcomes of binary-frame parsing/validation.
@@ -207,8 +221,9 @@ enum BinaryOutcome {
     /// (length prefix bad, header JSON unparseable, frame_id missing).
     FatalFraming(String),
     /// Framing is intact but the content of this Frame is rejected.
-    /// The Frame is dropped; the WS stays open for the next Frame.
-    PerFrame { frame_id: String, code: u16, message: String },
+    /// The Frame is dropped; the WS stays open for the next Frame. `code`
+    /// is one of the four A.2 `ErrorCode`s (no longer a numeric status).
+    PerFrame { frame_id: String, code: ErrorCode, message: String },
 }
 
 /// Validate a single WebSocket binary message and produce a BinaryOutcome.
@@ -250,9 +265,10 @@ async fn process_binary(
         Ok(h) => h,
         Err(e) => {
             return BinaryOutcome::FatalFraming(format!(
-                "header JSON parse failed: {e}. Required keys: frame_id, prompt, \
-                 generation_mode, jpeg_len. Extra keys rejected. See \
-                 docs/CLIENT_PROTOCOL.md.",
+                "header JSON parse failed: {e}. Required keys: frame_id, \
+                 request (a typed {{\"task\":...}} object), generation_mode \
+                 (\"fast\"|\"hybrid\"|\"slow\"), jpeg_len. Extra keys rejected. \
+                 See docs/CLIENT_PROTOCOL.md.",
             ));
         }
     };
@@ -277,64 +293,37 @@ async fn process_binary(
     // From here on we have a usable frame_id — every error becomes a
     // per-frame `type:"error"` message and the WS stays open.
 
-    // ---- 4. Strict trained-correct prompt-template validation. The
-    //         validator itself handles empty / length / template / slot
-    //         checks and produces an English diagnostic that points the
-    //         client at the canonical-reference URL. The returned
-    //         TemplateKind is forwarded to the worker as `prompt_task`
-    //         so the parser can filter off-shape model output (counting it
-    //         in the reply's off_shape_count, not silently dropping it) per
-    //         the trained task→shape contract (see prompt_validator::
-    //         TemplateKind::wire_name + worker/inference.py::
-    //         EXPECTED_SHAPE). -----------------------------------------
-    let prompt_task = match prompt_validator::validate(&header.prompt) {
-        Ok(kind) => kind,
+    // ---- 4. Compile the typed request → the exact trained prompt. The
+    //         builder validates the TYPED slot values (NFC, no control chars,
+    //         no surrounding whitespace, no `</c>`, no trailing '.', ≤200
+    //         chars, categories 1..=10 / no-comma, point/category no-comma)
+    //         per the locked A.1 contract, REJECTING (never normalizing) any
+    //         violation. It also enforces the compiled-prompt MAX_PROMPT_CHARS
+    //         cap. The returned wire-name is forwarded to the worker as
+    //         `prompt_task` so the parser can route off-shape model output per
+    //         the trained task→shape contract (prompt_validator::
+    //         TemplateKind::wire_name + worker/inference.py::EXPECTED_SHAPE).
+    //
+    //         NOTE: generation_mode is no longer string-checked here — serde's
+    //         typed `GenerationMode` enum rejected any non-{fast,hybrid,slow}
+    //         value at header-parse time above (a fatal-framing error). -----
+    let (prompt, prompt_task) = match prompt_validator::compile(&header.request) {
+        Ok(compiled) => compiled,
         Err(e) => {
             return BinaryOutcome::PerFrame {
                 frame_id,
-                code: 400,
-                message: format!("header.prompt rejected: {}", e.message()),
+                code: ErrorCode::InvalidRequest,
+                message: format!("request rejected: {}", e.message()),
             };
         }
     };
-    // Defense-in-depth: even though prompt_validator already enforces a
-    // character cap matching MAX_PROMPT_CHARS, keep the explicit check
-    // here in case the validator's cap ever loosens — these are two
-    // independent gates on the same invariant.
-    if header.prompt.chars().count() > MAX_PROMPT_CHARS {
-        return BinaryOutcome::PerFrame {
-            frame_id,
-            code: 400,
-            message: format!(
-                "header.prompt length {} chars > MAX_PROMPT_CHARS={} (the model's \
-                 tokenizer.model_max_length is 16384 tokens — even on ASCII this \
-                 cap is generous). See docs/MODEL_CAPABILITIES.md.",
-                header.prompt.chars().count(),
-                MAX_PROMPT_CHARS,
-            ),
-        };
-    }
 
-    // ---- 5. generation_mode --------------------------------------------
-    if !matches!(header.generation_mode.as_str(), "fast" | "hybrid" | "slow") {
-        return BinaryOutcome::PerFrame {
-            frame_id,
-            code: 400,
-            message: format!(
-                "header.generation_mode={:?} is not one of \"fast\" | \"hybrid\" \
-                 | \"slow\". No default — every Frame must commit to a mode. \
-                 See docs/MODEL_CAPABILITIES.md#generation-modes.",
-                header.generation_mode
-            ),
-        };
-    }
-
-    // ---- 6. JPEG payload size + signature ------------------------------
+    // ---- 5. JPEG payload size + signature ------------------------------
     let jpeg = bytes.slice(4 + header_len..);
     if jpeg.len() != header.jpeg_len {
         return BinaryOutcome::PerFrame {
             frame_id,
-            code: 400,
+            code: ErrorCode::InvalidRequest,
             message: format!(
                 "header.jpeg_len={} != actual payload length {} (these must \
                  match exactly — mismatch indicates a framing bug)",
@@ -345,14 +334,14 @@ async fn process_binary(
     if jpeg.is_empty() {
         return BinaryOutcome::PerFrame {
             frame_id,
-            code: 400,
+            code: ErrorCode::InvalidImage,
             message: "JPEG payload is zero bytes (a Frame must carry a JPEG image)".into(),
         };
     }
     if jpeg.len() > max_jpeg_bytes {
         return BinaryOutcome::PerFrame {
             frame_id,
-            code: 400,
+            code: ErrorCode::InvalidImage,
             message: format!(
                 "JPEG payload {} bytes exceeds server cap LA_MAX_JPEG_BYTES={} \
                  (configurable in scripts/lib/versions.sh)",
@@ -363,7 +352,7 @@ async fn process_binary(
     if !jpeg::is_jpeg(&jpeg) {
         return BinaryOutcome::PerFrame {
             frame_id,
-            code: 400,
+            code: ErrorCode::InvalidImage,
             message: format!(
                 "payload first bytes [{:02X}, {:02X}, {:02X}] are not the JPEG \
                  SOI marker FF D8 FF; we accept only baseline JPEG with the \
@@ -375,7 +364,7 @@ async fn process_binary(
         };
     }
 
-    // ---- 7. JPEG dimensions (off-thread; jpeg_decoder is sync) ---------
+    // ---- 6. JPEG dimensions (off-thread; jpeg_decoder is sync) ---------
     let jpeg_for_check = jpeg.clone();
     let dims = tokio::task::spawn_blocking(move || {
         jpeg::read_dimensions_blocking(&jpeg_for_check)
@@ -385,7 +374,7 @@ async fn process_binary(
         Ok(Ok(d)) => d,
         Ok(Err(s)) => return BinaryOutcome::PerFrame {
             frame_id,
-            code: 400,
+            code: ErrorCode::InvalidImage,
             message: format!(
                 "JPEG header parse failed: {s} (the SOI marker matched but the \
                  JPEG structure is malformed — check the encoder output)"
@@ -393,7 +382,7 @@ async fn process_binary(
         },
         Err(e) => return BinaryOutcome::PerFrame {
             frame_id,
-            code: 500,
+            code: ErrorCode::Internal,
             message: format!(
                 "spawn_blocking for jpeg_decoder join error: {e} (this is a \
                  tokio runtime issue, not a client error)"
@@ -403,7 +392,7 @@ async fn process_binary(
     if w < MIN_IMAGE_DIM || h < MIN_IMAGE_DIM {
         return BinaryOutcome::PerFrame {
             frame_id,
-            code: 400,
+            code: ErrorCode::InvalidImage,
             message: format!(
                 "image dimensions {}x{} below MIN_IMAGE_DIM={} (a useful input \
                  must occupy at least one LLM token in the model's 28px grid)",
@@ -414,7 +403,7 @@ async fn process_binary(
     if w > max_image_dim || h > max_image_dim {
         return BinaryOutcome::PerFrame {
             frame_id,
-            code: 400,
+            code: ErrorCode::InvalidImage,
             message: format!(
                 "image dimensions {}x{} exceed LA_MAX_IMAGE_DIM={} \
                  (configurable in scripts/lib/versions.sh; the model's preprocessor \
@@ -458,7 +447,7 @@ async fn process_binary(
     if n_patches > IN_TOKEN_LIMIT {
         return BinaryOutcome::PerFrame {
             frame_id,
-            code: 400,
+            code: ErrorCode::InvalidImage,
             message: format!(
                 "image dimensions {}x{} produce {} ViT patches \
                  ((W // {}) × (H // {})), exceeding the trained \
@@ -477,7 +466,7 @@ async fn process_binary(
     if w_patches >= POS_EMB_PATCH_CAP || h_patches >= POS_EMB_PATCH_CAP {
         return BinaryOutcome::PerFrame {
             frame_id,
-            code: 400,
+            code: ErrorCode::InvalidImage,
             message: format!(
                 "image dimensions {}x{} would map to a {}×{} patch grid; the \
                  MoonViT positional embedding's bicubic-interpolation cap is \
@@ -491,19 +480,36 @@ async fn process_binary(
         };
     }
 
-    BinaryOutcome::Pending(PendingFrame { header, jpeg, prompt_task })
+    BinaryOutcome::Pending(PendingFrame { header, jpeg, prompt, prompt_task })
 }
 
-/// Add the canonical `type` and `frame_id` keys to a worker response and
-/// serialize. Used for both result and error bodies — the worker's JSON is
-/// already in the right shape; we just stamp two fields the worker doesn't
-/// know.
-fn stamp_response(mut v: serde_json::Value, kind: &str, frame_id: &str) -> String {
-    if let serde_json::Value::Object(ref mut map) = v {
-        map.insert("type".into(), serde_json::json!(kind));
-        map.insert("frame_id".into(), serde_json::json!(frame_id));
+/// Serialize a typed [`Response`] to the JSON Text frame sent to the client.
+/// `frame_id` and the `type` tag are typed fields on the variant — no
+/// post-hoc stamping. serde serialization of these types is infallible in
+/// practice (no NaN/Inf reach our f32/f64 — they come from valid wire JSON or
+/// finite-constructed errors); the unreachable error arm still emits a
+/// guaranteed-valid `internal` error frame rather than panicking.
+fn serialize_response(response: &Response) -> String {
+    match serde_json::to_string(response) {
+        Ok(s) => s,
+        Err(e) => {
+            // Should be unreachable for our concrete types. Emit a minimal,
+            // hand-rolled error frame so the client still receives a typed
+            // error rather than a dropped/garbled message.
+            let frame_id = match response {
+                Response::Boxes(b) => b.frame_id.as_str(),
+                Response::Points(p) => p.frame_id.as_str(),
+                Response::Abstained(a) => a.frame_id.as_str(),
+                Response::Error(er) => er.frame_id.as_str(),
+            };
+            serde_json::json!({
+                "type":     "error",
+                "frame_id": frame_id,
+                "code":     ErrorCode::Internal.as_wire(),
+                "message":  format!("internal: failed to serialize response: {e}"),
+            }).to_string()
+        }
     }
-    v.to_string()
 }
 
 /// Send a WebSocket Close frame with a specific code and reason, then

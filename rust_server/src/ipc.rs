@@ -7,16 +7,25 @@
 //! Python responds with:
 //!     [ length(4) ][ response JSON ]
 //!
-//! Frame inference: the header JSON carries `kind:"frame"` plus the
-//! fields from `InferHeader` (frame_id, prompt, generation_mode, jpeg_len).
-//! Control queries (`{"kind":"capabilities"}` / `{"kind":"info"}`) carry
-//! the kind only and follow with an empty-length JPEG frame so framing
-//! stays uniform.
+//! Frame inference: the header JSON carries `kind:"frame"` plus
+//! `frame_id`, the COMPILED `prompt` string, the `prompt_task` wire-name,
+//! the serialized `generation_mode`, and `jpeg_len`. NOTE: the worker
+//! receives the assembled prompt STRING (built by `prompt_validator::compile`
+//! from the client's typed request) — the typed `PromptRequest` never crosses
+//! the UDS; the prompt/prompt_task/generation_mode header shape is unchanged.
+//! Control queries (`{"kind":"capabilities"}` / `{"kind":"info"}`) carry the
+//! kind only and follow with an empty-length JPEG frame so framing stays
+//! uniform.
 //!
-//! Worker response envelope: every body carries a top-level `ok:bool`
-//! discriminator the Rust side strips on the way out. `ok:true` → forward
-//! as `type:"result"`; `ok:false` → forward as `type:"error"`. The
-//! discriminator is internal to the UDS hop and never reaches the client.
+//! Worker response envelope: every inference body carries a top-level
+//! `ok:bool` discriminator (internal to the UDS hop; never reaches the
+//! client). The rest of the body is the client-facing A.2 shape — a flat
+//! tagged union on `type` — which the Rust edge DESERIALIZES into the typed
+//! [`crate::protocol::Response`]. Egress is therefore schema-enforced: a
+//! drifted worker field (a stale `off_shape_count`, a missing `latency_ms`,
+//! a duplicate key, an `ok`/`type` contradiction) fails loud here instead of
+//! being forwarded blindly. `query_capabilities`/`query_info` stay
+//! `serde_json::Value` — they are control-plane, deliberately untyped.
 
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
@@ -25,19 +34,10 @@ use tokio::net::UnixStream;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 use crate::error::ServerError;
-use crate::protocol::InferHeader;
+use crate::protocol::{GenerationMode, Response};
 
 pub struct WorkerConn {
     framed: Framed<UnixStream, LengthDelimitedCodec>,
-}
-
-/// Worker round-trip outcome. The `ok` discriminator has been stripped
-/// before the body reaches the caller — both variants carry the body
-/// the WS handler forwards verbatim to the client (after stamping
-/// type + frame_id).
-pub enum InferOutcome {
-    Success(serde_json::Value),
-    WorkerError(serde_json::Value),
 }
 
 impl WorkerConn {
@@ -51,37 +51,47 @@ impl WorkerConn {
         Ok(Self { framed: Framed::new(stream, codec) })
     }
 
-    /// Send (header, jpeg_bytes) and await one JSON response frame from
-    /// the Python worker.
+    /// Send (header, jpeg_bytes) and await one JSON response frame from the
+    /// Python worker, deserialized into the typed [`Response`].
     ///
-    /// The `Ok` variants both carry a body the WS handler forwards verbatim
-    /// (after stamping `type` + `frame_id`); only `Err` is a transport
-    /// failure that should close the WS — the framed UDS may have desynced.
+    /// `Ok(Response)` is the client-facing reply (a `boxes`/`points`/
+    /// `abstained` success OR a `Response::Error`); the WS handler serializes
+    /// it straight to the client. `Err` is a transport / protocol failure that
+    /// should close the WS — the framed UDS may have desynced, or the worker
+    /// emitted a body that violates the A.2 schema.
     ///
-    /// `prompt_task` is the wire name of the canonical template the prompt
-    /// was classified as (see `prompt_validator::TemplateKind::wire_name`).
-    /// It is forwarded to the worker so the parser can FILTER off-shape
-    /// output per the trained task→shape contract (e.g. a 4-coord box
-    /// returned for a Point template is filtered out of `detections`,
-    /// counted in the reply's `off_shape_count`, and never misreported as
-    /// abstention). This is NOT exposed in the client-facing InferHeader
-    /// schema — it is derived server-side from the validated prompt.
+    /// `prompt` is the COMPILED trained string and `prompt_task` is its
+    /// wire-name (one of `prompt_validator::TemplateKind::wire_name`), both
+    /// produced by `prompt_validator::compile` from the client's typed
+    /// request. `generation_mode` is serialized to its snake_case wire form.
+    /// The worker uses `prompt_task` to route off-shape model output per the
+    /// trained task→shape contract (worker/inference.py::EXPECTED_SHAPE).
     pub async fn infer(
         &mut self,
-        header: &InferHeader,
-        jpeg: Bytes,
+        frame_id: &str,
+        prompt: &str,
         prompt_task: &'static str,
-    ) -> Result<InferOutcome, ServerError> {
+        generation_mode: GenerationMode,
+        jpeg_len: usize,
+        jpeg: Bytes,
+    ) -> Result<Response, ServerError> {
+        // Serialize the generation mode to its wire string ("fast"/"hybrid"/
+        // "slow") via serde, so the IPC string is the single source of truth.
+        let mode_wire = serde_json::to_value(generation_mode).map_err(|e| {
+            ServerError::Internal(format!(
+                "could not serialize generation_mode for worker IPC: {e}"
+            ))
+        })?;
         let header_json = serde_json::to_string(&serde_json::json!({
             "kind":            "frame",
-            "frame_id":        &header.frame_id,
-            "prompt":          &header.prompt,
+            "frame_id":        frame_id,
+            "prompt":          prompt,
             "prompt_task":     prompt_task,
-            "generation_mode": &header.generation_mode,
-            "jpeg_len":        header.jpeg_len,
+            "generation_mode": mode_wire,
+            "jpeg_len":        jpeg_len,
         })).map_err(|e| {
             ServerError::Internal(format!(
-                "could not serialize InferHeader to JSON for worker IPC: {e}"
+                "could not serialize IPC frame header to JSON for worker: {e}"
             ))
         })?;
         self.framed.send(Bytes::from(header_json)).await.map_err(|e| {
@@ -105,16 +115,51 @@ impl WorkerConn {
                 "UDS read from Python worker failed: {e}"
             ))
         })?;
+
+        // The body is `{ok:bool, <A.2 fields...>}`. Strip the internal `ok`
+        // discriminator, then deserialize the rest into the typed Response.
+        // `ok` is required (fail-loud if absent) and must AGREE with the
+        // variant tag (`ok:false` ⇔ Error) — a contradiction is a worker bug.
         let mut v: serde_json::Value = serde_json::from_slice(&resp)?;
-        match v.as_object_mut().and_then(|m| m.remove("ok")).and_then(|x| x.as_bool()) {
-            Some(true)  => Ok(InferOutcome::Success(v)),
-            Some(false) => Ok(InferOutcome::WorkerError(v)),
-            None => Err(ServerError::WorkerProtocol(format!(
-                "worker response missing required `ok` boolean field; \
-                 received keys: {:?}",
-                v.as_object().map(|m| m.keys().collect::<Vec<_>>())
-            ))),
+        let ok = match v.as_object_mut().and_then(|m| m.remove("ok")) {
+            Some(serde_json::Value::Bool(b)) => b,
+            Some(other) => {
+                return Err(ServerError::WorkerProtocol(format!(
+                    "worker response `ok` field is not a boolean (got {other}); \
+                     it is the internal success discriminator and must be a bool"
+                )));
+            }
+            None => {
+                return Err(ServerError::WorkerProtocol(format!(
+                    "worker response missing required `ok` boolean field; \
+                     received keys: {:?}",
+                    v.as_object().map(|m| m.keys().collect::<Vec<_>>())
+                )));
+            }
+        };
+
+        // Egress schema enforcement: the remaining body must be exactly one
+        // A.2 variant (deny_unknown_fields + flatten reject drift here).
+        let response: Response = serde_json::from_value(v).map_err(|e| {
+            ServerError::WorkerProtocol(format!(
+                "worker inference reply does not match the typed Response \
+                 (A.2) schema: {e}. The Python worker emitted a body that \
+                 drifted from the locked wire contract — almost certainly a \
+                 worker bug; check the surrounding logs."
+            ))
+        })?;
+
+        let is_error = matches!(response, Response::Error(_));
+        if ok == is_error {
+            return Err(ServerError::WorkerProtocol(format!(
+                "worker response `ok`={ok} contradicts its `type` tag \
+                 (variant is {}an error). The internal `ok` discriminator and \
+                 the A.2 `type` tag must agree.",
+                if is_error { "" } else { "not " }
+            )));
         }
+
+        Ok(response)
     }
 
     /// Control-plane request: capabilities, info, or other no-payload kinds.

@@ -17,9 +17,11 @@ Failure modes this catches:
   - Median latency varies wildly across clients (de-facto starvation).
 
 Run via `docker exec` against the live container; NOT a reference for
-production clients (see examples/reference_client.py for that). Wire format
-follows scripts/lib/smoke_ws_client.py verbatim — these two clients MUST
-stay in sync with the server-side protocol.
+production clients (see examples/reference_client.py for that). The request
+is a TYPED PromptRequest (A.1) and the reply is the A.2 flat tagged union
+on `type` (boxes / points / abstained / error) — the request-build and
+response-parse logic follows scripts/lib/smoke_ws_client.py verbatim;
+these two clients MUST stay in sync with the server-side protocol.
 """
 
 from __future__ import annotations
@@ -37,6 +39,52 @@ from typing import Optional
 import websockets
 
 
+# The seven trained task tags (A.1). Mirrors rust_server/src/protocol.rs.
+TASKS = ("detection", "phrase_single", "phrase_multi",
+         "text_grounding", "scene_text", "gui_box", "point")
+
+# A.2 success variants (everything but `error`).
+SUCCESS_TYPES = {"boxes", "points", "abstained"}
+
+
+def build_request(args) -> dict:
+    """Assemble the typed `request` object (A.1) from the CLI flags. Tagged
+    on `task`; each task carries exactly its own slot."""
+    task = args.task
+    if task == "detection":
+        if not args.categories:
+            print("FAIL: --task detection requires --categories a,b,c",
+                  file=sys.stderr)
+            sys.exit(2)
+        cats = [c.strip() for c in args.categories.split(",") if c.strip()]
+        if not cats:
+            print("FAIL: --categories produced zero non-empty entries",
+                  file=sys.stderr)
+            sys.exit(2)
+        return {"task": "detection", "categories": cats}
+    if task in ("phrase_single", "phrase_multi", "point"):
+        if args.phrase is None:
+            print(f"FAIL: --task {task} requires --phrase", file=sys.stderr)
+            sys.exit(2)
+        return {"task": task, "phrase": args.phrase}
+    if task == "text_grounding":
+        if args.text is None:
+            print("FAIL: --task text_grounding requires --text",
+                  file=sys.stderr)
+            sys.exit(2)
+        return {"task": "text_grounding", "text": args.text}
+    if task == "gui_box":
+        if args.description is None:
+            print("FAIL: --task gui_box requires --description",
+                  file=sys.stderr)
+            sys.exit(2)
+        return {"task": "gui_box", "description": args.description}
+    if task == "scene_text":
+        return {"task": "scene_text"}
+    print(f"FAIL: unknown --task {task!r}", file=sys.stderr)
+    sys.exit(2)
+
+
 @dataclass
 class FrameRecord:
     client_id: str
@@ -44,8 +92,15 @@ class FrameRecord:
     sent_at: float
     recv_at: float
     latency_ms: float
-    resp_type: str           # "result" | "error" | "timeout" | f"unexpected:{t}"
-    n_detections: Optional[int] = None
+    # "result" (any A.2 success variant) | "error" | "timeout" |
+    # "ws_closed" | f"unexpected:{t!r}"
+    resp_type: str
+    # The concrete A.2 success variant tag for a result ("boxes" |
+    # "points" | "abstained"); None for non-result records.
+    variant: Optional[str] = None
+    # Count of geometry items in the populated list (boxes or points);
+    # 0 for abstained. None for non-result records.
+    n_geom: Optional[int] = None
     raw_text: Optional[str] = None
     error: Optional[str] = None
 
@@ -61,7 +116,7 @@ async def _run_one_client(
     client_id: str,
     url: str,
     jpeg: bytes,
-    prompt: str,
+    request: dict,
     mode: str,
     num_frames: int,
     send_interval: float,
@@ -85,9 +140,11 @@ async def _run_one_client(
                 if i > 0:
                     await asyncio.sleep(send_interval)
                 frame_id = f"{client_id}-{i:03d}"
+                # A.1 InferHeader: {frame_id, request, generation_mode,
+                # jpeg_len}. The same typed `request` is sent on every frame.
                 header = json.dumps({
                     "frame_id":        frame_id,
-                    "prompt":          prompt,
+                    "request":         request,
                     "generation_mode": mode,
                     "jpeg_len":        len(jpeg),
                 }).encode("utf-8")
@@ -96,11 +153,12 @@ async def _run_one_client(
                 t_send = time.perf_counter()
                 await ws.send(payload)
 
-                # Await the single response for this frame. The new
-                # protocol has no control / advisory messages on the WS,
-                # so any non-result / non-error reply IS a server bug.
-                # Other-client frames CANNOT appear on this WS — each WS
-                # is bound 1:1 to a single client task on the worker side.
+                # Await the single response for this frame. A.2 is a flat
+                # tagged union (boxes XOR points XOR abstained XOR error)
+                # with no control / advisory messages on the WS, so any
+                # other tag IS a server bug. Other-client frames CANNOT
+                # appear on this WS — each WS is bound 1:1 to a single
+                # client task on the worker side.
                 rec: Optional[FrameRecord] = None
                 try:
                     async with asyncio.timeout(frame_timeout):
@@ -127,7 +185,18 @@ async def _run_one_client(
                                     ),
                                 )
                                 break
-                            if t == "result":
+                            if t in SUCCESS_TYPES:
+                                # A.2 success: read the geometry count from
+                                # whichever list matches the variant (boxes →
+                                # `boxes`, points → `points`, abstained →
+                                # neither, count 0). raw_text is on Meta in
+                                # all three.
+                                if t == "boxes":
+                                    n_geom = len(obj.get("boxes", []))
+                                elif t == "points":
+                                    n_geom = len(obj.get("points", []))
+                                else:  # abstained
+                                    n_geom = 0
                                 rec = FrameRecord(
                                     client_id=client_id,
                                     frame_id=frame_id,
@@ -135,7 +204,8 @@ async def _run_one_client(
                                     recv_at=t_recv,
                                     latency_ms=lat_ms,
                                     resp_type="result",
-                                    n_detections=len(obj.get("detections", [])),
+                                    variant=t,
+                                    n_geom=n_geom,
                                     raw_text=(obj.get("raw_text") or "")[:200],
                                 )
                                 break
@@ -147,7 +217,8 @@ async def _run_one_client(
                                     recv_at=t_recv,
                                     latency_ms=lat_ms,
                                     resp_type="error",
-                                    error=str(obj.get("message") or obj),
+                                    error=(f"code={obj.get('code')!r} "
+                                           f"message={obj.get('message')!r}"),
                                 )
                                 break
                             rec = FrameRecord(
@@ -239,12 +310,15 @@ async def run(args) -> int:
         )
         return 2
 
+    request = build_request(args)
+    print(f"typed request: {json.dumps(request)}", file=sys.stderr, flush=True)
+
     tasks = [
         asyncio.create_task(_run_one_client(
             client_id=f"smoke-cc-{chr(ord('A') + i)}",
             url=args.url,
             jpeg=jpeg,
-            prompt=args.prompt,
+            request=request,
             mode=args.mode,
             num_frames=args.frames_per_client,
             send_interval=args.send_interval,
@@ -339,8 +413,8 @@ async def run(args) -> int:
                 f"  {f.client_id} frame={f.frame_id:>16} "
                 f"send=+{send_rel:6.2f}s recv=+{recv_rel:6.2f}s "
                 f"lat={f.latency_ms:7.0f}ms  type={f.resp_type}"
-                + (f"  detections={f.n_detections}"
-                   if f.n_detections is not None else "")
+                + (f"  variant={f.variant} n={f.n_geom}"
+                   if f.n_geom is not None else "")
                 + (f"  ERROR={f.error!r}" if f.error else ""),
                 file=sys.stderr,
             )
@@ -374,8 +448,19 @@ def main():
                    help="ws://host:port/v1/stream URL")
     p.add_argument("--image",              required=True,
                    help="path to the JPEG used as input by every frame")
-    p.add_argument("--prompt",             required=True,
-                   help="prompt sent in every frame header")
+    # Typed request (A.1): --task picks the slot flag that applies. The same
+    # typed request is sent on every frame across every client.
+    p.add_argument("--task",               required=True, choices=TASKS,
+                   help="trained task tag (detection→--categories, "
+                        "phrase_single/phrase_multi/point→--phrase, "
+                        "text_grounding→--text, gui_box→--description, "
+                        "scene_text→no slot)")
+    p.add_argument("--categories",
+                   help="detection only: comma-separated category list (1..=10)")
+    p.add_argument("--phrase",
+                   help="phrase_single / phrase_multi / point slot")
+    p.add_argument("--text",               help="text_grounding slot")
+    p.add_argument("--description",        help="gui_box slot")
     p.add_argument("--mode",               default="hybrid",
                    help="generation_mode: fast | hybrid | slow")
     p.add_argument("--num-clients",        type=int,   default=2)

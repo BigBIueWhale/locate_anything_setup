@@ -28,6 +28,11 @@ clap               = { version = "=4.6.1",  features = ["derive", "env"] }
 jpeg-decoder       = { version = "=0.3.2",  default-features = false }
 anyhow             = "=1.0.95"
 thiserror          = "=2.0.9"
+# NFC slot validation in prompt_validator. `default-features = false` drops the
+# crate's `std` feature; the `.nfc()` iterator we use needs only `alloc`. The
+# pin matches the website's §7.5 WASM-client pin so both edges reject identical
+# non-NFC inputs. We REJECT non-NFC slot strings — never silently normalize.
+unicode-normalization = { version = "=0.1.25", default-features = false }
 
 [profile.release]
 codegen-units = 1

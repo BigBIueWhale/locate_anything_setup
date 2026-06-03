@@ -18,7 +18,7 @@ from typing import List
 import statistics
 import time
 
-from .inference import LocateAnythingInference
+from .inference import LocateAnythingInference, KIND_ABSTAINED
 from .parsing import has_abstention
 from . import prompts
 
@@ -95,32 +95,34 @@ def calibrate(
     warm = engine.run(jpeg, test_prompt, generation_mode="hybrid",
                       prompt_task=test_prompt_task)
     # The default calibration target is a real drone JPEG + `point_to`
-    # drone prompt (see `worker/la_worker.py` argparse defaults) so the
-    # published `median_fps` is workload-representative. Whether the
-    # model actually detects the drone in the warm-up frame is
-    # incidental — what we DO require is evidence that the model emitted
-    # SOME structured output that the parser was able to consume. One of:
-    # (a) at least one parsed box, (b) at least one parsed point,
-    # (c) the trained explicit abstention literal `<box>None</box>`
-    #     present in raw_text. Anything else means raw_text was
-    #     unparseable, which would be a model-or-parser bug we want to
-    #     catch at boot — not in production.
-    #
-    # We deliberately invoke `has_abstention(warm.raw_answer)` here rather
-    # than reading `warm.abstained`. The aggregate `warm.abstained` is
-    # `not parsed_geometry` (the pre-filter no-geometry signal); for this
-    # warm-up it tracks `detections`/`points` being empty, so folding it into
-    # the disjunction would be tautological and silently mask the
-    # gibberish-output failure mode this assertion exists to
-    # catch. The substring scan via `has_abstention` is the parser-internal
-    # probe for "did the model
-    # emit the trained literal at all", which is what we actually need
-    # for the parser-drift self-test.
-    if not (warm.detections or warm.points or has_abstention(warm.raw_answer)):
+    # drone prompt (see `worker/la_worker.py` argparse defaults), classified
+    # as the `point` task, so the published `median_fps` is
+    # workload-representative and the expected success variant is `points`
+    # (or `abstained` if the model finds nothing). Whether the model actually
+    # detects the drone in the warm-up frame is incidental — what we DO
+    # require is evidence that the model emitted SOME structured output that
+    # the parser recognized. With the wire-v2 variant model that is:
+    #   (a) any success/deviation variant — i.e. `warm.kind != KIND_ABSTAINED`
+    #       — which means the parser consumed at least one geometry block
+    #       (valid points, valid boxes, or off-contract geometry that routed
+    #       to model_deviation); OR
+    #   (b) the trained explicit abstention literal `<box>None</box>` present
+    #       in raw_text (the `abstained` variant arising from a clean
+    #       no-detection rather than gibberish).
+    # `warm.kind != KIND_ABSTAINED` is the exact analogue of the old
+    # pre-(task-shape-)filter "any parsed geometry" snapshot: `abstained` is
+    # set iff ZERO geometry blocks parsed, so the disjunction is NOT
+    # tautological — it still fails loud on truly unparseable gibberish
+    # (zero geometry AND no abstention literal), which would be a
+    # model-or-parser bug we want to catch at boot, not in production.
+    # We invoke `has_abstention(warm.raw_answer)` directly (the parser-internal
+    # "did the model emit the trained literal at all" probe) for arm (b).
+    if not (warm.kind != KIND_ABSTAINED or has_abstention(warm.raw_answer)):
         raise RuntimeError(
-            "calibration warm-up yielded no recognizable output: no parsed "
-            "boxes, no parsed points, and no `<box>None</box>` abstention "
-            "literal in raw_text. raw_text first 200 chars: "
+            "calibration warm-up yielded no recognizable output: the frame "
+            "resolved to the `abstained` variant (zero parsed geometry of any "
+            "shape) AND raw_text contains no `<box>None</box>` abstention "
+            "literal. raw_text first 200 chars: "
             f"{warm.raw_answer[:200]!r}. Either the model is mis-loaded, "
             "the prompt path is broken, or the parser regex needs an "
             "update for new output forms."
@@ -138,8 +140,9 @@ def calibrate(
         t1 = time.perf_counter()
         latencies_ms.append((t1 - t0) * 1000.0)
         print(f"[calibrate] run {i+1}/{n_runs}: {latencies_ms[-1]:.1f} ms, "
-              f"{len(result.detections)} boxes, {len(result.points)} points, "
-              f"abstain={result.abstained}",
+              f"kind={result.kind}, {len(result.boxes)} boxes, "
+              f"{len(result.points)} points, "
+              f"dropped={result.deviations_dropped}",
               flush=True)
 
     latencies_ms.sort()

@@ -82,8 +82,11 @@ This project takes that seriously.
 5. **Validated input at the network boundary.** The Rust frontend
    validates every JPEG before passing it to the Python worker:
    magic bytes, declared vs. actual payload size, header-only
-   dimension parse against `LA_MAX_IMAGE_DIM`. A malformed image
-   yields a 400 — it does NOT reach the Python decoder.
+   dimension parse against `LA_MAX_IMAGE_DIM`. A malformed image is
+   rejected at the edge — a framing-level violation closes the
+   WebSocket (`Close 1008`), a per-frame image fault returns
+   `type:"error"` with `code:"invalid_image"` — and does NOT reach
+   the Python decoder.
 
 6. **No external network access from the worker.** The Python
    sidecar does not call out to the internet at runtime. All
@@ -180,5 +183,8 @@ This project takes that seriously.
 
 * Watch `docker stats locate-anything` during heavy use — if memory
   usage approaches the host's VRAM limit, the Python worker will
-  start emitting CUDA OOM errors. The server reports those as
-  `worker_error / retriable=true`; clients should back off.
+  start emitting CUDA OOM errors. The server reports those as a
+  per-frame `type:"error"` with `code:"internal"` (the message starts
+  `"CUDA out of memory"`), followed by a `Close(1011)` as the worker
+  self-exits to restore CUDA state; clients should back off and
+  reconnect after the ~10–15 s restart window.

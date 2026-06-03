@@ -8,8 +8,15 @@ is TWO consecutive length-prefixed frames sent by the Rust side:
     2) JPEG bytes (zero-length for control queries)
 The worker responds with ONE length-prefixed frame: a JSON body. The
 shape depends on the header.kind:
-    "frame"        → either a successful inference body or {code, message}
-                      on failure. The Rust frontend adds type+frame_id.
+    "frame"        → the EXACT A.2 client reply, a flat tagged union on
+                      `type` ({"type":"boxes"|"points"|"abstained", …Meta…}
+                      or {"type":"error","code":<ErrorCode str>,"message":…}),
+                      carrying `frame_id` and a top-level `ok:bool` IPC
+                      discriminator the Rust edge strips (and asserts agrees
+                      with the `type` tag) before forwarding. The worker emits
+                      `type` + `frame_id` itself; the Rust edge DESERIALIZES
+                      the post-`ok` body into the typed Response (egress
+                      schema-enforced — a drifted field fails loud).
     "capabilities" → /v1/capabilities payload (no `type` field).
     "info"         → /v1/info payload.
 
@@ -208,9 +215,16 @@ class WorkerApp:
             # where to look. Per the project policy "only use the model
             # how it was trained".
             "prompt_templates_reference_url": prompts.CANONICAL_REFERENCE_URL,
+            # TYPED presets (A.5): each is {label, request, generation_mode}
+            # where `request` is a typed PromptRequest dict (tagged on `task`,
+            # mirroring rust_server/src/protocol.rs::PromptRequest). The request
+            # is now a typed sum on the wire, so advertising bare prompt strings
+            # would be wire-inconsistent — a client sends a typed request, not a
+            # string. Clients can use a preset's `request` + `generation_mode`
+            # verbatim in a Frame header.
             "preset_prompts": {
-                "drone_ranked": prompts.DRONE_PROMPTS_RANKED,
-                "household":    prompts.HOUSEHOLD_PROMPTS,
+                "drone_ranked": prompts.DRONE_PRESETS_RANKED,
+                "household":    prompts.HOUSEHOLD_PRESETS,
             },
         }
 
@@ -270,30 +284,42 @@ class WorkerApp:
                     break
 
                 # ---- Parse header ----
+                # A header-parse failure means the Rust edge sent a malformed
+                # UDS header (it builds + validates the header, so this is an
+                # internal contract violation, never a client fault). We have
+                # no frame_id yet → emit the A.2 error with frame_id "".
                 try:
                     header = json.loads(header_bytes.decode("utf-8"))
                 except UnicodeDecodeError as e:
-                    await write_frame(writer, _err_json(
-                        400,
+                    await write_frame(writer, _err_frame_bytes(
+                        "", "internal",
                         f"header bytes are not valid UTF-8: {e!s}. "
                         "First 32 bytes (hex): "
                         + header_bytes[:32].hex(),
                     ))
                     continue
                 except json.JSONDecodeError as e:
-                    await write_frame(writer, _err_json(
-                        400,
+                    await write_frame(writer, _err_frame_bytes(
+                        "", "internal",
                         f"header JSON parse failed at line {e.lineno}, "
                         f"column {e.colno} (offset {e.pos}): {e.msg}",
                     ))
                     continue
                 if not isinstance(header, dict):
-                    await write_frame(writer, _err_json(
-                        400,
+                    await write_frame(writer, _err_frame_bytes(
+                        "", "internal",
                         f"header JSON must be an object; got "
                         f"{type(header).__name__}",
                     ))
                     continue
+
+                # frame_id used by the generic exception handlers below to
+                # build A.2 error replies. Inference-path exceptions (OOM /
+                # timeout / engine RuntimeError) are the meaningful users;
+                # control queries carry no frame_id (→ "").
+                req_frame_id = header.get("frame_id")
+                if not isinstance(req_frame_id, str):
+                    req_frame_id = ""
 
                 # ---- Route ----
                 # The Rust IPC layer always stamps `kind`; absent or wrong-
@@ -308,22 +334,25 @@ class WorkerApp:
                         resp = await self._infer(header, payload_bytes)
                         await write_frame(writer, json.dumps(resp).encode())
                     else:
-                        await write_frame(writer, _err_json(
-                            400, f"unknown header.kind: {kind!r}",
+                        # Rust always sends a valid kind; an unknown kind is an
+                        # internal IPC-contract violation, not a client fault.
+                        await write_frame(writer, _err_frame_bytes(
+                            req_frame_id, "internal",
+                            f"unknown header.kind: {kind!r}",
                         ))
                 except torch.OutOfMemoryError as e:
                     # CUDA OOM. Must catch BEFORE RuntimeError (OOM is a
                     # RuntimeError subclass). Write a typed per-frame
-                    # error so the client knows specifically why, then
-                    # hard-exit — see "Hard-recovery contract" at top
-                    # of file.
+                    # error (A.2 `internal`) so the client knows specifically
+                    # why, then hard-exit — see "Hard-recovery contract" at
+                    # top of file.
                     log.error(
                         "CUDA OutOfMemoryError during inference: %s — exiting %d for container restart",
                         e, WORKER_RESTART_EXIT_CODE,
                     )
                     try:
-                        await write_frame(writer, _err_json(
-                            500,
+                        await write_frame(writer, _err_frame_bytes(
+                            req_frame_id, "internal",
                             f"CUDA out of memory: {e}. The worker is "
                             "restarting; retry the request after ~10-15s.",
                         ))
@@ -343,8 +372,8 @@ class WorkerApp:
                         LA_INFERENCE_TIMEOUT_S, WORKER_RESTART_EXIT_CODE,
                     )
                     try:
-                        await write_frame(writer, _err_json(
-                            504,
+                        await write_frame(writer, _err_frame_bytes(
+                            req_frame_id, "internal",
                             f"inference timeout: exceeded "
                             f"LA_INFERENCE_TIMEOUT_S={LA_INFERENCE_TIMEOUT_S}s. "
                             "The worker is restarting; retry the request "
@@ -357,13 +386,23 @@ class WorkerApp:
                         )
                     _hard_exit_for_restart()
                 except ValueError as e:
-                    await write_frame(writer, _err_json(400, str(e)))
+                    # _infer maps per-frame image errors to invalid_image and
+                    # returns them as dicts, so a ValueError reaching here is a
+                    # server-side fault (e.g. capabilities()/info() or
+                    # _frame_error guard) → internal.
+                    log.exception("server-side ValueError")
+                    await write_frame(writer, _err_frame_bytes(
+                        req_frame_id, "internal", str(e)))
                 except RuntimeError as e:
+                    # engine.run's config faults (chat-template swap, processor
+                    # shape drift) and any other RuntimeError → internal.
                     log.exception("inference RuntimeError")
-                    await write_frame(writer, _err_json(500, str(e)))
+                    await write_frame(writer, _err_frame_bytes(
+                        req_frame_id, "internal", str(e)))
                 except Exception as e:
                     log.exception("inference unexpected error")
-                    await write_frame(writer, _err_json(500, repr(e)))
+                    await write_frame(writer, _err_frame_bytes(
+                        req_frame_id, "internal", repr(e)))
         finally:
             log.info("connection closed for %s", peer)
             try:
@@ -373,52 +412,99 @@ class WorkerApp:
                 pass
 
     async def _infer(self, header: dict, jpeg: bytes) -> dict:
+        """Run one frame and return the EXACT A.2 client reply dict.
+
+        Returns one of the tagged A.2 bodies, each carrying the internal
+        `ok:bool` discriminator the Rust edge strips before forwarding:
+          * success: {"ok":True,"type":<"boxes"|"points"|"abstained">,
+            "frame_id":…, [<"boxes"|"points">:[…]], <Meta…>}
+          * error:   {"ok":False,"type":"error","frame_id":…,
+            "code":<ErrorCode str>,"message":…}
+        The Rust edge deserializes the post-`ok` body into the typed
+        [`Response`] (deny_unknown_fields per body), so this dict MUST be
+        byte-faithful — no stale off_shape_count / abstained-bool /
+        prompt_task / detections-and-points-both.
+
+        Error-code mapping (A.4):
+          * image/decode/SOI → "invalid_image"
+          * A.3 zero-valid-geometry deviation → "model_deviation"
+          * upstream IPC-contract violation (missing/!typed header field) →
+            "internal" (the client cannot have caused it — Rust builds + has
+            already validated the header)
+          * OOM / inference timeout → NOT mapped here: they PROPAGATE so
+            handle_connection can hard-exit for a container restart (see the
+            "Hard-recovery contract" at the top of this file). The catch-all
+            for any other engine RuntimeError → "internal".
+        """
+        # frame_id is needed for every reply (success AND error) — A.2 requires
+        # it on ErrorBody too. Extract defensively; Rust's infer() always sends
+        # a non-empty string, so a missing/!str value is an internal contract
+        # violation, not a client fault.
+        frame_id = header.get("frame_id")
+        if not isinstance(frame_id, str) or not frame_id:
+            return _frame_error(
+                "", "internal",
+                f"header.frame_id missing or not a non-empty string "
+                f"(got {frame_id!r}). The Rust frontend always sends a "
+                "frame_id; receiving a Frame without one means the upstream "
+                "IPC contract was violated.",
+            )
+
         # The Rust frontend has already enforced the header schema and JPEG
         # SOI marker. We re-validate here as defense in depth: this worker is
         # also reachable by anything inside the container that can touch
-        # /tmp/la.sock.
-        for key in ("prompt", "generation_mode", "frame_id", "prompt_task"):
+        # /tmp/la.sock. A violation reaching here is upstream/internal (the
+        # client never touches the IPC header), EXCEPT the image bytes
+        # themselves, which map to invalid_image.
+        for key in ("prompt", "generation_mode", "prompt_task"):
             if key not in header:
-                raise ValueError(
+                return _frame_error(
+                    frame_id, "internal",
                     f"header.{key} missing. The Rust frontend should have "
                     "rejected this Frame upstream — receiving it here means "
-                    "the upstream contract was violated."
+                    "the upstream contract was violated.",
                 )
         prompt = header["prompt"]
         if not isinstance(prompt, str) or not prompt:
-            raise ValueError(
+            return _frame_error(
+                frame_id, "internal",
                 "header.prompt must be a non-empty string (see "
                 "worker/prompts.py for the seven canonical prompt forms — "
-                "that file is the single source of truth)"
+                "that file is the single source of truth)",
             )
         if len(prompt) > 16384:
-            raise ValueError(
+            return _frame_error(
+                frame_id, "internal",
                 f"header.prompt length {len(prompt)} chars > 16384 "
-                "(the tokenizer's model_max_length cap)"
+                "(the tokenizer's model_max_length cap)",
             )
         mode = header["generation_mode"]
         if mode not in ("fast", "hybrid", "slow"):
-            raise ValueError(
+            return _frame_error(
+                frame_id, "internal",
                 f"header.generation_mode={mode!r} is not one of "
                 "'fast'|'hybrid'|'slow'. There is no default — every "
-                "request must declare a mode explicitly."
+                "request must declare a mode explicitly.",
             )
         if not isinstance(jpeg, (bytes, bytearray)) or not jpeg:
-            raise ValueError(
+            return _frame_error(
+                frame_id, "invalid_image",
                 "JPEG payload is empty. The Rust frontend should have "
                 "rejected this Frame; receiving it here means the "
-                "upstream contract was violated."
+                "upstream contract was violated.",
             )
         # Defense-in-depth JPEG SOI sniff. Rust already enforces this; we
         # double-check here because /tmp/la.sock is also reachable by
         # anything inside the container.
         if jpeg[:3] != b"\xff\xd8\xff":
-            raise ValueError(
+            return _frame_error(
+                frame_id, "invalid_image",
                 "JPEG payload missing SOI marker FF D8 FF — Rust frontend "
                 "should have rejected this Frame; defense-in-depth check "
-                "tripped here because /tmp/la.sock is internally reachable."
+                "tripped here because /tmp/la.sock is internally reachable.",
             )
 
+        prompt_task = header["prompt_task"]
         # PyTorch/CUDA cannot run two .generate() concurrently. Serialize.
         # Once a frame enters _infer, the inference runs to completion (up
         # to LA_INFERENCE_TIMEOUT_S seconds) regardless of client liveness.
@@ -429,64 +515,105 @@ class WorkerApp:
         # NOT catch it here — it propagates up to handle_connection's
         # exception block which writes a per-frame error to the client AND
         # hard-exits the worker (see "Hard-recovery contract" at the top of
-        # this file). The asyncio.Lock IS released cleanly on the exception
-        # (the `async with` unwind runs), but the underlying thread keeps
-        # executing engine.run because Python provides no mechanism to
-        # cancel a thread inside a CUDA C call — the orphan dies with the
-        # process when _hard_exit_for_restart calls os._exit.
-        prompt_task = header["prompt_task"]
-        async with self.lock:
-            t0 = time.perf_counter()
-            result = await asyncio.wait_for(
-                asyncio.to_thread(self.engine.run, jpeg, prompt, mode, prompt_task),
-                timeout=LA_INFERENCE_TIMEOUT_S,
+        # this file). torch.OutOfMemoryError likewise propagates. The
+        # asyncio.Lock IS released cleanly on the exception (the `async with`
+        # unwind runs), but the underlying thread keeps executing engine.run
+        # because Python provides no mechanism to cancel a thread inside a
+        # CUDA C call — the orphan dies with the process when
+        # _hard_exit_for_restart calls os._exit.
+        try:
+            async with self.lock:
+                t0 = time.perf_counter()
+                result = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        self.engine.run, jpeg, prompt, mode, prompt_task
+                    ),
+                    timeout=LA_INFERENCE_TIMEOUT_S,
+                )
+                total_ms = (time.perf_counter() - t0) * 1000.0
+        except ValueError as e:
+            # engine.run raises ValueError on image decode / EXIF / ICC / CMYK
+            # / patch-budget rejection — all client-image problems.
+            return _frame_error(frame_id, "invalid_image", str(e))
+
+        # A.3 deviation: the model emitted geometry but zero was valid for the
+        # task (all off-shape / unlabeled). Nothing usable to return → error.
+        if result.kind == "model_deviation":
+            return _frame_error(
+                frame_id, "model_deviation", result.deviation_message,
             )
-            total_ms = (time.perf_counter() - t0) * 1000.0
-        # `ok` is an IPC-only discriminator the Rust frontend strips before
-        # stamping type+frame_id; it never appears in the client-facing body.
-        return {
+
+        # Build the shared A.2 Meta. `ok:True` is the internal discriminator
+        # the Rust edge strips before forwarding; it never reaches the client.
+        body: dict = {
             "ok":            True,
+            "type":          result.kind,   # "boxes" | "points" | "abstained"
+            "frame_id":      frame_id,
             "raw_text":      result.raw_answer,
-            "detections":    result.detections,
-            "points":        result.points,
-            "abstained":     result.abstained,
-            # Count of geometries the model emitted in the WRONG shape for the
-            # task (filtered out of detections/points). Normally 0; non-zero is
-            # a loud model task->shape deviation signal — NOT abstention.
-            "off_shape_count": result.off_shape_count,
-            # Wire name of the canonical template the prompt was
-            # classified as by the Rust validator. Echoed to the client
-            # so they can branch on `prompt_task == "point"` (→ read
-            # `points[]`) vs any other value (→ read `detections[]`)
-            # without re-classifying the prompt themselves.
-            "prompt_task":   result.prompt_task,
             # True iff `raw_text` does NOT end with the model's <|im_end|>
             # end-of-turn marker, meaning the custom .generate() loop
-            # terminated because max_new_tokens was reached, NOT because
-            # the model cleanly finished. Per
-            # models/LocateAnything-3B/modeling_locateanything.py:464,500-501
-            # the loop exits ONLY on <|im_end|> emission OR budget
-            # exhaustion, so this is a total signal. Naive clients can
-            # branch on this typed boolean instead of substring-checking
-            # raw_text themselves.
+            # terminated because max_new_tokens was reached, NOT because the
+            # model cleanly finished (modeling_locateanything.py:464,500-501).
             "model_output_truncated": result.model_output_truncated,
+            # Off-contract items dropped while keeping the valid geometry
+            # (off-shape geometry for the task + unlabeled/orphan/empty-ref).
+            # Usually 0; non-fatal.
+            "deviations_dropped": result.deviations_dropped,
             "image_size":    [result.image_size[0], result.image_size[1]],
             "resize_plan":   result.resize_plan,
             "generation_mode_used": mode,
             "latency_ms":    round(result.latency_ms, 1),
             "total_ms":      round(total_ms, 1),
         }
+        # The success geometry list is included ONLY for its matching variant —
+        # AbstainedBody/BoxesBody/PointsBody each carry deny_unknown_fields, so
+        # a stray empty `points:[]` on a boxes reply would be rejected by Rust.
+        if result.kind == "boxes":
+            body["boxes"] = result.boxes
+        elif result.kind == "points":
+            body["points"] = result.points
+        return body
 
 
 # -------------------------------------------------------------------------
 # Helpers
 # -------------------------------------------------------------------------
 
-def _err_json(code: int, message: str) -> bytes:
-    """Worker-side error body. `ok:false` is the IPC discriminator the Rust
-    frontend uses to route to type:"error"; the client sees
-    `{type, frame_id, code, message}` after Rust strips `ok`."""
-    return json.dumps({"ok": False, "code": code, "message": message}).encode("utf-8")
+# The four client-facing error codes (A.2 ErrorCode, snake_case). Mirrors
+# rust_server/src/protocol.rs::ErrorCode; the Rust edge deserializes the
+# worker's error reply into Response::Error, whose `code` is this enum — any
+# other string fails the egress schema check loud.
+_ERROR_CODES = frozenset({"invalid_request", "invalid_image",
+                          "model_deviation", "internal"})
+
+
+def _frame_error(frame_id: str, code: str, message: str) -> dict:
+    """Build the A.2 `error` reply dict for one Frame.
+
+    Shape: `{"ok":False,"type":"error","frame_id":…,"code":…,"message":…}`.
+    `ok:False` is the internal IPC discriminator the Rust edge strips (and
+    asserts agrees with `type:"error"`); the rest is the A.2 ErrorBody
+    (deny_unknown_fields: exactly frame_id + code + message). `code` MUST be
+    one of the four A.2 ErrorCode strings."""
+    if code not in _ERROR_CODES:
+        # A wrong code would be rejected by the Rust egress schema; fail loud
+        # in-process with a precise message instead of shipping the drift.
+        raise ValueError(
+            f"internal: _frame_error called with non-A.2 code {code!r}; "
+            f"must be one of {sorted(_ERROR_CODES)}"
+        )
+    return {
+        "ok":       False,
+        "type":     "error",
+        "frame_id": frame_id,
+        "code":     code,
+        "message":  message,
+    }
+
+
+def _err_frame_bytes(frame_id: str, code: str, message: str) -> bytes:
+    """`_frame_error` serialized to a UDS frame body."""
+    return json.dumps(_frame_error(frame_id, code, message)).encode("utf-8")
 
 
 def _torch_arches() -> list:
