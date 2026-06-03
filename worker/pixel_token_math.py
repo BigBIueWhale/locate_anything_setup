@@ -47,12 +47,16 @@ class ImageResize:
 
 def plan_resize(width: int, height: int) -> ImageResize:
     """
-    Compute the rescale+pad plan the LocateAnything image processor will
+    Compute the resize plan the LocateAnything image processor will
     apply to an input of (width, height).
 
-    Mirrors `LocateAnythingImageProcessor.preprocess` exactly:
-      - If (w//14)*(h//14) > 25600, downscale by sqrt(25600/total_patches).
-      - Pad up so both H and W are divisible by 28 (= patch*merge).
+    Mirrors `LocateAnythingImageProcessor.rescale` exactly:
+      - If (w//14)*(h//14) > 25600, uniformly downscale by
+        sqrt(25600/total_patches) (aspect preserved).
+      - Then resize so both H and W are multiples of 28 (= patch*merge).
+        NOTE: upstream names the targets `pad_size_*`, but the operation is
+        `image.resize(...)` — an ANAMORPHIC resize (independent ceil-to-28 per
+        axis, so the x and y factors differ slightly), NOT a border pad.
       - Raise if w//14 or h//14 ≥ 512 (positional embedding limit).
     """
     if width <= 0 or height <= 0:
@@ -64,7 +68,8 @@ def plan_resize(width: int, height: int) -> ImageResize:
         scale = math.sqrt(IN_TOKEN_LIMIT / total_patches)
         w = max(int(round(w * scale)), PATCH_SIZE)
         h = max(int(round(h * scale)), PATCH_SIZE)
-    # Pad up to multiple of 28.
+    # Target dims: next multiple of 28 on each axis (the processor
+    # anamorphically resizes the image to these — it does not border-pad).
     grid = PATCH_SIZE * MERGE_KERNEL
     dst_w = ((w + grid - 1) // grid) * grid
     dst_h = ((h + grid - 1) // grid) * grid
@@ -77,7 +82,12 @@ def plan_resize(width: int, height: int) -> ImageResize:
             f"exceeds MAX_PATCHES_PER_SIDE={MAX_PATCHES_PER_SIDE} after resize"
         )
     n_llm_tokens = (n_patches_w * n_patches_h) // (MERGE_KERNEL * MERGE_KERNEL)
-    scale = dst_w / width  # uniform x and y (aspect preserved before pad)
+    # x-axis resize factor. The y-axis factor (dst_h / height) differs slightly
+    # — the 28-grid resize is ANAMORPHIC; aspect is preserved only through the
+    # optional uniform sqrt-downscale above. Reported as a single summary
+    # scalar; the coordinate round-trip stays exact regardless because coords
+    # normalize per-axis (coord/1000 x source_dim).
+    scale = dst_w / width
     return ImageResize(
         src_w=width,
         src_h=height,

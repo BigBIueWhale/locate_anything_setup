@@ -34,10 +34,11 @@ and open an issue.
 ```
 rescale(w, h):
     n_patches = (w // 14) * (h // 14)
-    if n_patches > 25_600:
+    if n_patches > 25_600:                    # uniform downscale, aspect preserved
         scale = sqrt(25_600 / n_patches)
-        w, h = round(w * scale), round(h * scale)
-    # pad up to multiples of 28 (= 14 * 2)
+        w, h = int(w * scale), int(h * scale) # int() truncation (NOT round)
+    # ANAMORPHIC resize (image.resize, NOT a pad) up to the next multiple
+    # of 28 (= 14 * 2) on each axis — independent per axis, so x/y factors differ
     dst_w = ceil(w / 28) * 28
     dst_h = ceil(h / 28) * 28
     if dst_w // 14 >= 512 or dst_h // 14 >= 512:
@@ -50,14 +51,14 @@ Practical consequences:
 | Source resolution    | Source patches | After resize+pad     | LLM tokens | scale  | 1 LLM token in src px |
 |---|---|---|---|---|---|
 | 1920 × 1080 (1080p)  | 10,549 ≤ 25.6k → no rescale | 1932 × 1092 (138×78 patches) | 2,691  | 1.006  | ≈ 27.83 |
-| 2560 × 1440 (1440p)  | 18,775 ≤ 25.6k → no rescale | 2576 × 1456 (184×104 patches)| 4,784  | 1.006  | ≈ 27.83 |
+| 2560 × 1440 (1440p)  | 18,564 ≤ 25.6k → no rescale | 2576 × 1456 (184×104 patches)| 4,784  | 1.006  | ≈ 27.83 |
 | 3840 × 2160 (4K)     | 42,196 > 25.6k → ↓0.7802    | 2996 × 1708 (214×122 patches)| 6,527  | 0.7802 | ≈ 35.89 |
 | 2240 × 2240 (square) | 25,600 = cap → no rescale   | 2240 × 2240 (160×160 patches)| 6,400  | 1.000  | 28.00   |
 
 Note that the 4K case lands just over the 6,400-LLM-token cap (6,527),
 because the upstream preprocessor rescales by `sqrt(25600/total_patches)`
-and then pads up to multiples of 28 — the pad step can push the
-post-resize patch count slightly above 25,600. The model still
+and then resizes up to multiples of 28 — the 28-grid resize step can push
+the post-resize patch count slightly above 25,600. The model still
 accepts this (the only hard ceiling is the per-side 512-patch
 positional-embedding limit, which 214×122 is well under).
 
@@ -82,7 +83,7 @@ For FPV-drone detection from a 4K ground-facing camera:
   drone is on a clean background.
 
 This is also the basis of the model's reported VisDrone numbers
-(F1@0.95 = 3.2, mean 39.8) — tight-IoU localization at small object
+(F1@0.95 = 3.2, mean 39.9) — tight-IoU localization at small object
 sizes is broken for this class of architecture, not just this model.
 
 ## Tiling rescues some recall — but the server does NOT do it for you

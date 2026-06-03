@@ -108,9 +108,10 @@ def calibrate(
     #
     # We deliberately invoke `has_abstention(warm.raw_answer)` here rather
     # than reading `warm.abstained`. The aggregate `warm.abstained` is
-    # `not (detections or points)` and would always be True when both
-    # lists are empty — making the disjunction tautological and silently
-    # masking the gibberish-output failure mode this assertion exists to
+    # `not parsed_geometry` (the pre-filter no-geometry signal); for this
+    # warm-up it tracks `detections`/`points` being empty, so folding it into
+    # the disjunction would be tautological and silently mask the
+    # gibberish-output failure mode this assertion exists to
     # catch. The substring scan via `has_abstention` is the parser-internal
     # probe for "did the model
     # emit the trained literal at all", which is what we actually need

@@ -38,7 +38,11 @@ boxes / 12 M images, split roughly:
 **Augmentation**: only random resize (50 % probability, long-edge
 in [640, 2560], Lanczos). No motion-blur, no Gaussian-blur, no
 color/brightness jitter, no noise, no JPEG-quality augmentation.
-Verified in NVlabs/Eagle's `Embodied/eaglevl/train/augmentation.py`.
+The [640, 2560] range is set at the training call site —
+NVlabs/Eagle's `Embodied/eaglevl/train/locany_finetune_magi_stream.py:485`
+(`min_long_edge=640, max_long_edge=2560, augment_prob=0.5`), which overrides
+the `max_long_edge=2048` default in `Embodied/eaglevl/train/augmentation.py`;
+the resize itself (uniform random long edge, Lanczos) is `augmentation.py:81,43`.
 
 ## What it does well (in order)
 
@@ -214,19 +218,23 @@ placeholder. The training corpus has 22 M explicit negative queries
 `<box>None</box>` silently does not match and is dropped.
 
 The Result body's `"abstained": true` is the AGGREGATE signal: it fires
-iff `detections` and `points` are both empty — i.e. the model
-effectively returned nothing usable for this frame. This deliberately
+iff the model produced NO parseable geometry at all — no boxes and no
+points, evaluated BEFORE the task→shape filter. This deliberately
 collapses "all categories abstained" with "model produced unparseable
-output"; both are "nothing to render" from the client's perspective.
-NVIDIA's own eval pipeline has no aggregate `abstained` concept either
-— `Embodied/evaluation/metrics/other_metric.py:140-156` only tracks
-per-category None. The `abstained` boolean is therefore *strictly*
-derived from `not (detections or points)` and never from a substring
-scan over `raw_text`: a substring scan would flip the aggregate flag
-True for any multi-category response that contained an absent-category
-`<ref>X</ref><box>None</box>` triple — even when real detections were
-returned for other categories — and silently mislead a client that
-treats `abstained=true` as "no objects detected".
+output"; both are "nothing to render" from the client's perspective. It
+does NOT collapse an off-shape emission (geometry in the wrong shape for
+the task): that is filtered from `detections`/`points` but reported in
+`off_shape_count` and leaves `abstained` false — so a model that DID
+localize the object, just in the wrong shape, is never misreported as
+having abstained. NVIDIA's own eval pipeline has no aggregate `abstained`
+concept either — `Embodied/evaluation/metrics/other_metric.py:140-156`
+only tracks per-category None. The `abstained` boolean is derived from
+the pre-filter parse and never from a substring scan over `raw_text`: a
+substring scan would flip the aggregate flag True for any multi-category
+response that contained an absent-category `<ref>X</ref><box>None</box>`
+triple — even when real detections were returned for other categories —
+and silently mislead a client that treats `abstained=true` as "no objects
+detected".
 
 For per-category abstention in a multi-category detection prompt,
 clients recover the absent categories as the set difference between
@@ -252,19 +260,24 @@ which contains 1001 discrete coord tokens `<0>` … `<1000>`).
   `<box>` delimiter is reused for points — there is no separate
   `<point>` token).
 * **Origin** is the top-left of the image at PIL `(0,0)`.
-* **Scale** is uniform (same factor in x and y). The image processor
-  scales the whole image by `sqrt(25600 / total_patches)` when the
-  patch budget is exceeded, then pads to a multiple of 28 px.
-  Because the scale is uniform, `coord/1000 × source_w` and
-  `coord/1000 × resized_w` give the same source-relative pixel —
-  multiplying by the source dimensions is the canonical convention
-  and that's what the server does in `bbox_px`.
+* **Scale** is per-axis, not uniform. The image processor optionally
+  downscales the whole image uniformly by `sqrt(25600 / total_patches)`
+  (aspect preserved) when the patch budget is exceeded, then
+  **anamorphically resizes** it (via `image.resize(...)`, not a pad) so each
+  side is a multiple of 28 px — the independent ceil-to-28 makes the x and y
+  factors differ slightly. The coordinate round-trip is exact regardless,
+  because each axis is normalized INDEPENDENTLY: `coord/1000 × source_w` for
+  x and `coord/1000 × source_h` for y recover the source-relative pixel per
+  axis. Multiplying by the source dimensions is the canonical convention and
+  that's what the server does in `bbox_px`.
 * **Quantization granularity** per axis = `image_dim / 1000`. For a
   2240 px square image, 1 coord-token = 2.24 px. For 1920 px wide,
   1 coord-token = 1.92 px.
 
 The server returns:
 
-- `bbox_norm: [x1, y1, x2, y2]` — model output unchanged (integers in `[0,1000]`)
+- `bbox_norm: [x1, y1, x2, y2]` — canonical integer box in `[0,1000]`: each
+  coord clamped to the grid and corners min/max-sorted (`x1<=x2`, `y1<=y2`),
+  matching NVIDIA's eval. The verbatim token-order emission is in `raw_text`.
 - `bbox_px:   [x1, y1, x2, y2]` — pixels relative to the **source**
   image dimensions (float, rounded to 2 decimal places).

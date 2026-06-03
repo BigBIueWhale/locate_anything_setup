@@ -29,16 +29,17 @@ NVIDIA's eval-time `<ref>(category)</ref>((?:<box>.*?</box>)+)` capture
 `inference_detection_ddp.py:282-300`) so every sibling box inherits the
 ref's label.
 
-Aggregate abstention ("the frame returned nothing usable") is derivable from
-the parse results — empty `detections` AND empty `points` ⇔ aggregate
-abstention. The response's `abstained` field at `InferenceResult.abstained` is
-populated using exactly that derivation in `worker/inference.py`; it
-deliberately does NOT scan raw_text for `<box>None</box>`, because per-category
-abstention triples are emitted alongside real detections in multi-category
-prompts and a substring scan would flip the aggregate flag to True even when
-other categories returned valid boxes. NVIDIA's own pipeline has no aggregate
-`abstained` concept either — `metrics/other_metric.py:140-156` only tracks
-per-category None.
+Aggregate abstention ("the frame returned nothing usable") means the model
+produced NO parseable geometry at all — no boxes and no points. The response's
+`abstained` field at `InferenceResult.abstained` is derived in
+`worker/inference.py` from the PRE-(task-shape-)filter parse, so an off-shape
+emission (geometry in the wrong shape for the task) is reported as a deviation
+(`off_shape_count`), NOT as abstention. It deliberately does NOT scan raw_text
+for `<box>None</box>`, because per-category abstention triples are emitted
+alongside real detections in multi-category prompts and a substring scan would
+flip the aggregate flag to True even when other categories returned valid
+boxes. NVIDIA's own pipeline has no aggregate `abstained` concept either —
+`metrics/other_metric.py:140-156` only tracks per-category None.
 
 `has_abstention` is retained as a substring utility used by the BOOT SELF-TEST
 in `worker/calibration.py` to distinguish "model emitted the trained explicit
@@ -97,10 +98,14 @@ _NONE_RE = re.compile(r"<box>[Nn]one</box>")
 class Detection:
     """A bounding-box detection with its label (if any)."""
     label: Optional[str]
-    # Normalized [0, 1000] integer coords as emitted by the model. The model
-    # quantizes spatial position into 1001 tokens — this is the canonical
-    # representation. Pixel coords are derived per image.
-    bbox_norm: list  # [x1, y1, x2, y2]
+    # Canonical [0, 1000] integer box: each coord clamped to the 1001-token
+    # grid (<0>..<1000>) and corners min/max-sorted so x1<=x2 and y1<=y2. The
+    # model decodes the 4 coordinate positions INDEPENDENTLY (no monotonicity
+    # constraint — see `_make_box`), so raw emission order carries no meaning;
+    # we canonicalize it exactly as NVIDIA's eval does and never drop a box on
+    # corner order. The VERBATIM token-order emission is always recoverable
+    # from InferenceResult.raw_answer.
+    bbox_norm: list  # [x1, y1, x2, y2], canonical (x1<=x2, y1<=y2)
     bbox_px: list    # [x1, y1, x2, y2] in pixels relative to source image
 
     def to_json(self) -> dict:
@@ -124,9 +129,12 @@ def parse_boxes(answer: str, image_width: int, image_height: int) -> List[Detect
 
     Note: the LocateAnything README's parse_boxes uses the ORIGINAL image
     width/height. The model emits coords relative to whatever image it
-    actually saw (post-resize). Because the model's resize preserves
-    aspect ratio and is uniform in x and y, the same [0,1000]→[0,W] map
-    works for either dst or src, so passing src dims is correct.
+    actually saw (post-resize). The processor's 28-px-grid step is an
+    ANAMORPHIC resize (independent ceil-to-28 per axis, so the x and y scale
+    factors differ slightly — it is NOT a uniform scale, and NOT a pad). The
+    [0,1000]→[0,W] map is exact nonetheless because each axis is normalized
+    INDEPENDENTLY: coord/1000 × source_w for x, coord/1000 × source_h for y.
+    Passing src dims is therefore correct in either orientation.
 
     Two-pass design:
       (1) Find each <ref>label</ref> ref-run via _REF_RUN_RE. For each run,
@@ -151,9 +159,11 @@ def parse_boxes(answer: str, image_width: int, image_height: int) -> List[Detect
         label = m.group("label").strip() or None
         for bm in _BOX_RE.finditer(m.group("boxes")):
             x1, y1, x2, y2 = (int(bm.group(k)) for k in (1, 2, 3, 4))
-            if _coord_valid(x1, y1, x2, y2):
-                out.append(_make_box(label, x1, y1, x2, y2,
-                                     image_width, image_height))
+            # No geometric reject: `_make_box` clamps to [0,1000] and
+            # canonicalizes corner order (min/max), so a box the model
+            # localized is never silently dropped (matches NVIDIA's eval).
+            out.append(_make_box(label, x1, y1, x2, y2,
+                                 image_width, image_height))
 
     # Pass 2: orphan boxes — boxes whose span does NOT overlap any ref-run.
     for m in _BOX_RE.finditer(answer):
@@ -161,8 +171,6 @@ def parse_boxes(answer: str, image_width: int, image_height: int) -> List[Detect
         if any(s < ie and is_ < e for (is_, ie) in consumed_intervals):
             continue
         x1, y1, x2, y2 = (int(m.group(k)) for k in (1, 2, 3, 4))
-        if not _coord_valid(x1, y1, x2, y2):
-            continue
         out.append(_make_box(None, x1, y1, x2, y2, image_width, image_height))
 
     return out
@@ -260,22 +268,20 @@ def has_abstention(answer: str) -> bool:
     the trained abstention literal at all (e.g. in `worker/calibration.py`
     to distinguish "model produced recognized output" from "model emitted
     gibberish" at boot). For the aggregate "did this frame return
-    anything usable" question, use `not (detections or points)` instead —
-    that is the semantic the response's `abstained` field exposes, and it
-    matches NVIDIA's eval pipeline which has no aggregate abstained
-    concept (see module docstring)."""
+    anything usable" question, use `InferenceResult.abstained` (derived in
+    `worker/inference.py` from the pre-(task-shape-)filter parse) — it
+    matches NVIDIA's eval pipeline which has no aggregate abstained concept
+    (see module docstring)."""
     return _NONE_RE.search(answer) is not None
 
 
-def _coord_valid(x1: int, y1: int, x2: int, y2: int) -> bool:
-    return (
-        0 <= x1 <= 1000
-        and 0 <= y1 <= 1000
-        and 0 <= x2 <= 1000
-        and 0 <= y2 <= 1000
-        and x1 < x2
-        and y1 < y2
-    )
+def _clamp_coord(c: int) -> int:
+    """Clamp a coordinate to the valid [0, 1000] token grid. Defense-in-depth:
+    the 1001 coord tokens <0>..<1000> already bound the regex captures, so this
+    is a no-op on conforming output — but it guarantees the [0,1000] invariant
+    holds even if a future model/tokenizer change widens the captured range,
+    rather than emitting an out-of-grid box."""
+    return 0 if c < 0 else 1000 if c > 1000 else c
 
 
 def _make_box(
@@ -287,13 +293,27 @@ def _make_box(
     image_width: int,
     image_height: int,
 ) -> Detection:
+    """Build a Detection from four raw coordinate-token values.
+
+    The model's decoder selects the four coordinate positions INDEPENDENTLY
+    (per-position top-1, no monotonicity constraint — verified in the model's
+    `generate_utils.py` `decode_bbox_avg`), so it can legitimately emit
+    non-monotone corners (x1>x2 and/or y1>y2). NVIDIA's own evaluation
+    (NVlabs/Eagle `Embodied/evaluation/inference_grounding_ddp.py:447-470`,
+    `convert_normalized_bbox_to_absolute`) CLAMPS each coord and then min/max-
+    sorts the corners, and KEEPS the box. We do exactly the same: a box the
+    model localized must never be silently dropped on corner order or range.
+    `bbox_norm`/`bbox_px` are therefore the canonical (clamped, corner-sorted)
+    rectangle; the verbatim token-order emission stays in `raw_answer`."""
+    x_lo, x_hi = sorted((_clamp_coord(x1), _clamp_coord(x2)))
+    y_lo, y_hi = sorted((_clamp_coord(y1), _clamp_coord(y2)))
     return Detection(
         label=label,
-        bbox_norm=[x1, y1, x2, y2],
+        bbox_norm=[x_lo, y_lo, x_hi, y_hi],
         bbox_px=[
-            round(x1 / 1000.0 * image_width, 2),
-            round(y1 / 1000.0 * image_height, 2),
-            round(x2 / 1000.0 * image_width, 2),
-            round(y2 / 1000.0 * image_height, 2),
+            round(x_lo / 1000.0 * image_width, 2),
+            round(y_lo / 1000.0 * image_height, 2),
+            round(x_hi / 1000.0 * image_width, 2),
+            round(y_hi / 1000.0 * image_height, 2),
         ],
     )

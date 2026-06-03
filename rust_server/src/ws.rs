@@ -282,8 +282,9 @@ async fn process_binary(
     //         checks and produces an English diagnostic that points the
     //         client at the canonical-reference URL. The returned
     //         TemplateKind is forwarded to the worker as `prompt_task`
-    //         so the parser can drop off-shape model output per the
-    //         trained task→shape contract (see prompt_validator::
+    //         so the parser can filter off-shape model output (counting it
+    //         in the reply's off_shape_count, not silently dropping it) per
+    //         the trained task→shape contract (see prompt_validator::
     //         TemplateKind::wire_name + worker/inference.py::
     //         EXPECTED_SHAPE). -----------------------------------------
     let prompt_task = match prompt_validator::validate(&header.prompt) {

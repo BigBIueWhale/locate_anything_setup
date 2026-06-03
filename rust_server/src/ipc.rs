@@ -60,10 +60,11 @@ impl WorkerConn {
     ///
     /// `prompt_task` is the wire name of the canonical template the prompt
     /// was classified as (see `prompt_validator::TemplateKind::wire_name`).
-    /// It is forwarded to the worker so the parser can drop off-shape
+    /// It is forwarded to the worker so the parser can FILTER off-shape
     /// output per the trained task→shape contract (e.g. a 4-coord box
-    /// returned for a Point template is dropped before reaching the
-    /// client). This is NOT exposed in the client-facing InferHeader
+    /// returned for a Point template is filtered out of `detections`,
+    /// counted in the reply's `off_shape_count`, and never misreported as
+    /// abstention). This is NOT exposed in the client-facing InferHeader
     /// schema — it is derived server-side from the validated prompt.
     pub async fn infer(
         &mut self,

@@ -196,6 +196,7 @@ what NVIDIA does at training time).
   "detections":  [{"label": "drone", "bbox_norm": [420,510,560,640], "bbox_px": [806.4, 550.8, 1075.2, 691.2]}],
   "points":      [],
   "abstained":   false,
+  "off_shape_count": 0,
   "model_output_truncated": false,
   "prompt_task": "detection",
   "image_size":  [1920, 1080],
@@ -214,11 +215,15 @@ training: `"point"` → 2-coord points in `points[]` (with `detections`
 guaranteed empty); every other value → 4-coord boxes in `detections[]`
 (with `points` guaranteed empty). The server enforces this by filtering
 off-shape model output before stamping the response, so a naive client
-can branch on `prompt_task` alone without inspecting both lists. Any
-off-shape model output is dropped (zero cross-shape events were
-observed in 3,444 trials at trained sampling params spanning all 7
-templates × adversarial prompts; the filter is therefore a forward-
-compat guard rail rather than a frequent rejection path).
+can branch on `prompt_task` alone without inspecting both lists. Off-shape
+output is NOT silently dropped: it is filtered out of `detections`/`points`
+but its count is surfaced in `off_shape_count` (and the verbatim tokens stay
+in `raw_text`), and `abstained` is computed from the pre-filter parse — so an
+off-shape emission is reported as a loud, queryable model deviation, never
+misreported as abstention. Zero cross-shape events were observed in 3,444
+trials at trained sampling params spanning all 7 templates × adversarial
+prompts; the filter is therefore a forward-compat guard rail rather than a
+frequent rejection path.
 
 `raw_text` carries the full decoded model output including structural
 tokens (`<box>`, `<ref>`, `<0>`..`<1000>`) and the trailing
@@ -255,8 +260,9 @@ all labeled `PHRASE`, mirroring NVIDIA's eval-time parser at
 `Embodied/evaluation/inference_grounding_ddp.py:379-427`). `label`
 is `null` only for bare `<box>` blocks the model emitted without
 a preceding `<ref>` (off-pattern; none of the seven canonical
-templates trains this shape). Coords are integers in `[0, 1000]`
-for `*_norm` and floats in source-image pixels for `*_px`.
+templates trains this shape). Coords are integers in `[0, 1000]` for
+`*_norm` (canonical: clamped to the grid and, for boxes, corner-sorted so
+`x1<=x2`, `y1<=y2`) and floats in source-image pixels for `*_px`.
 
 ### Error (Text)
 

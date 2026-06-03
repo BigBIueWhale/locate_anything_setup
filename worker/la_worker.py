@@ -450,6 +450,10 @@ class WorkerApp:
             "detections":    result.detections,
             "points":        result.points,
             "abstained":     result.abstained,
+            # Count of geometries the model emitted in the WRONG shape for the
+            # task (filtered out of detections/points). Normally 0; non-zero is
+            # a loud model task->shape deviation signal — NOT abstention.
+            "off_shape_count": result.off_shape_count,
             # Wire name of the canonical template the prompt was
             # classified as by the Rust validator. Echoed to the client
             # so they can branch on `prompt_task == "point"` (→ read

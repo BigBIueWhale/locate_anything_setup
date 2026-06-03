@@ -136,6 +136,7 @@ from dataclasses import dataclass
 import io
 import os
 import time
+import warnings
 
 import torch
 from PIL import Image, ImageFile, ImageOps
@@ -148,9 +149,20 @@ from .pixel_token_math import plan_resize
 
 # Hard upper bound on decoded pixel count. Defense-in-depth: the Rust
 # frontend already enforces max_image_dim=2240 per side; even if that
-# guard were bypassed, this cap raises DecompressionBombError before
-# allocating gigantic buffers. 2240² × 4-safety-factor ≈ 20 M pixels.
+# guard were bypassed, this makes PIL refuse the image at the
+# decompression-bomb check (before allocating the full pixel buffer).
+# 2240² × 4-safety-factor ≈ 20 M pixels.
+#
+# PIL's default policy is asymmetric: it only *warns*
+# (DecompressionBombWarning) above MAX_IMAGE_PIXELS and only *raises*
+# (DecompressionBombError) above 2×MAX_IMAGE_PIXELS. A bare cap would
+# therefore let the 20–40 M-pixel band through silently. We promote the
+# warning to a hard error so anything above 20 M pixels fails loud, closing
+# that gap. DecompressionBombWarning is also in _PIL_DECODE_EXCEPTIONS below,
+# so the raised error is reported as a clean client invalid_image, not a
+# server fault.
 Image.MAX_IMAGE_PIXELS = 20_000_000
+warnings.simplefilter("error", Image.DecompressionBombWarning)
 
 # Explicit refusal to decode truncated JPEGs. PIL's default is False
 # already, but a future dep could flip it; lock it down here.
@@ -923,20 +935,22 @@ def _force_vit_flash_attn_2(config, model_dir: str) -> None:
 # 2-coord points. The Rust validator at rust_server/src/prompt_validator
 # .rs classifies every accepted prompt into one of these seven wire names
 # and forwards it through the IPC header as `prompt_task`. `run()` uses
-# this map to DROP off-shape parse output before stamping the response:
+# this map to FILTER off-shape parse output before stamping the response:
 # a 4-coord box that escapes through a Point prompt's response (or a
 # 2-coord point that escapes through a detection prompt's response) is
-# by-definition off-distribution and silently lands in the wrong field
-# without enforcement.
+# by-definition off-distribution and must not land in the typed field for
+# the other shape.
 #
 # Empirically the model does not emit off-shape at the trained sampling
 # parameters: zero cross-shape events were observed in 3,444 trials
 # spanning all 7 templates × adversarial prompts (including a Point
 # prompt literally containing the substring "bounding box"). The filter
 # is therefore a forward-compat guard rail, not a frequent rejection
-# path; it converts a hypothetical future model regression from a
-# silent-wrong-field-filled bug into a clean "model deviated → empty
-# response" signal that the `abstained` field already surfaces.
+# path. Crucially it does NOT silently drop the deviation: the off-shape
+# count is surfaced in `off_shape_count` (and the verbatim tokens stay in
+# `raw_answer`), and `abstained` is computed from the PRE-filter parse — so
+# a model that emitted geometry in the wrong shape is reported as a loud,
+# queryable deviation, never misreported as "the model abstained".
 #
 # Keys MUST equal worker/prompts.py::TEMPLATE_WIRE_NAMES AND the wire
 # names in rust_server/src/prompt_validator.rs::TemplateKind::wire_name;
@@ -959,17 +973,27 @@ class InferenceResult:
     raw_answer: str
     detections: list  # list[dict]
     points: list      # list[dict]
-    # True iff `detections` and `points` are both empty — i.e. the model
-    # effectively returned nothing usable for this frame. Derivable from
-    # the two lists but stamped explicitly so naive clients can branch
-    # on it without re-parsing. NVIDIA's eval pipeline has no aggregate
-    # `abstained` concept; empty parsed output is the aggregate-no-result
-    # signal there too (inference_grounding_ddp.py:282-300 +
-    # metrics/other_metric.py:140-156). Per-category abstention in a
-    # multi-category detect prompt is NOT signalled here — it's
-    # recoverable from `raw_answer` as the set difference between the
-    # prompt's category list and `{d['label'] for d in detections}`.
+    # True iff the model produced NO parseable geometry at all — no boxes
+    # and no points — evaluated BEFORE the task→shape filter. An off-shape
+    # emission (geometry in the wrong shape for the task) is NOT abstention:
+    # it is filtered out of `detections`/`points`, counted in
+    # `off_shape_count`, and leaves this False. Stamped explicitly so naive
+    # clients can branch without re-parsing. NVIDIA's eval pipeline has no
+    # aggregate `abstained` concept; empty parsed output is the
+    # aggregate-no-result signal there too (inference_grounding_ddp.py:282-300
+    # + metrics/other_metric.py:140-156). Per-category abstention in a
+    # multi-category detect prompt is NOT signalled here — it's recoverable
+    # from `raw_answer` as the set difference between the prompt's category
+    # list and `{d['label'] for d in detections}`.
     abstained: bool
+    # Number of parsed geometries the model emitted in the WRONG shape for
+    # the task (a box under a `point` prompt, or a point under a box prompt)
+    # and that were therefore filtered out of `detections`/`points`. Normally
+    # 0. Non-zero is a loud, queryable signal of a model task→shape deviation:
+    # the output is NOT silently dropped (verbatim tokens remain in
+    # `raw_answer`) and does NOT count as abstention. Empirically 0 across
+    # 3,444 trials at the trained sampling params (see EXPECTED_SHAPE).
+    off_shape_count: int
     # True iff `raw_answer` does NOT end with the model's <|im_end|>
     # end-of-turn marker. Per the custom .generate() loop at
     # models/LocateAnything-3B/modeling_locateanything.py:464,500-501
@@ -989,7 +1013,8 @@ class InferenceResult:
     # for `prompt_task == "point"` look at `points[]`; for any other
     # wire name look at `detections[]`. Per the trained task→shape
     # contract, the OTHER list is always empty (off-shape outputs are
-    # filtered before this object is constructed; see run()).
+    # filtered out of `detections`/`points` and counted in
+    # `off_shape_count`; see run()).
     prompt_task: str
     latency_ms: float
     image_size: tuple
@@ -1260,7 +1285,8 @@ class LocateAnythingInference:
         `prompt_task` is the wire name of the canonical template the
         prompt was classified as (Rust validator output forwarded through
         the IPC header; see EXPECTED_SHAPE for valid values). Used to
-        drop off-shape model output per the trained task→shape contract.
+        filter off-shape model output (counted in `off_shape_count`, not
+        silently dropped) per the trained task→shape contract.
 
         JPEG decoded inside this method — Python's PIL is the canonical
         decoder for the LocateAnything image processor.
@@ -1501,20 +1527,34 @@ class LocateAnythingInference:
 
         detections = [d.to_json() for d in parse_boxes(answer, image.width, image.height)]
         points     = [p.to_json() for p in parse_points(answer, image.width, image.height)]
-        # Trained task→shape enforcement: drop off-shape parse output
-        # before stamping the response. See EXPECTED_SHAPE for the
-        # full contract.
+        # `abstained` must reflect the MODEL, not the task-shape filter below:
+        # snapshot whether the model produced ANY parseable geometry BEFORE we
+        # filter to the trained shape, so an off-shape emission is never
+        # misreported as "the model abstained".
+        parsed_geometry = bool(detections or points)
+        # Trained task→shape enforcement: a `point` task returns points and
+        # every other task returns boxes. Off-shape output (a box under a point
+        # prompt, or vice-versa) is filtered out of the typed lists — but NOT
+        # silently dropped: it is COUNTED in `off_shape_count` (verbatim tokens
+        # remain in `raw_answer`), turning a model deviation into a loud,
+        # queryable signal instead of an empty response. See EXPECTED_SHAPE.
+        off_shape_count = 0
         expected = EXPECTED_SHAPE[prompt_task]
         if expected == "point":
+            off_shape_count = len(detections)
             detections = []
         elif expected == "box":
+            off_shape_count = len(points)
             points = []
         return InferenceResult(
             raw_answer=answer,
             detections=detections,
             points=points,
-            # Aggregate semantic. See InferenceResult.abstained docstring.
-            abstained=not (detections or points),
+            # True only if the model produced no parseable geometry at all
+            # (pre-filter). An off-shape emission leaves this False; see
+            # off_shape_count. See InferenceResult.abstained docstring.
+            abstained=not parsed_geometry,
+            off_shape_count=off_shape_count,
             # Explicit truncation signal. See InferenceResult.model_output_truncated
             # docstring.
             model_output_truncated=not answer.endswith("<|im_end|>"),
