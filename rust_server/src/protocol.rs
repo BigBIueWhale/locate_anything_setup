@@ -144,6 +144,17 @@ pub enum Response {
     Error(ErrorBody),
 }
 
+// The `deny_unknown_fields` on each of the three success bodies below is the
+// LOAD-BEARING egress refusal: it is what makes a drifted/garbled worker reply
+// fail loud instead of being forwarded to the client. Verified empirically
+// against the pinned serde 1.0.228 (see the `resp_rejects_*` wire_tests): when a
+// struct carries BOTH `deny_unknown_fields` AND a `#[serde(flatten)]` field, the
+// OUTER attribute rejects any field unknown to both the named outer fields AND
+// the flattened `Meta`. The common belief that flatten disables the outer
+// `deny_unknown_fields` is FALSE here; what is actually inert is a
+// `deny_unknown_fields` on the flattened struct itself (`Meta`). So this
+// attribute must NOT be dropped in the belief that `Meta`'s own `deny` covers
+// the meta fields — it does not, in flattened position.
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct BoxesBody {
@@ -199,6 +210,11 @@ pub struct LabeledPoint {
 }
 
 /// Per-reply metadata, flattened into the boxes/points/abstained variants.
+/// NOTE: `Meta` is only ever deserialized in FLATTENED position, where its own
+/// `deny_unknown_fields` is INERT (serde 1.0.228) — the enclosing body's
+/// `deny_unknown_fields` is what rejects stray meta fields. The attribute is
+/// kept here purely as a defensive backstop in case `Meta` is ever deserialized
+/// standalone; it is NOT what guards the flattened replies.
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct Meta {
@@ -484,6 +500,18 @@ mod wire_tests {
         // boxes variant must not also carry points (deny_unknown_fields).
         rejects::<Response>(
             r#"{"type":"boxes","frame_id":"f","boxes":[],"points":[],"raw_text":"x","model_output_truncated":false,"deviations_dropped":0,"image_size":[1,1],"resize_plan":{"dst_w":1,"dst_h":1,"n_llm_tokens":1,"scale":1.0},"generation_mode_used":"slow","latency_ms":1.0,"total_ms":2.0}"#,
+        );
+    }
+    #[test]
+    fn resp_rejects_points_with_stray_meta_field() {
+        // Symmetric guard for the THIRD flatten-bearing body (points): a field
+        // unknown to both the body and the flattened Meta must reject. Together
+        // with resp_rejects_stale_off_shape_count (abstained body) and
+        // resp_rejects_boxes_with_points_field (boxes body), this pins the
+        // load-bearing body-level deny_unknown_fields across all three bodies —
+        // so the flatten/deny mechanism documented on BoxesBody can't silently rot.
+        rejects::<Response>(
+            r#"{"type":"points","frame_id":"f","points":[],"stray":true,"raw_text":"x","model_output_truncated":false,"deviations_dropped":0,"image_size":[1,1],"resize_plan":{"dst_w":1,"dst_h":1,"n_llm_tokens":1,"scale":1.0},"generation_mode_used":"slow","latency_ms":1.0,"total_ms":2.0}"#,
         );
     }
     #[test]
