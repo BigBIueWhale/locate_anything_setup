@@ -154,8 +154,8 @@
   <li>If granted, the SPA prompts the user to select a webcam (from any platform: Apple iPhone smartphone, Google Pixel Android smartphone, Samsung Galaxy S25 Android smartphone, Apple iPad tablet, Microsoft Windows laptop, Apple macOS desktop, etc.), and to construct a prompt from the 7 canonical templates LocateAnything-3B was trained on.</li>
   <li>The streamer's web browser captures 1280x720-pixel video at 30 frames per second via the JavaScript <code>navigator.mediaDevices.getUserMedia()</code> Application Programming Interface (API), encodes with H.264 Constrained Baseline Level 3.1, and sends it via WebRTC (Web Real Time Communication) to the demo server, which is a Selective Forwarding Unit.</li>
   <li>The demo server has two simultaneous responsibilities for the incoming H.264 video stream: <strong>(a)</strong> re-publish the Real-time Transport Protocol (RTP) packets to all currently-connected viewer browsers, and <strong>(b)</strong> sample the latest decoded frame at whatever cadence the LocateAnything-3B inference server can sustain (stop-and-wait per WebSocket: one frame in, one reply out — Section 19.1), decoding H.264 access units to YUV color space, converting to Red-Green-Blue (RGB) color space, encoding as Joint Photographic Experts Group (JPEG) images at quality 92, and sending each JPEG over a WebSocket connection to the inference server.</li>
-  <li>LocateAnything-3B processes each JPEG and returns a JavaScript Object Notation (JSON) message containing bounding-box coordinates. The demo server normalizes coordinates to the floating-point range [0.0, 1.0] and forwards each <code>BoxMessage</code> over WebRTC Data Channel to the streamer and every viewer in parallel. The video and box flows are architecturally independent: video re-publish (RTP fan-out) does not pass through the decode-pipeline / LA path, and slow LA inference does not slow the live video.</li>
-  <li>Each browser overlays bounding boxes on a Hypertext Markup Language (HTML) <code>&lt;canvas&gt;</code> element positioned above its <code>&lt;video&gt;</code> element under a <strong>latest-wins overlay</strong>: every canvas redraw tick draws the most-recent BoxMessage received over the Data Channel, on whatever frame is currently being presented. The overlay is therefore stale by one LocateAnything-3B inference cycle plus pipeline overhead (~800 ms hybrid; see Section 21.2 for the honest budget). The streamer's local video has near-zero latency and uses <code>requestAnimationFrame</code> as the redraw cadence (local <code>getUserMedia</code> tracks have no RTP timeline per the WICG video-rvfc spec); the viewer's video uses <code>requestVideoFrameCallback</code> (universal across the Section 22.1 matrix as of 2026-06-02) as the redraw tick so that the canvas redraw matches the actual video-frame presentation cadence even under congestion. The <code>has_rvfc()</code> feature-detect at viewer-mount surfaces a chained <code>anyhow::Error</code> to the error banner if absent (strict no-silent-fallback per Section 3.1).</li>
+  <li>LocateAnything-3B processes each JPEG and returns a JavaScript Object Notation (JSON) reply that is exactly one of a strict tagged union — <code>boxes</code>, <code>points</code>, <code>abstained</code>, or <code>error</code> (the LocateAnything-3B wire makes every other state unrepresentable, so the demo server's LA-client <code>match</code>es one tag and needs no defensive parsing). On a <code>boxes</code>/<code>points</code>/<code>abstained</code> reply the demo server normalizes coordinates to the floating-point range [0.0, 1.0] and forwards a single <code>BoxOverlay</code> (its own browser-facing sum, mirroring the LocateAnything-3B reply's shape) over WebRTC Data Channel to the streamer and every viewer in parallel; an <code>error</code> reply goes back to the streamer over the signaling WebSocket instead. The video and box flows are architecturally independent: video re-publish (RTP fan-out) does not pass through the decode-pipeline / LA path, and slow LA inference does not slow the live video.</li>
+  <li>Each browser overlays bounding boxes on a Hypertext Markup Language (HTML) <code>&lt;canvas&gt;</code> element positioned above its <code>&lt;video&gt;</code> element under a <strong>latest-wins overlay</strong>: every canvas redraw tick draws the most-recent BoxOverlay received over the Data Channel, on whatever frame is currently being presented. The overlay is therefore stale by one LocateAnything-3B inference cycle plus pipeline overhead (~800 ms hybrid; see Section 21.2 for the honest budget). The streamer's local video has near-zero latency and uses <code>requestAnimationFrame</code> as the redraw cadence (local <code>getUserMedia</code> tracks have no RTP timeline per the WICG video-rvfc spec); the viewer's video uses <code>requestVideoFrameCallback</code> (universal across the Section 22.1 matrix as of 2026-06-02) as the redraw tick so that the canvas redraw matches the actual video-frame presentation cadence even under congestion. The <code>has_rvfc()</code> feature-detect at viewer-mount surfaces a chained <code>anyhow::Error</code> to the error banner if absent (strict no-silent-fallback per Section 3.1).</li>
   <li>When the streamer disconnects (closes the browser tab, loses network, or explicitly releases ownership), the demo server's ownership finite state machine reverts cleanly to the Idle state, all viewer WebRTC peer connections are torn down, and the next person to visit the URL can claim the streamer slot.</li>
 </ol>
 
@@ -902,7 +902,7 @@ Use Bash:
 │  │                 │  │                        │  │  unreliable)       │ │
 │  └─────────────────┘  └────────────────────────┘  └────────────────────┘ │
 │  WebSocket Secure /v1/signal — SDP offer/answer, ICE candidates,         │
-│  claim_streamer with {prompt, generation_mode}, keepalive, resume_session│
+│  claim_streamer with {request, generation_mode}, keepalive, resume_sess. │
 └──────┬───────────────────────────────────────────────────────────────────┘
        │ HTTPS+WSS port 8443 (TCP)
        │ WebRTC media+DataChannel port 51000 (UDP)
@@ -973,7 +973,8 @@ Use Bash:
 │  │ tokio-tungstenite 0.29.0, default features (TLS not on by default) │  │
 │  │ ws://&lt;la-host&gt;:&lt;la-port&gt;/v1/stream                                 │  │
 │  │ Wire frame: [4-byte BE u32 = header_len][header_len JSON][JPEG]    │  │
-│  │ JSON: {frame_id, prompt, generation_mode, jpeg_len}                │  │
+│  │ JSON: {frame_id, request, generation_mode, jpeg_len} (request is   │  │
+│  │   the typed PromptRequest sum; LA compiles it to the prompt)       │  │
 │  │ Loop:                                                              │  │
 │  │   jpeg_rx.changed().await    // park if no new frame from decoder  │  │
 │  │   frame = jpeg_rx.borrow_and_update().clone()   // latest wins     │  │
@@ -1275,10 +1276,10 @@ Concurrently:
   <dd>Reference for Cargo dependency pin style and release-profile settings (<code>codegen-units = 1</code>, <code>lto = "thin"</code>, <code>panic = "abort"</code>, <code>strip = true</code>, <code>opt-level = 3</code>).</dd>
 
   <dt><code>/home/user/Desktop/locate_anything_setup/rust_server/src/protocol.rs</code></dt>
-  <dd>Reference for wire-protocol type definitions with serde. Look at lines 26-66: <code>InferHeader</code> struct with fields <code>frame_id</code>, <code>prompt</code>, <code>generation_mode</code>, <code>jpeg_len</code>; uses <code>#[serde(deny_unknown_fields)]</code>; defines <code>MAX_PROMPT_CHARS = 16384</code> as a public constant. The new <code>protocol</code> crate uses the identical disciplines.</dd>
+  <dd>Reference for wire-protocol type definitions with serde — and the canonical example of the make-illegal-states-unrepresentable discipline this plan mirrors. The <code>InferHeader</code> struct carries <code>frame_id</code>, a typed <code>request: PromptRequest</code> (a sum over the seven trained tasks, internally tagged on <code>task</code>), a typed <code>generation_mode: GenerationMode</code>, and <code>jpeg_len</code>; every body uses <code>#[serde(deny_unknown_fields)]</code>, and the reply is the flat tagged <code>Response</code> union (<code>boxes</code> XOR <code>points</code> XOR <code>abstained</code> XOR <code>error</code>) with <code>label</code> required and no <code>score</code>/<code>conf</code> field anywhere. <code>MAX_PROMPT_CHARS = 16384</code> is a public constant bounding the compiled prompt. The new <code>protocol</code> crate uses the identical disciplines, including a <code>PromptRequest</code> sum and a <code>BoxOverlay</code> reply sum that mirror these shapes.</dd>
 
   <dt><code>/home/user/Desktop/locate_anything_setup/rust_server/src/prompt_validator.rs</code></dt>
-  <dd>The authoritative prompt-template validator in the LocateAnything-3B server. Lines 33-41: the <code>CATEGORY_SEPARATOR</code> at line 33 plus the 7 canonical template constants at lines 35-41 as <code>&amp;'static str</code>. Lines 80-135: the <code>TemplateKind</code> enum and its <code>wire_name</code> method (lines 124-134 specifically — the wire-name mapping per variant, NOT a runtime verification routine) that produces the exact wire strings (<code>"detection"</code>, <code>"phrase_single"</code>, <code>"phrase_multi"</code>, <code>"text_grounding"</code>, <code>"scene_text"</code>, <code>"gui_box"</code>, <code>"point"</code>). <strong>Important — verified by source-level research on 2026-06-01:</strong> The doc comments at lines 4-8 describe how drift is caught — by the LocateAnything-3B container's Python startup running <code>la_server --print-canonical-templates</code> (the Rust binary's subcommand) and dict-equaling the JSON against <code>worker/prompts.py</code>. <strong>The Rust validator itself has NO runtime drift-check code; the constants are compile-time literals; the "drift check" is a Python-checks-Rust mechanism that lives inside the LocateAnything-3B container only.</strong> Therefore we do NOT copy this file verbatim into the demo server. Instead: the canonical strings are mirrored as <code>pub const &amp;'static str</code> in the new <code>protocol</code> crate (Section 10.10), with a compile-time unit test that asserts byte-equality against <code>worker/prompts.py</code> via <code>include_str!</code>. Server-side validation of prompts is NOT duplicated in the demo server (per the user requirement "Try to place the validation in the frontend only in order not to duplicate"); the LocateAnything-3B server is the authoritative validator and rejects malformed prompts with a <code>type:"error"</code> reply that the demo server propagates to the streamer.</dd>
+  <dd>The authoritative prompt-template validator in the LocateAnything-3B server. Lines 33-41: the <code>CATEGORY_SEPARATOR</code> at line 33 plus the 7 canonical template constants at lines 35-41 as <code>&amp;'static str</code>. Lines 80-135: the <code>TemplateKind</code> enum and its <code>wire_name</code> method (lines 124-134 specifically — the wire-name mapping per variant, NOT a runtime verification routine) that produces the exact wire strings (<code>"detection"</code>, <code>"phrase_single"</code>, <code>"phrase_multi"</code>, <code>"text_grounding"</code>, <code>"scene_text"</code>, <code>"gui_box"</code>, <code>"point"</code>). <strong>Important — verified by source-level research on 2026-06-01:</strong> The doc comments at lines 4-8 describe how drift is caught — by the LocateAnything-3B container's Python startup running <code>la_server --print-canonical-templates</code> (the Rust binary's subcommand) and dict-equaling the JSON against <code>worker/prompts.py</code>. <strong>The Rust validator itself has NO runtime drift-check code; the constants are compile-time literals; the "drift check" is a Python-checks-Rust mechanism that lives inside the LocateAnything-3B container only.</strong> Therefore we do NOT copy this file verbatim into the demo server. Instead: the canonical strings are mirrored as <code>pub const &amp;'static str</code> in the new <code>protocol</code> crate (Section 10.10), with a compile-time unit test that asserts byte-equality against <code>worker/prompts.py</code> via <code>include_str!</code>. Server-side validation of prompts is NOT duplicated in the demo server (per the user requirement "Try to place the validation in the frontend only in order not to duplicate"); the LocateAnything-3B server now <code>compile</code>s a typed <code>PromptRequest</code> and validates the typed slots itself (it rejects an invalid request with a <code>type:"error", code:"invalid_request"</code> reply that the demo server propagates to the streamer). Because the request is a strict typed sum, the demo's WebAssembly client builds the request directly and needs only light inline UX validation, not a parallel server-grade validator (Section 23.6).</dd>
 
   <dt><code>/home/user/Desktop/locate_anything_setup/rust_server/src/error.rs</code></dt>
   <dd>Reference for the typed-error-to-HTTP-response pattern. The new project's <code>server/src/error.rs</code> follows a simpler form (anyhow chain converted to HTTP body string per Section 4) but the type-to-status-code mapping is the same shape.</dd>
@@ -1290,7 +1291,7 @@ Concurrently:
   <dd>Reference for the minimal AppState pattern: <code>Args</code> plus <code>Arc&lt;Notify&gt;</code> for shutdown signaling.</dd>
 
   <dt><code>/home/user/Desktop/locate_anything_setup/worker/prompts.py</code></dt>
-  <dd>The Python source of truth for the 7 canonical LocateAnything-3B prompt templates. Line 58: <code>CATEGORY_SEPARATOR</code>. Lines 62, 63, 64, 69, 72, 75, 80: each canonical prompt string. Lines 121-129: the wire-name enumeration. Lines 135-145: the <code>CANONICAL_TEMPLATES</code> dict that the Python boot-time drift check (<code>worker/validate_startup.py:336 validate_prompt_template_drift</code>) compares against the Rust binary's <code>la_server --print-canonical-templates</code> JSON output. The demo server's frontend prompt builder constructs prompts that match these strings byte-for-byte.</dd>
+  <dd>The Python source of truth for the 7 canonical LocateAnything-3B prompt templates. Line 58: <code>CATEGORY_SEPARATOR</code>. Lines 62, 63, 64, 69, 72, 75, 80: each canonical prompt string. Lines 121-129: the wire-name enumeration. Lines 135-145: the <code>CANONICAL_TEMPLATES</code> dict that the Python boot-time drift check (<code>worker/validate_startup.py:336 validate_prompt_template_drift</code>) compares against the Rust binary's <code>la_server --print-canonical-templates</code> JSON output. These template strings are the single source of truth the LocateAnything-3B server compiles a typed <code>PromptRequest</code> into; the demo server's frontend prompt builder emits the typed request (it never concatenates the template strings itself — Section 23), and the demo's mirrored constants exist only for the boot-time cross-check parity (Section 10.10).</dd>
 
   <dt><code>/home/user/Desktop/locate_anything_setup/worker/inference.py</code></dt>
   <dd>Reference for the LA inference loop: lines 215-238 show the three generation modes (<code>fast</code>, <code>hybrid</code>, <code>slow</code>) and what they do (Multi-Token-Prediction, hybrid MTP-then-Autoregressive, pure Autoregressive). Lines 1287-1530 cover the JPEG decode, preprocessor, and bbox-parsing stages of the inference pipeline.</dd>
@@ -1399,7 +1400,7 @@ Concurrently:
 │       │                              # viewer mount surfaces anyhow::Error if absent (strict no-silent-fallback)
 │       └── components/
 │           ├── claim_button.rs        # Leptos component; the initial "Claim Streamer" call-to-action
-│           ├── prompt_builder.rs      # 7-card grid -> per-template form -> live preview pane
+│           ├── prompt_builder.rs      # 7-card grid -> per-template form -> typed PromptRequest + preview pane
 │           ├── camera_picker.rs       # cross-platform picker with two-stage detect (placeholder -> labeled)
 │           ├── video_pane.rs          # <video> + <canvas> overlay; ResizeObserver; DPR-aware canvas sizing
 │           ├── viewer_pane.rs         # viewer-side variant of video_pane with rVFC sync
@@ -1409,7 +1410,8 @@ Concurrently:
 └── protocol/                          # shared types, compiled for both x86_64 and wasm32
     ├── Cargo.toml
     └── src/
-        └── lib.rs                     # SignalMessage enum, BoxMessage, BoundingBox, PromptTask, GenerationMode,
+        └── lib.rs                     # SignalMessage enum, PromptRequest (typed-request sum), BoxOverlay
+                                       # (boxes|points|abstained sum) + LabeledBox/LabeledPoint, GenerationMode,
                                        # error_code constants, anyhow_to_error_msg helper, serde parse/serialize helpers
 </code></pre>
 
@@ -1457,20 +1459,34 @@ pub fn anyhow_to_error_msg(code: &amp;str, e: &amp;anyhow::Error) -&gt; ErrorMsg
 }
 </code></pre>
 
-<h3>10.4 PromptTask enum (matches LA's wire names byte-for-byte)</h3>
-<pre><code>#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum PromptTask {
-    Detection,       // wire: "detection"
-    PhraseSingle,    // wire: "phrase_single"
-    PhraseMulti,     // wire: "phrase_multi"
-    TextGrounding,   // wire: "text_grounding"
-    SceneText,       // wire: "scene_text"
-    GuiBox,          // wire: "gui_box"
-    Point,           // wire: "point"
+<h3>10.4 PromptRequest sum (the typed inference request — mirrors LA's <code>PromptRequest</code> byte-for-byte)</h3>
+
+<p>The request the browser builds and the demo server forwards to LocateAnything-3B is a <strong>typed sum, internally tagged on <code>task</code></strong>, one variant per trained template — the exact shape of <code>rust_server/src/protocol.rs::PromptRequest</code>. The WebAssembly client never concatenates a prompt string: it emits one of these variants with its typed slots, and the LocateAnything-3B server compiles the variant into the exact trained prompt (Section 23). Each variant carries its own <code>deny_unknown_fields</code> body via the newtype-around-named-struct pattern; <code>SceneText</code> wraps an <em>empty</em> struct (not a unit variant) so a stray sibling field is rejected rather than silently ignored under internal tagging.</p>
+
+<pre><code>#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(tag = "task", rename_all = "snake_case")]
+pub enum PromptRequest {
+    Detection(DetectionReq),      // task: "detection"      — slot: categories
+    PhraseSingle(PhraseReq),      // task: "phrase_single"  — slot: phrase
+    PhraseMulti(PhraseReq),       // task: "phrase_multi"   — slot: phrase
+    TextGrounding(TextReq),       // task: "text_grounding" — slot: text
+    SceneText(SceneTextReq),      // task: "scene_text"     — no slot (empty-struct newtype)
+    GuiBox(DescReq),              // task: "gui_box"        — slot: description
+    Point(PhraseReq),             // task: "point"          — slot: phrase
 }
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)] #[serde(deny_unknown_fields)]
+pub struct DetectionReq { pub categories: Vec&lt;String&gt; }   // 1..=10 entries; NOT a client-joined "&lt;/c&gt;" string (§23.4)
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)] #[serde(deny_unknown_fields)]
+pub struct PhraseReq    { pub phrase: String }
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)] #[serde(deny_unknown_fields)]
+pub struct TextReq      { pub text: String }
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)] #[serde(deny_unknown_fields)]
+pub struct DescReq      { pub description: String }
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)] #[serde(deny_unknown_fields)]
+pub struct SceneTextReq {}
 </code></pre>
-<p>Verify against LA's <code>/home/user/Desktop/locate_anything_setup/rust_server/src/prompt_validator.rs:124-134</code> at implementation time.</p>
+<p>The <code>task</code> tag strings (<code>detection</code>, <code>phrase_single</code>, <code>phrase_multi</code>, <code>text_grounding</code>, <code>scene_text</code>, <code>gui_box</code>, <code>point</code>) must match LA's <code>/home/user/Desktop/locate_anything_setup/rust_server/src/protocol.rs::PromptRequest</code> and <code>prompt_validator.rs</code> at implementation time. The variant is the <strong>only</strong> place the task identity lives — there is no separate <code>PromptTask</code> marker enum, because each prompt-builder card maps directly to a <code>PromptRequest</code> variant and the reply's shape (boxes vs points) is carried by the <code>BoxOverlay</code> tag (Section 10.7), not echoed back on the request.</p>
 
 <h3>10.5 GenerationMode enum</h3>
 <pre><code>#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -1483,12 +1499,18 @@ pub enum GenerationMode {
 </code></pre>
 
 <h3>10.6 SignalMessage enum (sent over /v1/signal WebSocket as JSON text)</h3>
-<p>Internally tagged with <code>#[serde(tag = "type", rename_all = "snake_case")]</code>. Every variant's struct has <code>#[serde(deny_unknown_fields)]</code>. Examples on the wire: <code>{"type":"claim","prompt":"Point to: drone in the sky.","generation_mode":"slow"}</code>; <code>{"type":"sdp_offer","sdp":"v=0\r\no=...\r\n..."}</code>.</p>
+<p>Internally tagged with <code>#[serde(tag = "type", rename_all = "snake_case")]</code>. Every variant's struct has <code>#[serde(deny_unknown_fields)]</code>. Examples on the wire: <code>{"type":"claim","request":{"task":"point","phrase":"drone in the sky"},"generation_mode":"slow"}</code>; <code>{"type":"sdp_offer","sdp":"v=0\r\no=...\r\n..."}</code>. <strong>The <code>claim</code> carries a typed <code>request</code> (a <code>PromptRequest</code>, §10.4), never a prompt string — the browser sends typed slots and the LocateAnything-3B server compiles the prompt.</strong></p>
 <p><strong>Wire-size bound.</strong> The <code>/v1/signal</code> <code>WebSocketUpgrade</code> sets a conservative <code>.max_message_size(64 * 1024)</code> and <code>.max_frame_size(...)</code>: axum 0.8.9 defaults to 64 MiB / 16 MiB — orders of magnitude larger than any legitimate SDP offer or ICE candidate — so without an explicit cap an authenticated-but-buggy-or-hostile peer could force large per-frame allocations (the only other backstop is the 2 GiB container limit, §22). An oversize frame triggers a loud WebSocket close, not a silent drop.</p>
 <pre><code>#[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct ClaimMsg {
-    pub prompt:          String,
+    /// The typed inference request (a sum over the seven trained tasks,
+    /// §10.4) the streamer commits to for the whole ownership session. The
+    /// browser builds this from the prompt-builder form (§23); the demo
+    /// server forwards it verbatim to LocateAnything-3B, which compiles it
+    /// to the trained prompt string. No prompt string is ever constructed
+    /// client-side.
+    pub request:         PromptRequest,
     pub generation_mode: GenerationMode,
 }
 
@@ -1559,61 +1581,82 @@ pub enum SignalMessage {
 }
 </code></pre>
 
-<h3>10.7 BoundingBox and BoxMessage (sent over WebRTC Data Channel as JSON text)</h3>
+<h3>10.7 BoxOverlay — the browser-facing reply sum (sent over WebRTC Data Channel as JSON text)</h3>
 
-<p>The DataChannel labeled <code>"boxes"</code> is created by the WebAssembly client (the SDP <em>offerer</em>) before <code>createOffer()</code>; the server is the answerer, and per RFC 8829 §5.3.1 an SDP answer cannot introduce an <code>m=</code> section the offer omitted — so the channel MUST be offered by the client. The server receives it via <code>Event::ChannelOpen</code> (§11.8 step 8) and sends one BoxMessage per LocateAnything-3B reply, per peer. <strong>The coordinate system is normalized to the floating-point range [0.0, 1.0] for both axes</strong>, with origin at the top-left of the source frame; the WebAssembly client multiplies by the Cascading Style Sheets (CSS) dimensions of its overlay canvas to convert to pixel coordinates.</p>
+<p>The DataChannel labeled <code>"boxes"</code> is created by the WebAssembly client (the SDP <em>offerer</em>) before <code>createOffer()</code>; the server is the answerer, and per RFC 8829 §5.3.1 an SDP answer cannot introduce an <code>m=</code> section the offer omitted — so the channel MUST be offered by the client. The server receives it via <code>Event::ChannelOpen</code> (§11.8 step 8) and sends one <code>BoxOverlay</code> per LocateAnything-3B <code>boxes</code>/<code>points</code>/<code>abstained</code> reply, per peer (an LA <code>error</code> reply does NOT travel this channel — it goes to the streamer over the signaling WebSocket, §11.7.1/§23.9). <strong>The coordinate system is normalized to the floating-point range [0.0, 1.0] for both axes</strong>, with origin at the top-left of the source frame; the WebAssembly client multiplies by the Cascading Style Sheets (CSS) dimensions of its overlay canvas to convert to pixel coordinates.</p>
+
+<p><strong>The demo's own browser wire is a sum, the same discipline as the LocateAnything-3B reply.</strong> The LocateAnything-3B reply is a strict tagged union (<code>boxes</code> XOR <code>points</code> XOR <code>abstained</code> XOR <code>error</code>); the box overlay the demo server forwards to browsers mirrors it as <code>BoxOverlay = Boxes | Points | Abstained</code>, internally tagged on <code>type</code>. The browser <code>match</code>es exactly one tag and draws it — no both-lists struct to disambiguate, no <code>abstained</code> boolean to consult, no <code>prompt_task</code> to switch on. Making the overlay's illegal states unrepresentable means the receive path and the canvas draw need far less defensiveness: a <code>Points</code> value simply cannot also carry boxes, so the draw code matches the variant and is done (§21.3.1, §21.9).</p>
 
 <div class="note note-critical">
 <strong>DataChannel reliability config (verified by source-level research on 2026-06-01):</strong> <code>ordered: false, reliability: Reliability::MaxRetransmits { retransmits: 0 }</code>. <em>NOT</em> <code>ordered: true, max_retransmits: None</code> (reliable+ordered) — that config is wrong for our use case.
 
-<p><strong>Why unordered + zero retransmits is strictly correct:</strong> Each BoxMessage carries a monotonic, server-assigned <code>frame_id</code> (§10.7). The WebAssembly client uses a latest-wins overlay (§21.2): a single <code>latest_box: RwSignal&lt;Option&lt;BoxMessage&gt;&gt;</code> slot holds the most-recent inference result, with "newer-frame_id wins" comparison on the rare case a DataChannel reorder delivers an older box after a newer one (§21.3.1). Therefore receive-order is irrelevant — the freshest box always wins, the box overlay is always at most one inference cycle stale (a property the user has explicitly accepted).</p>
+<p><strong>Why unordered + zero retransmits is strictly correct:</strong> Each BoxOverlay carries a monotonic, server-assigned <code>frame_id</code> (§10.7) on every variant. The WebAssembly client uses a latest-wins overlay (§21.2): a single <code>latest_box: RwSignal&lt;Option&lt;BoxOverlay&gt;&gt;</code> slot holds the most-recent inference result, with "newer-frame_id wins" comparison on the rare case a DataChannel reorder delivers an older overlay after a newer one (§21.3.1). Therefore receive-order is irrelevant — the freshest overlay always wins, the box overlay is always at most one inference cycle stale (a property the user has explicitly accepted).</p>
 
-<p>If we used <code>Reliable</code> + <code>ordered</code>, SCTP would retransmit lost packets AND hold back subsequent packets until the lost one is delivered (head-of-line blocking) — then deliver the now-stale BoxMessage. That is exactly the failure mode Section 10.7.1 warns against. The <code>Channel::write</code> <code>Ok(false)</code> drop-on-backpressure only handles local 128-kibibyte SCTP buffer pressure; it does NOT prevent in-flight retransmissions causing stale delivery. Unordered+zero-retransmits eliminates the head-of-line stall and guarantees that any datagram arriving at the client is either the freshest available or simply absent.</p>
+<p>If we used <code>Reliable</code> + <code>ordered</code>, SCTP would retransmit lost packets AND hold back subsequent packets until the lost one is delivered (head-of-line blocking) — then deliver the now-stale BoxOverlay. That is exactly the failure mode Section 10.7.1 warns against. The <code>Channel::write</code> <code>Ok(false)</code> drop-on-backpressure only handles local 128-kibibyte SCTP buffer pressure; it does NOT prevent in-flight retransmissions causing stale delivery. Unordered+zero-retransmits eliminates the head-of-line stall and guarantees that any datagram arriving at the client is either the freshest available or simply absent.</p>
 
-<p><strong>Who creates the channel:</strong> the <em>client</em> calls <code>RtcPeerConnection.create_data_channel_with_data_channel_dict("boxes", &amp;init)</code> with <code>init.ordered(false)</code> and <code>init.max_retransmits(0)</code> (the browser-side equivalent of the SCTP reliability config) BEFORE <code>createOffer()</code>, so the OFFER carries the <code>m=application</code> line. The server (answerer) does NOT call <code>add_channel_with_config</code>: an answerer cannot add an m-section the offer lacks (RFC 8829 §5.3.1), and str0m's <code>accept_offer</code> silently ignores a queued <code>Change::AddApp</code> — so the prior "add it server-side before <code>accept_offer</code>" approach produced an answer with no <code>m=application</code> and the channel never opened (the demo's core feature would be dead). The server simply <code>accept_offer</code>s the client's offer and obtains the channel via <code>Event::ChannelOpen</code> (§11.8 step 8), then writes BoxMessages with <code>rtc.channel(cid).write(false, bytes)</code>. The unordered + zero-retransmit reliability is negotiated over DCEP regardless of which side offers.</p>
+<p><strong>Who creates the channel:</strong> the <em>client</em> calls <code>RtcPeerConnection.create_data_channel_with_data_channel_dict("boxes", &amp;init)</code> with <code>init.ordered(false)</code> and <code>init.max_retransmits(0)</code> (the browser-side equivalent of the SCTP reliability config) BEFORE <code>createOffer()</code>, so the OFFER carries the <code>m=application</code> line. The server (answerer) does NOT call <code>add_channel_with_config</code>: an answerer cannot add an m-section the offer lacks (RFC 8829 §5.3.1), and str0m's <code>accept_offer</code> silently ignores a queued <code>Change::AddApp</code> — so the prior "add it server-side before <code>accept_offer</code>" approach produced an answer with no <code>m=application</code> and the channel never opened (the demo's core feature would be dead). The server simply <code>accept_offer</code>s the client's offer and obtains the channel via <code>Event::ChannelOpen</code> (§11.8 step 8), then writes each BoxOverlay with <code>rtc.channel(cid).write(false, bytes)</code>. The unordered + zero-retransmit reliability is negotiated over DCEP regardless of which side offers.</p>
 </div>
 
-<pre><code>#[derive(Serialize, Deserialize, Debug, Clone)]
+<pre><code>/// One detected box. `label` is REQUIRED (the LocateAnything-3B reply's
+/// `LabeledBox` is `{label, bbox_norm, bbox_px}` — never unlabeled, never
+/// scored), normalized to [0.0, 1.0]. No `conf`/`score` field: the model
+/// emits none, so the wire carries none.
+#[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
-pub struct BoundingBox {
+pub struct LabeledBox {
+    pub label: String,               // REQUIRED — the box's category/phrase
     pub x1:    f32,                  // normalized [0.0, 1.0]
     pub y1:    f32,
     pub x2:    f32,
     pub y2:    f32,
-    pub label: Option&lt;String&gt;,       // present for detection-class results
-    pub conf:  Option&lt;f32&gt;,          // confidence in [0.0, 1.0]
 }
 
+/// One pointed location from the `point` template. `label` REQUIRED.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
-pub struct Point {
+pub struct LabeledPoint {
+    pub label: String,               // REQUIRED
     pub x:     f32,                  // normalized [0.0, 1.0]
     pub y:     f32,                  // normalized [0.0, 1.0]
-    pub label: Option&lt;String&gt;,       // optional label per LA reply structure
-    pub conf:  Option&lt;f32&gt;,
 }
 
+/// The browser-facing overlay reply, mirroring the LocateAnything-3B
+/// `Response` sum (A.2): exactly one of `boxes` / `points` / `abstained` —
+/// mutually exclusive, exhaustive. Internally tagged on `type`. The LA
+/// `error` variant is NOT carried here: an LA error is forwarded to the
+/// streamer over the signaling WebSocket as `SignalMessage::Error`
+/// (§11.7.1), never over the "boxes" DataChannel.
+///
+/// `frame_id` is on EVERY variant — the latest-wins ordering key (§21.3.1):
+/// a monotonic, server-assigned u64 (the LA-client's per-frame counter,
+/// echoed by LA and stamped onto the overlay). u64 so it never wraps, and —
+/// unlike a 90 kHz source RTP timestamp — it is actually sourceable
+/// end-to-end (the SFU→decode AU channel carries only bytes + the
+/// contiguous flag, NOT MediaData.time, so a meaningful rtp_ts could never
+/// reach the overlay; frame_id serves the ordering need without it).
 #[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(deny_unknown_fields)]
-pub struct BoxMessage {
-    pub frame_id:    u64,            // monotonic, server-assigned per frame (the LA-client's
-                                     // per-frame counter, echoed by LA and stamped onto the box).
-                                     // This is the viewer's "newer-wins" ordering key (§21.3.1):
-                                     // u64 so it never wraps, and — unlike a 90 kHz source RTP
-                                     // timestamp — it is actually sourceable end-to-end. (A source
-                                     // rtp_ts was dropped from this struct: the SFU→decode AU
-                                     // channel carries only bytes + the contiguous flag, NOT
-                                     // MediaData.time, so a meaningful rtp_ts could never reach
-                                     // the box; frame_id serves the ordering need without it.)
-    pub prompt_task: PromptTask,
-    pub abstained:   bool,
-    pub boxes:       Vec&lt;BoundingBox&gt;,
-    /// Point results from the `point` prompt template (PromptTask::Point).
-    /// Empty for all other templates. Distinct from `boxes` because the wire
-    /// format is different: a point is (x, y) in normalized [0.0, 1.0], not
-    /// a rectangle. The WebAssembly client renders points as small crosshairs
-    /// or filled circles, not as bounding rectangles.
-    pub points:      Vec&lt;Point&gt;,
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum BoxOverlay {
+    /// A box-shaped result (detection / phrase / text_grounding /
+    /// scene_text / gui_box). The browser draws rectangles.
+    Boxes     { frame_id: u64, boxes:  Vec&lt;LabeledBox&gt; },
+    /// A `point`-template result. The browser draws crosshairs.
+    Points    { frame_id: u64, points: Vec&lt;LabeledPoint&gt; },
+    /// The model found nothing for this frame. The browser clears the
+    /// overlay (no boxes, no points — the variant carries no geometry at
+    /// all, so an empty overlay is unrepresentable as anything else).
+    Abstained { frame_id: u64 },
+}
+
+impl BoxOverlay {
+    /// The ordering key, present on every variant (§21.3.1).
+    pub fn frame_id(&amp;self) -&gt; u64 {
+        match self {
+            BoxOverlay::Boxes { frame_id, .. }
+            | BoxOverlay::Points { frame_id, .. }
+            | BoxOverlay::Abstained { frame_id } =&gt; *frame_id,
+        }
+    }
 }
 </code></pre>
 
@@ -1621,10 +1664,10 @@ pub struct BoxMessage {
 
 <p>str0m's <code>Channel::write</code> method (verified at <code>/tmp/str0m-src/src/channel.rs:59-77</code>) is <code>#[must_use]</code> and returns <code>Result&lt;bool, RtcError&gt;</code>. The return value distinguishes three cases: <code>Ok(true)</code> means the bytes were accepted by the Stream Control Transmission Protocol stack; <code>Ok(false)</code> means the cross-stream buffer (capped at 128 kibibytes per <code>src/sctp/mod.rs:30</code> for the entire <code>Rtc</code> instance) does not currently have room for this message; <code>Err(...)</code> means the DataChannel is in a bad state.</p>
 
-<p>The Selective Forwarding Unit's BoxMessage fan-out loop handles each case as follows:</p>
+<p>The Selective Forwarding Unit's BoxOverlay fan-out loop handles each case as follows:</p>
 <ol>
   <li><code>Ok(true)</code>: success, continue to next viewer.</li>
-  <li><code>Ok(false)</code>: <strong>log at <code>tracing::warn!</code> and drop the message for this peer</strong>. Do NOT retry, do NOT queue. Justification: BoxMessages are time-stamped and intrinsically stale (the overlay is already 200-500 milliseconds behind the video frame); a buffered, late-delivered BoxMessage would render boxes for a frame the viewer has already moved past, which is worse than no boxes. The peer will see the next successful BoxMessage when buffer drains.</li>
+  <li><code>Ok(false)</code>: <strong>log at <code>tracing::warn!</code> and drop the message for this peer</strong>. Do NOT retry, do NOT queue. Justification: a BoxOverlay is time-stamped and intrinsically stale (the overlay is already 200-500 milliseconds behind the video frame); a buffered, late-delivered overlay would render boxes for a frame the viewer has already moved past, which is worse than no boxes. The peer will see the next successful BoxOverlay when buffer drains.</li>
   <li><code>Err(...)</code>: propagate as <code>anyhow::Error</code> with context up to the SFU actor's per-peer handler, which logs and may transition that peer to <code>Disconnect</code> if the error indicates the DataChannel is permanently bad.</li>
 </ol>
 
@@ -1640,12 +1683,12 @@ pub fn parse_signal_message(json: &amp;str) -&gt; Result&lt;SignalMessage&gt; {
 pub fn serialize_signal_message(msg: &amp;SignalMessage) -&gt; Result&lt;String&gt; {
     serde_json::to_string(msg).context("failed to serialize SignalMessage to JSON")
 }
-pub fn parse_box_message(json: &amp;str) -&gt; Result&lt;BoxMessage&gt; {
+pub fn parse_box_overlay(json: &amp;str) -&gt; Result&lt;BoxOverlay&gt; {
     serde_json::from_str(json)
-        .with_context(|| format!("failed to parse BoxMessage from JSON ({} bytes)", json.len()))
+        .with_context(|| format!("failed to parse BoxOverlay from JSON ({} bytes)", json.len()))
 }
-pub fn serialize_box_message(msg: &amp;BoxMessage) -&gt; Result&lt;String&gt; {
-    serde_json::to_string(msg).context("failed to serialize BoxMessage to JSON")
+pub fn serialize_box_overlay(msg: &amp;BoxOverlay) -&gt; Result&lt;String&gt; {
+    serde_json::to_string(msg).context("failed to serialize BoxOverlay to JSON")
 }
 </code></pre>
 
@@ -1654,11 +1697,14 @@ pub fn serialize_box_message(msg: &amp;BoxMessage) -&gt; Result&lt;String&gt; {
 
 <h3>10.10 Canonical LocateAnything-3B template constants (mirrored from <code>worker/prompts.py</code>)</h3>
 
-<p>The 7 canonical prompt-template strings from <code>/home/user/Desktop/locate_anything_setup/worker/prompts.py</code> are mirrored as compile-time constants in the <code>protocol</code> crate. Verified byte-for-byte against the Python source on 2026-06-01:</p>
+<p>The 7 canonical prompt-template strings from <code>/home/user/Desktop/locate_anything_setup/worker/prompts.py</code> are mirrored as compile-time constants in the <code>protocol</code> crate. Verified byte-for-byte against the Python source on 2026-06-01. <strong>Their role is the boot-time cross-check parity only</strong> (Section 12.2) — the demo's WebAssembly client does NOT concatenate these strings into a prompt; it emits a typed <code>PromptRequest</code> (Section 10.4) and the LocateAnything-3B server compiles the prompt from the same templates. The constants and the drift test below keep the demo's notion of the contract honest against <code>prompts.py</code>; they are not a client-side prompt builder. (In particular <code>CATEGORY_SEPARATOR</code> is parity-only: the client sends detection categories as a <code>Vec&lt;String&gt;</code> in <code>DetectionReq</code>, never a client-joined <code>&lt;/c&gt;</code> string — §23.4 — and the LA server performs the join during compilation.)</p>
 
 <pre><code>// protocol/src/lib.rs
 
-/// Separator used to join multiple categories in a `detection` prompt.
+/// Separator the LocateAnything-3B server uses to join multiple categories
+/// when it compiles a `detection` prompt. Mirrored for the boot cross-check
+/// parity; the demo client never joins with it (categories go on the wire as
+/// a Vec&lt;String&gt; — §23.4).
 /// Source: ../../../worker/prompts.py:58.
 pub const CATEGORY_SEPARATOR: &amp;str = "&lt;/c&gt;";
 
@@ -1730,12 +1776,34 @@ fn canonical_templates_match_prompts_py_byte_for_byte() {
 <p>The <code>include_str!</code> path traverses up three directories: <code>protocol/src/</code> → workspace root <code>website/</code> → parent <code>locate_anything_setup/</code> → <code>worker/prompts.py</code>. If the LocateAnything-3B reference project is relocated, this path breaks at compile-time, which is the desired loud-fail behavior.</p>
 
 <h3>10.11 Where the LocateAnything-3B wire types live</h3>
-<p>The server's connection to the LocateAnything-3B backend is a separate wire protocol defined in the existing reference project. Per <code>/home/user/Desktop/locate_anything_setup/docs/CLIENT_PROTOCOL.md</code>:</p>
+<p>The server's connection to the LocateAnything-3B backend is a separate, strongly-typed wire protocol defined in the existing reference project. The demo server's LA-client is a pure consumer of it. Per <code>/home/user/Desktop/locate_anything_setup/docs/CLIENT_PROTOCOL.md</code> and <code>rust_server/src/protocol.rs</code>:</p>
 <ul>
   <li><strong>Frame format:</strong> binary WebSocket message containing <code>[4-byte big-endian unsigned 32-bit length of header][JSON header bytes][JPEG body bytes]</code>.</li>
-  <li><strong>JSON header fields:</strong> <code>frame_id</code>, <code>prompt</code>, <code>generation_mode</code>, <code>jpeg_len</code>. Verified against <code>/home/user/Desktop/locate_anything_setup/rust_server/src/protocol.rs:36-54</code>.</li>
-  <li><strong>Reply:</strong> JSON text message. Examples: <code>{"type":"result","frame_id":...,"detections":[{"bbox_px":[...],"label":...,"score":...}, ...],"points":[...],"abstained":...,"latency_ms":...,"raw_text":"...","prompt_task":"...","model_output_truncated":...}</code> or <code>{"type":"error","frame_id":...,"code":"...","message":"..."}</code>.</li>
-  <li><strong>Coordinate space in LA's reply:</strong> LA returns <code>bbox_px</code> in pixel coordinates of the source frame and <code>bbox_norm</code> in the [0, 1000] integer grid (per verified reading of <code>/home/user/Desktop/locate_anything_setup/worker/parsing.py:103, 154, 294</code>). Our demo server <strong>converts to the [0.0, 1.0] floating-point grid</strong> before forwarding to WebAssembly clients via DataChannel. Specifically: <code>x1 = bbox_norm[0] as f32 / 1000.0_f32</code>.</li>
+  <li><strong>JSON header (typed request):</strong> <code>{ "frame_id":"f-1", "request":{ "task":"detection", "categories":["drone","bird"] }, "generation_mode":"slow", "jpeg_len":300456 }</code>. The header carries a typed <code>request</code> — a <code>PromptRequest</code> sum internally tagged on <code>task</code> (one of <code>detection</code> | <code>phrase_single</code> | <code>phrase_multi</code> | <code>text_grounding</code> | <code>scene_text</code> | <code>gui_box</code> | <code>point</code>, each with its own typed slot) — and a typed <code>generation_mode</code>. The demo server forwards the <code>ClaimMsg.request</code> (§10.6) verbatim as this <code>request</code>; it never builds a prompt string. Verified against <code>/home/user/Desktop/locate_anything_setup/rust_server/src/protocol.rs</code> <code>InferHeader</code>/<code>PromptRequest</code>.</li>
+  <li><strong>Reply (flat tagged union on <code>type</code>):</strong> the LocateAnything-3B server replies with exactly one of four variants — <code>boxes</code> XOR <code>points</code> XOR <code>abstained</code> XOR <code>error</code> — and the wire makes every other state unrepresentable (no <code>detections</code>+<code>points</code>-both, no <code>abstained</code> boolean, no <code>off_shape_count</code>, no <code>prompt_task</code> echo, and no <code>score</code>/<code>conf</code> field — <code>LabeledBox</code> is <code>{label, bbox_norm, bbox_px}</code> only, <code>label</code> required):
+    <pre><code>{ "type":"boxes", "frame_id":"f-1",
+  "boxes":[ {"label":"drone","bbox_norm":[420,510,560,640],"bbox_px":[806.4,550.8,1075.2,691.2]} ],
+  "raw_text":"…","model_output_truncated":false,"deviations_dropped":0,"image_size":[1920,1080],
+  "resize_plan":{"dst_w":1932,"dst_h":1092,"n_llm_tokens":2691,"scale":1.006},
+  "generation_mode_used":"slow","latency_ms":812.4,"total_ms":821.0 }
+
+{ "type":"points","frame_id":"f-2",
+  "points":[ {"label":"drone in the sky","point_norm":[500,300],"point_px":[960.0,324.0]} ], … }
+
+{ "type":"abstained","frame_id":"f-3", … }   // no geometry at all
+
+{ "type":"error","frame_id":"f-4",
+  "code":"invalid_request"|"invalid_image"|"model_deviation"|"internal", "message":"…" }</code></pre>
+  </li>
+  <li><strong>The LA-client <code>match</code>es the tag and needs no defensive parsing.</strong> Because the LocateAnything-3B wire is strict (illegal states unrepresentable), the consumer does not re-validate field combinations — it deserializes into the typed reply and <code>match</code>es <code>type</code> exactly once, mapping each variant to the demo's own browser message:
+    <ul>
+      <li><code>boxes</code> → build <code>BoxOverlay::Boxes</code> (normalize each <code>bbox_norm</code> to [0.0, 1.0]) → <code>FsmCommand::LaBoxResult</code> → DataChannel fan-out (§11.7.1).</li>
+      <li><code>points</code> → build <code>BoxOverlay::Points</code> (normalize each <code>point_norm</code>) → <code>FsmCommand::LaBoxResult</code> → fan-out.</li>
+      <li><code>abstained</code> → build <code>BoxOverlay::Abstained { frame_id }</code> → <code>FsmCommand::LaBoxResult</code> → fan-out (browsers clear the overlay).</li>
+      <li><code>error</code> → <code>FsmCommand::LaErrorResult { frame_id, code, message }</code> → the FSM forwards <code>SignalMessage::Error</code> to the streamer over the signaling WebSocket (§11.7.1, §23.9), NOT over the boxes channel.</li>
+    </ul>
+    The <code>meta</code> fields (<code>raw_text</code>, <code>model_output_truncated</code>, <code>deviations_dropped</code>, <code>image_size</code>, <code>resize_plan</code>, <code>latency_ms</code>, <code>total_ms</code>, <code>generation_mode_used</code>) are not needed by the overlay and are dropped at this hop; <code>deviations_dropped &gt; 0</code> may be logged for observability but is non-fatal (the LA worker already kept the valid geometry).</li>
+  <li><strong>Coordinate space in LA's reply:</strong> LA returns <code>bbox_px</code> in pixel coordinates of the source frame and <code>bbox_norm</code> in the [0, 1000] integer grid (<code>u16</code>; per <code>rust_server/src/protocol.rs::LabeledBox</code> and the worker's <code>parsing.py</code> clamp to [0,1000]). The demo server <strong>converts to the [0.0, 1.0] floating-point grid</strong> before forwarding to WebAssembly clients via DataChannel. Specifically: <code>x1 = bbox_norm[0] as f32 / 1000.0_f32</code> (and likewise <code>point_norm</code> for points).</li>
   <li><strong>Stop-and-wait per WebSocket connection.</strong> The LA server only handles one outstanding frame at a time per WebSocket. To get more concurrency, open more WebSockets; but for our use case one connection is enough — the architecture is single-streamer (Section 11) so there is only ever one inference stream, and the natural-pace pipeline (Section 19.1) is intrinsically one-frame-in-flight regardless of LA's per-frame latency.</li>
 </ul>
 
@@ -1761,7 +1829,7 @@ fn canonical_templates_match_prompts_py_byte_for_byte() {
 <h3>11.2 Transition triggers and timeouts</h3>
 <table>
   <tr><th>From → To</th><th>Trigger</th><th>Timeout</th></tr>
-  <tr><td>Idle → Claimed</td><td>Valid <code>SignalMessage::Claim</code> with valid prompt + generation_mode received over /v1/signal</td><td>n/a (immediate transition on receive)</td></tr>
+  <tr><td>Idle → Claimed</td><td>Valid <code>SignalMessage::Claim</code> with a typed <code>request</code> + generation_mode received over /v1/signal</td><td>n/a (immediate transition on receive)</td></tr>
   <tr><td>Claimed → Streaming</td><td>First Real-time Transport Protocol packet received from the claimer's WebRTC peer</td><td>n/a (immediate)</td></tr>
   <tr><td>Claimed → Draining</td><td>No Real-time Transport Protocol from claimer within 10 seconds of accept</td><td>10 seconds (<code>CLAIM_TIMEOUT</code>)</td></tr>
   <tr><td>Streaming → Draining</td><td>WebSocket close from streamer; OR no Real-time Transport Protocol from streamer for 5 seconds; OR <code>IceConnectionStateChange::Disconnected</code> event from str0m; OR signaling-WebSocket keepalive miss (see below); OR explicit <code>Bye</code> from streamer; OR <code>FsmCommand::LaDown</code> while in Streaming (Section 19.4)</td><td>5 seconds RTP gap (<code>RTP_TIMEOUT</code>); ~21.5 seconds ICE consent freshness (str0m's reduced timeout vs RFC 7675's nominal 30 s; see Section 20.11); 30 seconds signaling-WS keepalive (<code>KEEPALIVE_TIMEOUT</code>)</td></tr>
@@ -1835,7 +1903,7 @@ let decode_thread = std::thread::Builder::new()
     .spawn(move || run_decode_pipeline(au_rx, rgb_tx, fsm_tx.clone()))
     .context("spawn decode OS thread")?;
 
-let la_h = tokio::spawn(run_la_client(rgb_rx, fsm_tx.clone(), /* la host:port, prompt, mode */ /* ... */));
+let la_h = tokio::spawn(run_la_client(rgb_rx, fsm_tx.clone(), /* la host:port, request, mode */ /* ... */));
 </code></pre>
 
 <p>The run task:</p>
@@ -1914,9 +1982,9 @@ let la_h = tokio::spawn(run_la_client(rgb_rx, fsm_tx.clone(), /* la host:port, p
 <p>Three WebSocket handler tasks (one per peer A, B, C) all send <code>FsmCommand::Claim { ... }</code> at the same moment. The exact serialization sequence is below. Each <code>cmd = rx.recv() =&gt;</code> branch is fully synchronous from receive to <code>reply.send(...)</code> — no <code>.await</code> point inside — so the next select! iteration cannot start until <code>handle</code> returns:</p>
 
 <pre><code>// Wire-clock: t=0
-// Task-A sends FsmCommand::Claim{ peer_id: A, prompt: pA, reply: oA } → mpsc
-// Task-B sends FsmCommand::Claim{ peer_id: B, prompt: pB, reply: oB } → mpsc
-// Task-C sends FsmCommand::Claim{ peer_id: C, prompt: pC, reply: oC } → mpsc
+// Task-A sends FsmCommand::Claim{ peer_id: A, request: rA, reply: oA } → mpsc
+// Task-B sends FsmCommand::Claim{ peer_id: B, request: rB, reply: oB } → mpsc
+// Task-C sends FsmCommand::Claim{ peer_id: C, request: rC, reply: oC } → mpsc
 // Per tokio mpsc bounded.rs:118-119, the receive order matches the send
 // order (whatever it was at the channel level; assume A, B, C).
 
@@ -2150,7 +2218,7 @@ pub struct Sfu {
     /// A peer wants to become the streamer.
     Claim {
         peer_id:         PeerId,
-        prompt:          String,
+        request:         protocol::PromptRequest,   // typed request (§10.4), not a prompt string
         generation_mode: protocol::GenerationMode,
         reply:           tokio::sync::oneshot::Sender&lt;ClaimResult&gt;,
     },
@@ -2197,12 +2265,13 @@ pub struct Sfu {
     /// Toggle the reachability bit back to true. Does NOT auto-restore
     /// any previous streamer; users must re-claim.
     LaUp,
-    /// A bounding-box result has arrived from the LocateAnything-3B server.
-    /// The FSM dispatches it to every connected peer's "boxes" DataChannel —
-    /// streamer AND viewers (the streamer needs overlays on their own video
-    /// too). The handler `on_la_box_message` in this module performs the
-    /// fan-out.
-    LaBoxResult { msg: protocol::BoxMessage },
+    /// An overlay result (boxes / points / abstained) has arrived from the
+    /// LocateAnything-3B server. The FSM dispatches it to every connected
+    /// peer's "boxes" DataChannel — streamer AND viewers (the streamer needs
+    /// overlays on their own video too). The handler `on_la_box_overlay` in
+    /// this module performs the fan-out. (The LA `error` variant does NOT
+    /// arrive as this command — it arrives as `LaErrorResult` below.)
+    LaBoxResult { overlay: protocol::BoxOverlay },
     /// A prompt-rejection or other recoverable error has arrived from the
     /// LocateAnything-3B server for a specific frame. The FSM forwards it
     /// to the streamer as `SignalMessage::Error { code: "prompt_rejected", ... }`;
@@ -2406,8 +2475,8 @@ fn request_pli_from_streamer(streamer: &amp;mut Client, streamer_video_mid: Mid)
         // can interleave a second Claim between the check and the set.
         // All awaiting (UDP send, channel writes) lives OUTSIDE handle().
         match cmd {
-            FsmCommand::Claim { peer_id, prompt, generation_mode, reply } =&gt; {
-                let result = self.handle_claim(peer_id, prompt, generation_mode);
+            FsmCommand::Claim { peer_id, request, generation_mode, reply } =&gt; {
+                let result = self.handle_claim(peer_id, request, generation_mode);
                 let _ = reply.send(result);  // WS handler may have dropped Receiver; harmless
             }
             FsmCommand::ResumeSession { peer_id, session_id, reply } =&gt; {
@@ -2486,8 +2555,8 @@ fn request_pli_from_streamer(streamer: &amp;mut Client, streamer_video_mid: Mid)
                 self.la_reachable  = true;
                 self.la_last_error = None;
             }
-            FsmCommand::LaBoxResult { msg } =&gt; {
-                self.on_la_box_message(&amp;msg)?;
+            FsmCommand::LaBoxResult { overlay } =&gt; {
+                self.on_la_box_overlay(&amp;overlay)?;
             }
             FsmCommand::LaErrorResult { frame_id, code, message } =&gt; {
                 self.on_la_error_result(frame_id, code, message)?;
@@ -2568,16 +2637,16 @@ fn request_pli_from_streamer(streamer: &amp;mut Client, streamer_video_mid: Mid)
 
 <p><strong>Policy on <code>signal_tx.try_send</code> failure.</strong> The per-peer outbound mpsc to the WebSocket handler has capacity 32 (Section 11.5). On <code>Err(TrySendError::Full)</code> OR <code>Err(TrySendError::Closed)</code>, the FSM logs at <code>tracing::warn!</code> AND immediately calls <code>client.rtc.disconnect()</code> on that peer's Rtc. <strong>Rationale:</strong> a Full mpsc means the peer's WS handler task is not draining its Receiver — either it is stuck on a blocked socket write (a frozen browser tab; cellular outage; etc.) or its task has stalled. A Closed mpsc means the WS handler has already exited. Either way the peer is dead on the wire; immediately disconnecting the Rtc triggers the standard cleanup path on the next select iteration (<code>FsmCommand::Disconnect</code> arrives from the WS handler's exit, OR the next UDP-receive tick observes <code>!rtc.is_alive()</code> and culls the Client). This is fail-loud per Section 3 — no consecutive-failure counter, no retry budget, no silent absorption.</p>
 
-<h3>11.7.1 BoxMessage fan-out handler — load-bearing for overlay rendering</h3>
+<h3>11.7.1 BoxOverlay fan-out handler — load-bearing for overlay rendering</h3>
 
-<p>The LocateAnything-3B WebSocket client task (Section 12.1 item 4) receives JSON replies from the LA server and forwards them to the FSM via <code>FsmCommand::LaBoxResult { msg: protocol::BoxMessage }</code>. The FSM's handler fans the BoxMessage out to <strong>every connected peer's "boxes" DataChannel</strong> — including the streamer (so the streamer sees overlays on their own video per Section 21.2) AND every viewer.</p>
+<p>The LocateAnything-3B WebSocket client task (Section 12.1 item 4) <code>match</code>es the typed LA reply (§10.11): a <code>boxes</code>/<code>points</code>/<code>abstained</code> variant becomes a <code>BoxOverlay</code> and is forwarded to the FSM via <code>FsmCommand::LaBoxResult { overlay: protocol::BoxOverlay }</code>; an <code>error</code> variant becomes <code>FsmCommand::LaErrorResult</code> instead (handled below, over the signaling WebSocket, never the boxes channel). The FSM's handler fans the BoxOverlay out to <strong>every connected peer's "boxes" DataChannel</strong> — including the streamer (so the streamer sees overlays on their own video per Section 21.2) AND every viewer.</p>
 
 <pre><code>use anyhow::{Context, Result};
 use str0m::channel::ChannelId;
 use tracing::warn;
 
 impl Sfu {
-    /// Fan out one BoxMessage to every connected peer's "boxes" DataChannel.
+    /// Fan out one BoxOverlay to every connected peer's "boxes" DataChannel.
     /// Unlike `on_streamer_media_data` (which excludes the streamer from
     /// fan-out because video flows ONLY streamer→viewers), the box fan-out
     /// includes every peer — the streamer needs overlays on their own video
@@ -2585,11 +2654,12 @@ impl Sfu {
     ///
     /// Per-peer failures are isolated. `Channel::write` returning `Ok(false)`
     /// means SCTP send-buffer pressure; we drop-and-log the message rather
-    /// than retry (a late box is stale and worse than no box). `Err(...)`
-    /// disconnects that peer's Rtc.
-    fn on_la_box_message(&amp;mut self, msg: &amp;protocol::BoxMessage) -&gt; Result&lt;()&gt; {
-        let payload = protocol::serialize_box_message(msg)
-            .context("serialize BoxMessage for DataChannel fan-out")?;
+    /// than retry (a late overlay is stale and worse than no overlay).
+    /// `Err(...)` disconnects that peer's Rtc.
+    fn on_la_box_overlay(&amp;mut self, overlay: &amp;protocol::BoxOverlay) -&gt; Result&lt;()&gt; {
+        let payload = protocol::serialize_box_overlay(overlay)
+            .context("serialize BoxOverlay for DataChannel fan-out")?;
+        let frame_id = overlay.frame_id();
         for client in self.clients.iter_mut() {
             if !client.rtc.is_alive() {
                 continue;
@@ -2611,8 +2681,8 @@ impl Sfu {
             match channel.write(false, payload.as_bytes()) {
                 Ok(true)  =&gt; {}
                 Ok(false) =&gt; {
-                    warn!(client_id = %client.id, frame_id = msg.frame_id,
-                          "DataChannel buffer full; dropping BoxMessage (peer link too slow; box is stale anyway)");
+                    warn!(client_id = %client.id, frame_id,
+                          "DataChannel buffer full; dropping BoxOverlay (peer link too slow; overlay is stale anyway)");
                 }
                 Err(e) =&gt; {
                     warn!(client_id = %client.id, error = ?e,
@@ -2656,7 +2726,7 @@ impl Sfu {
 }
 </code></pre>
 
-<p>Wire-format note: BoxMessages flow over the DataChannel as JSON text frames (Section 10.7). The fan-out site above passes <code>payload.as_bytes()</code> with the binary flag <code>false</code>, which str0m maps to a text SCTP message. The DataChannel is configured (Section 10.7) with <code>ordered: false, reliability: Reliability::MaxRetransmits { retransmits: 0 }</code> — unreliable and unordered — so SCTP sends each datagram once and never retransmits, eliminating head-of-line blocking for stale boxes.</p>
+<p>Wire-format note: each BoxOverlay flows over the DataChannel as a JSON text frame (Section 10.7). The fan-out site above passes <code>payload.as_bytes()</code> with the binary flag <code>false</code>, which str0m maps to a text SCTP message. The DataChannel is configured (Section 10.7) with <code>ordered: false, reliability: Reliability::MaxRetransmits { retransmits: 0 }</code> — unreliable and unordered — so SCTP sends each datagram once and never retransmits, eliminating head-of-line blocking for stale overlays.</p>
 
 <h3>11.8 Reconnect — server-side state model when a peer's <code>Rtc</code> is replaced</h3>
 
@@ -2728,7 +2798,7 @@ let _ = self.phase_tx.send(self.phase.kind());</code></pre>
 
 <ul>
   <li><strong>The <code>MediaAdded</code> window:</strong> between <code>Rtc::builder()...build()</code> and the first <code>Event::MediaAdded</code>, <code>video_mid</code> is <code>None</code>. The forwarder MUST skip the peer during this window (handled by the <code>let Some(viewer_mid) = ... else { continue; }</code> guard in Section 11.7).</li>
-  <li><strong>The <code>ChannelOpen</code> window:</strong> after the new Rtc is constructed and the client has offered the boxes channel (§10.7), that channel is unusable until <code>Event::ChannelOpen</code> fires. <code>rtc.channel(cid)</code> returns <code>None</code> until then. The box-dispatch loop MUST skip a peer whose <code>boxes_cid</code> is <code>None</code>. BoxMessages generated for this peer during the window are dropped (a single peer in mid-reconnect would otherwise hold up the inference pipeline; dropping is strict-correctness for this transient state).</li>
+  <li><strong>The <code>ChannelOpen</code> window:</strong> after the new Rtc is constructed and the client has offered the boxes channel (§10.7), that channel is unusable until <code>Event::ChannelOpen</code> fires. <code>rtc.channel(cid)</code> returns <code>None</code> until then. The box-dispatch loop MUST skip a peer whose <code>boxes_cid</code> is <code>None</code>. Overlays generated for this peer during the window are dropped (a single peer in mid-reconnect would otherwise hold up the inference pipeline; dropping is strict-correctness for this transient state).</li>
   <li><strong>SCTP stream-id cooldown</strong> (irrelevant to our reconnect path but worth knowing): when a channel is closed, str0m holds its stream id in a 2-second cooldown (<code>/tmp/str0m-src/src/channel.rs:193, 369-372</code>). This affects close-then-immediately-reopen patterns on the SAME <code>Rtc</code>; in our reconnect path the whole <code>Rtc</code> is dropped, so the cooldown is irrelevant.</li>
   <li><strong>Viewers' <code>Rtc</code> instances are unaffected by the streamer's reconnect.</strong> Each <code>Rtc</code> is an independent state machine with no shared state (verified by source-level review of <code>/tmp/str0m-src/src/lib.rs:869-891</code>). When the streamer reconnects, viewers' Rtcs keep polling normally; the forwarder simply has nothing to feed into them for the brief gap. No viewer-side signaling action is needed; viewers do NOT re-negotiate their own Session Description Protocol.</li>
   <li><strong>Picture Loss Indication after reconnect:</strong> as soon as the new streamer's <code>MediaAdded</code> arrives, the SFU should call <code>request_pli_from_streamer(streamer_video_mid)</code> (Section 11.7) so the streamer's encoder emits a keyframe; viewers' decoders pick up the stream cleanly. PLI emission is fully event-driven (Section 20.6); the new Rtc is a fresh state machine and any prior in-flight requests on the old Rtc are dropped with it.</li>
@@ -2745,7 +2815,7 @@ let _ = self.phase_tx.send(self.phase.kind());</code></pre>
   <li><strong>Signal handler task</strong>: spawns a Tokio task that calls <code>tokio::select! { _ = tokio::signal::ctrl_c() =&gt; ..., _ = tokio::signal::unix::signal(SignalKind::terminate())?.recv() =&gt; ... }</code> and notifies the shutdown <code>Arc&lt;tokio::sync::Notify&gt;</code> on either signal.</li>
   <li><strong>Authentication rate-limit garbage-collection task</strong>: on a 60-second tokio::time::interval, calls <code>RateLimiter::retain_recent()</code> on the per-IP rate limiter to evict entries whose buckets have fully refilled.</li>
   <li><strong>Cert-expiry re-check task</strong>: on a 6-hour <code>tokio::time::interval</code>, re-parses the live <code>cert.pem</code> at <code>STATE_DIR/cert.pem</code> via <code>x509-parser</code> and re-runs the §14.5 three-band check against <code>SystemTime::now()</code>. <strong>If the cert has crossed into the &lt;30-day-from-expiry band</strong>, log a WARN identical to the boot-time WARN (idempotent — operator sees the same message every 6 hours regardless of how many days have elapsed). <strong>If the cert has crossed into the &lt;7-day-from-expiry band</strong>, log an ERROR at every interval AND flip a process-local <code>cert_expiring_soon: AtomicBool</code> flag that <code>/v1/health</code> reads and reports as <code>status: "degraded"</code>. The binary does NOT self-exit (existing TLS sessions stay valid); the operator monitoring <code>/v1/health</code> or <code>docker logs</code> gets a continuous loud signal. <strong>If the cert is past <code>notAfter</code></strong>, the same flag is set, plus <code>cert_valid: false</code> is reported in <code>/v1/health</code>. This closes the silent-stall window in which a binary that started with 7–30 days of cert remaining keeps running through expiry without proactive logging. The 6-hour cadence is generous (the band crossings only happen once every ~27 months in normal operation); not perf-coupled.</li>
-  <li><strong>LocateAnything-3B WebSocket client task</strong>: maintains a reconnecting <code>tokio-tungstenite</code> connection to <code>ws://&lt;la-host&gt;:&lt;la-port&gt;/v1/stream</code>; reads the latest RGB frame from a <code>tokio::sync::watch::Receiver&lt;Option&lt;RgbFrame&gt;&gt;</code> via the canonical <code>changed().await</code> + <code>borrow_and_update()</code> idiom; encodes JPEG via <code>mozjpeg::Compress</code> at quality 92 per the knob discipline in Section 19.2; writes frame headers + JPEG body per the LA wire format; reads one JSON reply (stop-and-wait per LA's enforcement); emits <code>FsmCommand::LaBoxResult { msg: BoxMessage }</code> on <code>type:"result"</code> replies, <code>FsmCommand::LaErrorResult { frame_id, code, message }</code> on <code>type:"error"</code> replies, <code>FsmCommand::LaDown { error }</code> on WebSocket-drop, and <code>FsmCommand::LaUp</code> on reconnect-success into the FSM. LA's per-frame latency is the natural sampling cadence; the loop runs forever as fast as LA can chew through frames.</li>
+  <li><strong>LocateAnything-3B WebSocket client task</strong>: maintains a reconnecting <code>tokio-tungstenite</code> connection to <code>ws://&lt;la-host&gt;:&lt;la-port&gt;/v1/stream</code>; reads the latest RGB frame from a <code>tokio::sync::watch::Receiver&lt;Option&lt;RgbFrame&gt;&gt;</code> via the canonical <code>changed().await</code> + <code>borrow_and_update()</code> idiom; encodes JPEG via <code>mozjpeg::Compress</code> at quality 92 per the knob discipline in Section 19.2; writes the typed request header + JPEG body per the LA wire format (§10.11); reads one JSON reply (stop-and-wait per LA's enforcement) and <code>match</code>es its <code>type</code> tag with no defensive parsing (the LA wire is strict): <code>boxes</code>/<code>points</code>/<code>abstained</code> → <code>FsmCommand::LaBoxResult { overlay: BoxOverlay }</code>, <code>error</code> → <code>FsmCommand::LaErrorResult { frame_id, code, message }</code>, <code>FsmCommand::LaDown { error }</code> on WebSocket-drop, and <code>FsmCommand::LaUp</code> on reconnect-success into the FSM. LA's per-frame latency is the natural sampling cadence; the loop runs forever as fast as LA can chew through frames.</li>
   <li><strong>Selective Forwarding Unit actor task</strong>: see <a href="#sec-fsm">Section 11</a>. Owns the UDP socket and the <code>Vec&lt;Client&gt;</code>. Drives <code>str0m::Rtc</code> instances. Handles own-STUN binding-request demultiplexing. Pushes every streamer-video <code>MediaData</code> access unit into a bounded <code>tokio::sync::mpsc::channel(256)</code> toward the decode-pipeline thread in arrival order — no coalescing.</li>
   <li><strong>Decode pipeline — a DEDICATED OS thread (<code>std::thread</code>), NOT a tokio task</strong>: the libswscale <code>software::scaling::Context</code> it owns is <code>!Send</code> in ffmpeg-next 7.1.0 (no <code>unsafe impl Send</code> — the decoder/frame/packet types ARE <code>Send</code>, only the scaler is not), so it cannot be held across a tokio <code>.await</code>; and per Tokio's own guidance a persistent CPU-bound loop belongs on a dedicated thread, not a runtime worker (Section 11.3). It bridges the bounded AU mpsc with <code>blocking_recv()</code> and drains access units in arrival order; holds ONE long-lived <code>ffmpeg-next 7.1.0</code> H.264 decoder <code>Context</code> for the session; libavcodec maintains the H.264 reference chain across P-frames and naturally suppresses output until <code>recovered=true</code> after the first IDR (verified at upstream <code>libavcodec/h264_slice.c:1376-1383</code>). It decodes EVERY access unit (preserving the reference chain), runs the long-lived <code>scaling::Context</code> (BICUBIC, BT.709 limited→full per Section 19.3, rebuilt only on a frame-dimensions change) YUV→RGB24 on each decoded frame, and publishes the RGB to <code>watch::Sender&lt;Option&lt;RgbFrame&gt;&gt;</code>; the 1-slot watch coalesces, so the LA client samples only the freshest frame at its own ~1.3 fps pace while intervening frames are overwritten. On <code>MediaData.contiguous == false</code> (the flag rides the AU channel as part of <code>DecodeAu</code>): calls <code>decoder.flush()</code> AND signals the FSM (<code>blocking_send</code>) to emit one event-driven <code>KeyframeRequestKind::Pli</code>. JPEG encoding still lives in the LA client task (Section 12.1 list item 4).</li>
   <li><strong>Per-HTTP-connection task</strong>: spawned automatically by <code>axum_server</code>'s underlying hyper service. Each one handles one HTTP request, or upgrades to a long-lived WebSocket. WebSocket handler tasks (the <code>/v1/signal</code> upgrade route) drive a per-peer state machine on top of the FsmCommand channel:
@@ -2760,7 +2830,7 @@ let _ = self.phase_tx.send(self.phase.kind());</code></pre>
           <li><code>Keepalive</code> → reply <code>SignalMessage::Keepalive {}</code>.</li>
         </ul>
       </li>
-      <li>On the receiving side from the FSM: a per-peer <code>tokio::sync::mpsc::Receiver&lt;SignalMessage&gt;</code> (the FSM sends BoxMessage-equivalent error replies, ResumeOk/Expired, etc.). The WS handler forwards these to the WebSocket as JSON text frames.</li>
+      <li>On the receiving side from the FSM: a per-peer <code>tokio::sync::mpsc::Receiver&lt;SignalMessage&gt;</code> (the FSM sends Error replies, ResumeOk/Expired, etc.). The WS handler forwards these to the WebSocket as JSON text frames.</li>
       <li>On WS close (peer closed, network error, or our own shutdown): the handler sends <code>FsmCommand::Disconnect { peer_id, reason, intentional: false }</code> with a chained-anyhow context describing the reason (peer 1000/1001-close, network error, keepalive timeout, etc.). A raw socket close — even a clean 1000 — is treated as an UNINTENTIONAL drop (30 s resume-eligible for the streamer, covering a handover); intentionality is signaled ONLY by an explicit <code>SignalMessage::Bye</code> (the arm above, which sets <code>intentional: true</code>). The handler then returns from the task.</li>
       <li>On shutdown notification (<code>state.shutdown.notified()</code>): send <code>SignalMessage::Bye {}</code>, close WS with code 1001 (Going Away), return.</li>
       <li>Auth has already been validated at upgrade time (Section 17.5); the handler does not re-check.</li>
@@ -2776,7 +2846,7 @@ let _ = self.phase_tx.send(self.phase.kind());</code></pre>
 <ol>
   <li><code>response.prompt_templates_reference_url</code> exists and equals <code>protocol::EXPECTED_LA_PROMPT_TEMPLATES_REFERENCE_URL</code> (currently <code>"https://github.com/BigBIueWhale/locate_anything_setup/blob/main/worker/prompts.py"</code>). Mismatch indicates the operator pointed the demo server at a fork or future LocateAnything-3B version that may have different templates.</li>
   <li><code>response.supported_generation_modes</code> is a JSON array and contains each of <code>"fast"</code>, <code>"hybrid"</code>, <code>"slow"</code>. Missing any of these means the demo's per-template hardcoded modes (Section 23.2) cannot all be served.</li>
-  <li><code>response.preset_prompts</code> is a non-empty JSON object. (Sanity check that the LocateAnything-3B server is the expected build at all.)</li>
+  <li><code>response.preset_prompts</code> is a non-empty JSON object. (Sanity check that the LocateAnything-3B server is the expected build at all.) Each preset advertises a <em>typed</em> <code>PromptRequest</code> now — e.g. <code>{"label":"drone (point)","request":{"task":"point","phrase":"drone in the sky"},"generation_mode":"slow"}</code> (A.5) — consistent with the typed request wire; a client can drop a preset's <code>request</code> + <code>generation_mode</code> straight into a <code>ClaimMsg</code>. The cross-check only asserts non-emptiness; the prompt-builder UI (Section 23) does not depend on the preset list.</li>
   <li><code>response.model</code> equals <code>"nvidia/LocateAnything-3B"</code>. (Sanity check against accidentally pointing at a different model.)</li>
 </ol>
 
@@ -4229,8 +4299,13 @@ LA WebSocket client task (the natural-rate driver):
       jpeg_rx.changed().await?;                          // park if no new frame
       let frame   = jpeg_rx.borrow_and_update().clone(); // latest wins
       let jpeg    = mozjpeg_encode_q92(&amp;frame)?;         // see Section 19.2
-      let header  = LaInferHeader { frame_id, prompt, generation_mode,
-                                    jpeg_len: jpeg.len() };
+      // The LA InferHeader carries the TYPED request (§10.11) — the streamer's
+      // ClaimMsg.request, forwarded verbatim; the demo never builds a prompt
+      // string. frame_id is the demo's own monotonic u64 counter, stringified
+      // for the LA wire (LA's frame_id is a String) and echoed back unchanged.
+      frame_id += 1;
+      let header  = LaInferHeader { frame_id: frame_id.to_string(), request,
+                                    generation_mode, jpeg_len: jpeg.len() };
       let mut wire = Vec::with_capacity(4 + header_json.len() + jpeg.len());
       wire.extend_from_slice(&amp;(header_json.len() as u32).to_be_bytes());
       wire.extend_from_slice(&amp;header_json);
@@ -4238,9 +4313,12 @@ LA WebSocket client task (the natural-rate driver):
       ws.send(Message::Binary(wire.into())).await?;
       let reply = ws.next().await
           .ok_or_else(|| anyhow!("LA closed mid-frame"))??;
-      // Dispatch reply to FSM (Section 11.7.1's fan-out path):
-      //   type:"result" -&gt; FsmCommand::LaBoxResult { msg: BoxMessage }
-      //   type:"error"  -&gt; FsmCommand::LaErrorResult { frame_id, code, message }
+      // Deserialize into the typed LA reply and match its `type` tag — no
+      // defensive field-combination checks (the LA wire is strict, §10.11).
+      // Dispatch to FSM (Section 11.7.1's fan-out path), stamping the demo's
+      // own u64 frame_id onto the BoxOverlay:
+      //   boxes|points|abstained -&gt; FsmCommand::LaBoxResult { overlay: BoxOverlay }
+      //   error                  -&gt; FsmCommand::LaErrorResult { frame_id, code, message }
   }
 </code></pre>
 
@@ -4813,7 +4891,7 @@ There is therefore no cross-peer cascade to defend against: because each <code>R
 <p>Streamer HUD content (overlaid on the video, top-right corner; auto-hides after 3 seconds of inactivity, re-shows on any pointer/touch event):</p>
 <ul>
   <li>A small pill showing running-median round-trip-time in milliseconds (the same value the Section 21.2 streamer-path overlay's RTT badge already shows).</li>
-  <li>A small pill showing the most recent detection count from the latest BoxMessage.</li>
+  <li>A small pill showing the most recent detection count from the latest BoxOverlay.</li>
   <li>A bottom-center "Release ownership" button (48 × 48 CSS-pixel minimum tap target — see 21.0.12).</li>
 </ul>
 
@@ -5110,13 +5188,13 @@ fn App() -&gt; impl IntoView {
 
 <p>Because these are independent paths, slow LA inference does NOT slow the live video stream, and fast video does NOT speed up the boxes. The user's stated goals — "video to viewers ASAP without stutter, boxes for the streamer ASAP" — are met by keeping the two flows architecturally separate, which they already are.</p>
 
-<p>The user has explicitly granted that boxes do NOT need to be displayed on the exact video frame they were inferred from: <em>"no need for the bounding boxes to come in at the same time as the frame being presented."</em> The plan honors this with a <strong>latest-wins overlay</strong>: every browser (streamer and viewer alike) draws the most recent BoxMessage on whatever frame is currently being presented. The box always represents a scene ~one inference cycle in the past relative to the live video on screen; this is irreducible (physics) and consistent with the user's framing.</p>
+<p>The user has explicitly granted that boxes do NOT need to be displayed on the exact video frame they were inferred from: <em>"no need for the bounding boxes to come in at the same time as the frame being presented."</em> The plan honors this with a <strong>latest-wins overlay</strong>: every browser (streamer and viewer alike) draws the most recent BoxOverlay on whatever frame is currently being presented. The box always represents a scene ~one inference cycle in the past relative to the live video on screen; this is irreducible (physics) and consistent with the user's framing.</p>
 
 <dl>
   <dt>Streamer path</dt>
-  <dd>The user's own browser captures via <code>getUserMedia</code>; the resulting MediaStream is assigned to a local <code>&lt;video&gt;</code> element via <code>HtmlMediaElement::set_src_object</code>. Display latency is essentially zero (browser-internal pipeline). The bounding-box overlay is drawn via <code>requestAnimationFrame</code> (NOT rVFC — rVFC's <code>metadata.rtpTimestamp</code> is absent for local <code>getUserMedia</code> tracks per WICG video-rvfc spec, since local sources have no RTP timeline). On each RAF tick the canvas reads <code>latest_box</code> via <code>RwSignal::with_untracked</code> (no Leptos reactive subscription — pure pull) and renders the most-recent BoxMessage's rectangles. Color: desaturated red <code>#dd5050</code>. A small corner badge displays the running median overlay staleness (computed as below), so the streamer knows roughly how far behind live the overlay is. The staleness is the LA cycle plus pipeline overhead — ~785 ms hybrid, ~937 ms slow, ~210 ms point_to as of LA-3B (per <code>/home/user/Desktop/locate_anything_setup/docs/DRONE_DETECTION.md:113-117</code>); a model swap changes this one-for-one without architectural change.
+  <dd>The user's own browser captures via <code>getUserMedia</code>; the resulting MediaStream is assigned to a local <code>&lt;video&gt;</code> element via <code>HtmlMediaElement::set_src_object</code>. Display latency is essentially zero (browser-internal pipeline). The bounding-box overlay is drawn via <code>requestAnimationFrame</code> (NOT rVFC — rVFC's <code>metadata.rtpTimestamp</code> is absent for local <code>getUserMedia</code> tracks per WICG video-rvfc spec, since local sources have no RTP timeline). On each RAF tick the canvas reads <code>latest_box</code> via <code>RwSignal::with_untracked</code> (no Leptos reactive subscription — pure pull) and renders the most-recent BoxOverlay by matching its variant (rectangles for <code>Boxes</code>, crosshairs for <code>Points</code>, a cleared canvas for <code>Abstained</code> — §21.9). Color: desaturated red <code>#dd5050</code>. A small corner badge displays the running median overlay staleness (computed as below), so the streamer knows roughly how far behind live the overlay is. The staleness is the LA cycle plus pipeline overhead — ~785 ms hybrid, ~937 ms slow, ~210 ms point_to as of LA-3B (per <code>/home/user/Desktop/locate_anything_setup/docs/DRONE_DETECTION.md:113-117</code>); a model swap changes this one-for-one without architectural change.
 
-  <p><strong>Staleness-badge construction (buildable, no <code>getStats</code>).</strong> The badge answers "how far behind live is my overlay?" — which, under latest-wins plus LocateAnything-3B's stop-and-wait pipeline, is essentially one inference cycle. Measure it directly and locally: resolve a <code>web_sys::Performance</code> handle ONCE at streamer-overlay mount — <code>window().ok_or_else(|| anyhow::anyhow!("no window"))?.performance().ok_or_else(|| anyhow::anyhow!("no Performance API"))?</code> (a one-time fail-loud lift, no <code>.unwrap()</code> — §4.1/§4.3) — and move that handle into the "boxes" DataChannel <code>onmessage</code> closure (§21.3.1). On each <code>BoxMessage</code> arrival the closure pushes <code>perf.now()</code> — a monotonic <code>DOMHighResTimeStamp</code> in milliseconds — into a small <code>VecDeque&lt;f64&gt;</code> capped at ~16 entries; the badge shows the running median of the consecutive-arrival deltas. Resolving once also keeps the per-message path free of a redundant window/Performance lookup. No <code>getStats</code> poll loop, no RTP-timestamp correlation, no extra dependency.</p>
+  <p><strong>Staleness-badge construction (buildable, no <code>getStats</code>).</strong> The badge answers "how far behind live is my overlay?" — which, under latest-wins plus LocateAnything-3B's stop-and-wait pipeline, is essentially one inference cycle. Measure it directly and locally: resolve a <code>web_sys::Performance</code> handle ONCE at streamer-overlay mount — <code>window().ok_or_else(|| anyhow::anyhow!("no window"))?.performance().ok_or_else(|| anyhow::anyhow!("no Performance API"))?</code> (a one-time fail-loud lift, no <code>.unwrap()</code> — §4.1/§4.3) — and move that handle into the "boxes" DataChannel <code>onmessage</code> closure (§21.3.1). On each <code>BoxOverlay</code> arrival the closure pushes <code>perf.now()</code> — a monotonic <code>DOMHighResTimeStamp</code> in milliseconds — into a small <code>VecDeque&lt;f64&gt;</code> capped at ~16 entries; the badge shows the running median of the consecutive-arrival deltas. Resolving once also keeps the per-message path free of a redundant window/Performance lookup. No <code>getStats</code> poll loop, no RTP-timestamp correlation, no extra dependency.</p>
   <p><strong>Why not a true send→box round-trip from <code>getStats</code>.</strong> A genuine "frame T sent → box for T returned" RTT would require mapping a returned box back to the wall-clock instant the streamer sent that frame — but the WebRTC statistics model exposes <strong>no outbound RTP timestamp</strong>: <code>RTCOutboundRtpStreamStats</code> (and the <code>RTCSentRtpStreamStats</code> / <code>RTCRtpStreamStats</code> it extends) carry no current-RTP-timestamp field to correlate against, and the local <code>getUserMedia</code> source has no RTP timeline at all (which is also why the streamer overlay uses <code>requestAnimationFrame</code>, not rVFC). The inter-arrival median captures the dominant term (inference latency, ~785 ms hybrid) honestly; the few-tens-of-milliseconds network legs it omits are noise at this scale. (<code>RTCRemoteInboundRtpStreamStats.roundTripTime</code> does exist, but it measures only the streamer↔SFU network hop, not the box pipeline — the wrong number for this badge.)</p></dd>
 
   <dt>Viewer path</dt>
@@ -5125,7 +5203,7 @@ fn App() -&gt; impl IntoView {
 
 <p><strong>Why not just RAF on both paths?</strong> Using rVFC on the viewer path lets the canvas redraw tick match the actual video-frame-presentation cadence (which can be lower than 60 Hz under congestion or thermal throttle on mobile), avoiding wasted draws and visible canvas-vs-video mismatch during low-framerate playback. On the streamer path the local video has effectively no jitter buffer and runs at the camera's actual cadence, so RAF (which fires at display-refresh rate) is the natural fit; rVFC offers no advantage AND has the spec-mandated <code>rtpTimestamp == undefined</code> for local sources.</p>
 
-<p>On the viewer path, a missing <code>metadata.rtpTimestamp</code> is not treated as an error: the presented-frame rtpTimestamp is an observability signal only, and box ordering uses the monotonic <code>BoxMessage.frame_id</code> (§21.3.1), not it.</p>
+<p>On the viewer path, a missing <code>metadata.rtpTimestamp</code> is not treated as an error: the presented-frame rtpTimestamp is an observability signal only, and box ordering uses the monotonic <code>BoxOverlay</code> <code>frame_id</code> (§21.3.1), not it.</p>
 
 <h3>21.3 The <code>requestVideoFrameCallback</code> extern declaration</h3>
 <p>The <code>requestVideoFrameCallback</code> method is not bound in <code>web-sys</code> version 0.3.99 (verified by reading <code>wasm-bindgen-0.2.122/crates/web-sys/src/features/gen_HtmlVideoElement.rs</code>). The WebAssembly client declares the binding manually. The complete extern includes the <code>VideoFrameCallbackMetadata</code> dictionary type with all ten fields per the WICG <em>HTMLVideoElement.requestVideoFrameCallback()</em> draft specification (verified live on 2026-06-01):</p>
@@ -5173,7 +5251,7 @@ extern "C" {
     /// This value matches the `data.time` MediaTime that str0m exposes on
     /// the server side via Event::MediaData. The WASM viewer keeps this
     /// presented-frame rtpTimestamp only as an observability diagnostic
-    /// (current_frame_rtp_ts, §21.3); box ordering uses BoxMessage.frame_id.
+    /// (current_frame_rtp_ts, §21.3); box ordering uses BoxOverlay's frame_id.
     pub type VideoFrameCallbackMetadata;
 
     #[wasm_bindgen(method, getter, js_name = "presentationTime")]
@@ -5213,7 +5291,7 @@ pub fn has_rvfc(video: &amp;web_sys::HtmlVideoElement) -&gt; anyhow::Result&lt;b
 }
 </code></pre>
 
-<p><strong>The <code>metadata.rtpTimestamp</code> field is not load-bearing for overlay rendering.</strong> Under the latest-wins overlay (§21.2), the rVFC callback pulls the most-recent <code>BoxMessage</code> from <code>latest_box</code> at frame-presentation time and draws it; no lookup by RTP timestamp is performed. <code>metadata.rtpTimestamp</code> is used only for diagnostics (the streamer's overlay-staleness badge, §21.2). On the streamer path the local <code>getUserMedia</code> source has no RTP timeline (WICG video-rvfc spec: "absent" for non-WebRTC sources), so the streamer overlay uses <code>requestAnimationFrame</code> rather than rVFC.</p>
+<p><strong>The <code>metadata.rtpTimestamp</code> field is not load-bearing for overlay rendering.</strong> Under the latest-wins overlay (§21.2), the rVFC callback pulls the most-recent <code>BoxOverlay</code> from <code>latest_box</code> at frame-presentation time and draws it; no lookup by RTP timestamp is performed. <code>metadata.rtpTimestamp</code> is used only for diagnostics (the streamer's overlay-staleness badge, §21.2). On the streamer path the local <code>getUserMedia</code> source has no RTP timeline (WICG video-rvfc spec: "absent" for non-WebRTC sources), so the streamer overlay uses <code>requestAnimationFrame</code> rather than rVFC.</p>
 
 <p>On the viewer path, the rVFC callback shape is:</p>
 <pre><code>// Inside the rVFC callback closure (called per presented video frame).
@@ -5296,11 +5374,13 @@ pub fn apply_jitter_buffer_target(receiver: &amp;web_sys::RtcRtpReceiver) -&gt; 
 
 <h3>21.3.1 DataChannel "boxes" receive path on the WebAssembly client</h3>
 
-<p>The CLIENT creates the "boxes" DataChannel via <code>pc.create_data_channel_with_data_channel_dict("boxes", &amp;init)</code> (<code>init.ordered(false)</code>, <code>init.max_retransmits(0)</code>) BEFORE <code>createOffer()</code> — see §10.7 for why the offerer must own it (the server, as answerer, cannot add the m-section per RFC 8829). <code>create_data_channel*</code> returns the <code>RtcDataChannel</code> directly; the client stores that handle in the per-PC state struct and attaches its <code>onmessage</code> closure. (There is no <code>ondatachannel</code> event on the client — that fires only on the peer that did NOT create the channel; here that peer is the server-side str0m, which instead gets <code>Event::ChannelOpen</code>.) The channel is bidirectional, so the server writes BoxMessages and the client receives them on this same channel.</p>
+<p>The CLIENT creates the "boxes" DataChannel via <code>pc.create_data_channel_with_data_channel_dict("boxes", &amp;init)</code> (<code>init.ordered(false)</code>, <code>init.max_retransmits(0)</code>) BEFORE <code>createOffer()</code> — see §10.7 for why the offerer must own it (the server, as answerer, cannot add the m-section per RFC 8829). <code>create_data_channel*</code> returns the <code>RtcDataChannel</code> directly; the client stores that handle in the per-PC state struct and attaches its <code>onmessage</code> closure. (There is no <code>ondatachannel</code> event on the client — that fires only on the peer that did NOT create the channel; here that peer is the server-side str0m, which instead gets <code>Event::ChannelOpen</code>.) The channel is bidirectional, so the server writes each BoxOverlay and the client receives them on this same channel.</p>
+
+<p><strong>The strict overlay sum means a thin receive path.</strong> A <code>BoxOverlay</code> is exactly one of <code>Boxes</code> / <code>Points</code> / <code>Abstained</code> (§10.7), so the closure deserializes one value, takes its <code>frame_id()</code> for the latest-wins comparison, and stores it — there is no field-combination to validate (no "boxes present but abstained also true", no "points alongside boxes"), because such states are unrepresentable on the wire. The variant is consulted only at draw time (§21.9).</p>
 
 <pre><code>use anyhow::Context;
 use leptos::prelude::*;
-use protocol::BoxMessage;
+use protocol::BoxOverlay;
 
 // Per-PC state struct (mirrors the closure-lifetime inventory in rtc.rs).
 // The DataChannel instance and its handlers all live as long as this struct
@@ -5311,23 +5391,24 @@ pub struct DcState {
     pub _msg:               wasm_bindgen::closure::Closure&lt;dyn FnMut(web_sys::MessageEvent)&gt;,
     pub _close:             wasm_bindgen::closure::Closure&lt;dyn FnMut(web_sys::CloseEvent)&gt;,
     pub _err:               wasm_bindgen::closure::Closure&lt;dyn FnMut(web_sys::Event)&gt;,
-    /// The single latest BoxMessage. Latest-wins overlay (§21.2):
-    /// LA inference takes ~800 ms hybrid; by the time a box for frame X
+    /// The single latest BoxOverlay. Latest-wins overlay (§21.2):
+    /// LA inference takes ~800 ms hybrid; by the time an overlay for frame X
     /// arrives, the video has advanced ~25 frames past X. Per-frame
-    /// timestamp matching would mean the box for X never finds the frame
+    /// timestamp matching would mean the overlay for X never finds the frame
     /// it describes — viewers would see no boxes at all. Instead we always
-    /// render the most recent BoxMessage on whatever frame is currently
+    /// render the most recent BoxOverlay on whatever frame is currently
     /// being presented, exactly as the user's stated goal allows ("no need
     /// for bounding boxes to come in at the same time as the frame being
-    /// presented"). The `frame_id` field on BoxMessage is the ordering
-    /// key (newer frame_id wins on the rare DC reorder), not a sync key.
-    pub latest_box:         RwSignal&lt;Option&lt;BoxMessage&gt;&gt;,
+    /// presented"). `BoxOverlay::frame_id()` (present on every variant) is
+    /// the ordering key (newer frame_id wins on the rare DC reorder), not a
+    /// sync key.
+    pub latest_box:         RwSignal&lt;Option&lt;BoxOverlay&gt;&gt;,
 }
 
 // Attaching the channel:
 pub fn attach_boxes_dc(
     dc: web_sys::RtcDataChannel,
-    latest_box: RwSignal&lt;Option&lt;BoxMessage&gt;&gt;,
+    latest_box: RwSignal&lt;Option&lt;BoxOverlay&gt;&gt;,
     last_error: RwSignal&lt;Option&lt;String&gt;&gt;,
 ) -&gt; DcState {
     // The "boxes" channel is always JSON text frames. Set binary_type defensively
@@ -5349,30 +5430,31 @@ pub fn attach_boxes_dc(
                     return;
                 }
             };
-            let msg: BoxMessage = match protocol::parse_box_message(&amp;text) {
+            let overlay: BoxOverlay = match protocol::parse_box_overlay(&amp;text) {
                 Ok(m) =&gt; m,
                 Err(e) =&gt; {
-                    err_for_msg.set(Some(format!("parse BoxMessage: {e:#}")));
+                    err_for_msg.set(Some(format!("parse BoxOverlay: {e:#}")));
                     return;
                 }
             };
-            // Latest-wins: keep the latest BoxMessage only. On the rare case
-            // a reordered datagram delivers an older box AFTER a newer one
+            // Latest-wins: keep the latest BoxOverlay only. On the rare case
+            // a reordered datagram delivers an older overlay AFTER a newer one
             // (unordered DataChannel, unreliable), reject the stale one —
             // newer-frame_id wins, never overwrite backwards. Under stop-and-wait
             // LA + LAN transport reordering is essentially impossible; this guard
-            // is defense. We order by `frame_id` (u64, monotonic, server-assigned
-            // — §10.7), NOT a 90 kHz RTP timestamp: frame_id is actually sourceable
-            // end-to-end (the SFU→decode AU channel carries bytes + the contiguous
-            // flag only, never MediaData.time) and, being u64, never wraps — so a
-            // plain `>` is correct, no RFC-1982 serial arithmetic needed.
+            // is defense. We order by `frame_id()` (u64, monotonic, server-assigned
+            // — §10.7, present on every variant), NOT a 90 kHz RTP timestamp:
+            // frame_id is actually sourceable end-to-end (the SFU→decode AU channel
+            // carries bytes + the contiguous flag only, never MediaData.time) and,
+            // being u64, never wraps — so a plain `>` is correct, no RFC-1982
+            // serial arithmetic needed.
             buf_for_msg.update(|slot| {
                 let accept = match slot {
                     None =&gt; true,
-                    Some(cur) =&gt; msg.frame_id &gt; cur.frame_id,
+                    Some(cur) =&gt; overlay.frame_id() &gt; cur.frame_id(),
                 };
                 if accept {
-                    *slot = Some(msg);
+                    *slot = Some(overlay);
                 }
             });
         }
@@ -5523,32 +5605,42 @@ ctx.scale(dpr, dpr).map_err(js_err("ctx.scale"))?;  // so this scale does NOT ac
 <p><strong>ResizeObserver does NOT fire on a device-pixel-ratio change when the CSS box is unchanged</strong> — e.g. dragging the window to a display with a different DPR, or browser page-zoom — leaving the backing store stale (blurry, or mis-scaled boxes) until some unrelated resize. So also register a self-re-arming <code>matchMedia(&amp;format!("(resolution: {dpr}dppx)"))</code> <code>change</code> listener; on fire, re-run the sizing block above (it re-reads <code>device_pixel_ratio()</code>, which resets the transform via <code>set_width</code>) and re-arm the listener against the new ratio. Both the ResizeObserver and this media-query listener are owned closures in the §21.11 inventory.</p>
 
 <h3>21.9 Bounding-box coordinate transform</h3>
-<p>Boxes arrive normalized in [0.0, 1.0]. The WebAssembly client multiplies by the current CSS width and height of the canvas (<code>css_width</code>/<code>css_height</code> — read from the shared cell the §21.8 ResizeObserver keeps current, see §21.3, never <code>getBoundingClientRect</code> per frame). <strong><code>draw_boxes</code> clears the whole canvas first</strong>, so the previous inference's shapes never ghost; an <code>abstained</code> reply (empty <code>boxes</code> and <code>points</code>) therefore leaves a clean, blank overlay. The per-frame caller (viewer rVFC / streamer RAF) calls this every presented frame, and clears directly when <code>latest_box</code> is <code>None</code> (§21.3). <strong>Note:</strong> <code>box</code> is a reserved keyword in Rust; the local binding is named <code>bb</code>:</p>
+<p>Boxes and points arrive normalized in [0.0, 1.0]. The WebAssembly client multiplies by the current CSS width and height of the canvas (<code>css_width</code>/<code>css_height</code> — read from the shared cell the §21.8 ResizeObserver keeps current, see §21.3, never <code>getBoundingClientRect</code> per frame). <strong><code>draw_overlay</code> clears the whole canvas first</strong>, so the previous inference's shapes never ghost, then <strong><code>match</code>es the <code>BoxOverlay</code> variant</strong> (§10.7) — <code>Boxes</code> → rectangles, <code>Points</code> → crosshairs, <code>Abstained</code> → nothing further (the cleared canvas is the blank overlay). There is no both-lists struct to walk and no <code>abstained</code> flag to test: the variant says exactly what to draw. The per-frame caller (viewer rVFC / streamer RAF) calls this every presented frame, and clears directly when <code>latest_box</code> is <code>None</code> (§21.3). <strong>Note:</strong> <code>box</code> is a reserved keyword in Rust; the local binding is named <code>bb</code>:</p>
 <pre><code>// Clear the whole canvas in CSS-pixel space (the ctx is already DPR-scaled,
 // §21.8) BEFORE drawing — otherwise each frame's shapes paint over the last
-// and the overlay smears.
+// and the overlay smears. Runs for every variant, so Abstained = a clean wipe.
 ctx.clear_rect(0.0, 0.0, css_width as f64, css_height as f64);
 
-for bb in box_message.boxes.iter() {
-    let x = bb.x1 * css_width;
-    let y = bb.y1 * css_height;
-    let w = (bb.x2 - bb.x1) * css_width;
-    let h = (bb.y2 - bb.y1) * css_height;
-    ctx.stroke_rect(x as f64, y as f64, w as f64, h as f64);
-}
-
-// The `point` template (PromptTask::Point) returns points, not boxes (§10.7);
-// render each as a small crosshair so that template is not silently blank.
-// Points are normalized [0.0, 1.0] in the same space as box corners.
-for pt in box_message.points.iter() {
-    let (cx, cy, r) = ((pt.x * css_width) as f64, (pt.y * css_height) as f64, 6.0_f64);
-    ctx.begin_path();
-    ctx.move_to(cx - r, cy); ctx.line_to(cx + r, cy);
-    ctx.move_to(cx, cy - r); ctx.line_to(cx, cy + r);
-    ctx.stroke();
+match overlay {
+    BoxOverlay::Boxes { boxes, .. } =&gt; {
+        for bb in boxes.iter() {
+            let x = bb.x1 * css_width;
+            let y = bb.y1 * css_height;
+            let w = (bb.x2 - bb.x1) * css_width;
+            let h = (bb.y2 - bb.y1) * css_height;
+            ctx.stroke_rect(x as f64, y as f64, w as f64, h as f64);
+            draw_label(&amp;ctx, &amp;bb.label, x as f64, y as f64);   // label is REQUIRED (§10.7)
+        }
+    }
+    BoxOverlay::Points { points, .. } =&gt; {
+        // The `point` template returns points, not boxes (§10.7); render each
+        // as a small crosshair. Points are normalized [0.0, 1.0] in the same
+        // space as box corners.
+        for pt in points.iter() {
+            let (cx, cy, r) = ((pt.x * css_width) as f64, (pt.y * css_height) as f64, 6.0_f64);
+            ctx.begin_path();
+            ctx.move_to(cx - r, cy); ctx.line_to(cx + r, cy);
+            ctx.move_to(cx, cy - r); ctx.line_to(cx, cy + r);
+            ctx.stroke();
+            draw_label(&amp;ctx, &amp;pt.label, cx + r, cy);
+        }
+    }
+    // The model found nothing for this frame — the clear_rect above already
+    // left a blank overlay, so there is nothing more to draw.
+    BoxOverlay::Abstained { .. } =&gt; {}
 }
 </code></pre>
-<p>Stroke styling: line width 2.0 pixels in CSS pixels. Stroke color <code>#ff3030</code> (saturated red) for viewer-side; <code>#dd5050</code> (desaturated red) for streamer-side. Optional label drawn above the box with a filled rectangle background (same color at 70 percent alpha) and white 12-pixel sans-serif text.</p>
+<p>Stroke styling: line width 2.0 pixels in CSS pixels. Stroke color <code>#ff3030</code> (saturated red) for viewer-side; <code>#dd5050</code> (desaturated red) for streamer-side. The <code>label</code> (always present — every <code>LabeledBox</code>/<code>LabeledPoint</code> carries one, §10.7) is drawn alongside the shape with a filled rectangle background (same color at 70 percent alpha) and white 12-pixel sans-serif text.</p>
 <p><strong>Accessibility.</strong> The canvas overlay is purely visual (<code>pointer-events: none</code>, no DOM semantics), so it is invisible to assistive technology. To leave a non-visual signal, the detection <em>count</em> (the same value the §21.0.6 pill shows) is mirrored into a visually-hidden <code>aria-live="polite"</code> region that updates only when the count changes — not every inference cycle, which would be too chatty for a screen reader.</p>
 
 <h3>21.10 WebSocket reconnect on the WebAssembly client</h3>
@@ -5768,18 +5860,22 @@ loop {
 <h3>23.1 The 7 canonical LocateAnything-3B prompt templates (verbatim from <code>worker/prompts.py</code>)</h3>
 
 <table>
-  <tr><th>#</th><th>Wire name (PromptTask)</th><th>User-friendly card title</th><th>Canonical prompt string (substitute braces)</th><th>User slot(s)</th><th>Returns</th></tr>
-  <tr><td>1</td><td><code>detection</code></td><td>"Detect category"</td><td><code>Locate all the instances that matches the following description: {cats}.</code></td><td>1 to 10 category strings joined by literal <code>&lt;/c&gt;</code> separator (e.g., <code>drone&lt;/c&gt;quadcopter</code>)</td><td>bounding boxes</td></tr>
-  <tr><td>2</td><td><code>phrase_single</code></td><td>"Find one specific thing"</td><td><code>Locate a single instance that matches the following description: {description}.</code></td><td>one free-form phrase</td><td>bounding boxes</td></tr>
-  <tr><td>3</td><td><code>phrase_multi</code></td><td>"Find all things matching"</td><td><code>Locate all the instances that match the following description: {description}.</code></td><td>one free-form phrase</td><td>bounding boxes</td></tr>
-  <tr><td>4</td><td><code>text_grounding</code></td><td>"Find this text in the image"</td><td><code>Please locate the text referred as {phrase}.</code></td><td>one phrase (the text to find)</td><td>bounding boxes</td></tr>
-  <tr><td>5</td><td><code>scene_text</code></td><td>"Read all text (OCR)"</td><td><code>Detect all the text in box format.</code></td><td>none</td><td>bounding boxes</td></tr>
-  <tr><td>6</td><td><code>gui_box</code></td><td>"Find this UI element"</td><td><code>Locate the region that matches the following description: {description}.</code></td><td>one phrase</td><td>bounding boxes</td></tr>
-  <tr><td>7</td><td><code>point</code></td><td>"Point at the most relevant"</td><td><code>Point to: {description}.</code></td><td>one phrase, single category per call</td><td>points (single x, y per detection)</td></tr>
+  <tr><th>#</th><th>Wire name (<code>task</code> tag)</th><th>User-friendly card title</th><th>Canonical prompt string the LA server compiles (substitute braces)</th><th>Typed slot(s) the card emits</th><th>Reply variant</th></tr>
+  <tr><td>1</td><td><code>detection</code></td><td>"Detect category"</td><td><code>Locate all the instances that matches the following description: {cats}.</code></td><td><code>categories: Vec&lt;String&gt;</code>, 1 to 10 entries (the LA server joins them with <code>&lt;/c&gt;</code> when it compiles the prompt — the client never joins)</td><td><code>boxes</code></td></tr>
+  <tr><td>2</td><td><code>phrase_single</code></td><td>"Find one specific thing"</td><td><code>Locate a single instance that matches the following description: {description}.</code></td><td><code>phrase: String</code> (one free-form phrase)</td><td><code>boxes</code></td></tr>
+  <tr><td>3</td><td><code>phrase_multi</code></td><td>"Find all things matching"</td><td><code>Locate all the instances that match the following description: {description}.</code></td><td><code>phrase: String</code> (one free-form phrase)</td><td><code>boxes</code></td></tr>
+  <tr><td>4</td><td><code>text_grounding</code></td><td>"Find this text in the image"</td><td><code>Please locate the text referred as {phrase}.</code></td><td><code>text: String</code> (the text to find)</td><td><code>boxes</code></td></tr>
+  <tr><td>5</td><td><code>scene_text</code></td><td>"Read all text (OCR)"</td><td><code>Detect all the text in box format.</code></td><td>none (empty-struct variant)</td><td><code>boxes</code></td></tr>
+  <tr><td>6</td><td><code>gui_box</code></td><td>"Find this UI element"</td><td><code>Locate the region that matches the following description: {description}.</code></td><td><code>description: String</code> (one phrase)</td><td><code>boxes</code></td></tr>
+  <tr><td>7</td><td><code>point</code></td><td>"Point at the most relevant"</td><td><code>Point to: {description}.</code></td><td><code>phrase: String</code> (one phrase, single category per call)</td><td><code>points</code> (single x, y per detection)</td></tr>
 </table>
 
 <div class="note note-warn">
 <strong>Note the subtle verb difference:</strong> <code>phrase_single</code> uses <strong>"matches"</strong> (with an s), while <code>phrase_multi</code> uses <strong>"match"</strong> (without an s). Verify against the file <code>/home/user/Desktop/locate_anything_setup/worker/prompts.py</code> lines 18-21 and 62-80 at implementation time. This asymmetry is intentional in the model's training data.
+</div>
+
+<div class="note note-info">
+<strong>The prompt builder is a typed-request constructor, not a string builder.</strong> The "Canonical prompt string" column above is what the LocateAnything-3B server compiles each typed request into — it is shown so the user understands what the model receives, but the WebAssembly client never assembles those bytes. Each card maps to one <code>PromptRequest</code> variant (§10.4); the form emits the typed slots (a category list as a <code>Vec&lt;String&gt;</code>, a phrase/text/description as a <code>String</code>), and the LA server does the prefix/separator/period assembly. Because the request is a strict typed sum and the LA server is the authoritative slot-validator (§23.6), the client needs far less validation than if it built and shipped the final string itself — the make-illegal-states-unrepresentable discipline at the wire makes the UI simpler, not more complex.
 </div>
 
 <h3>23.2 Per-template hardcoded <code>generation_mode</code></h3>
@@ -5863,7 +5959,7 @@ loop {
 <h3>23.4 Per-template form controls</h3>
 <dl>
   <dt><code>detection</code></dt>
-  <dd>N rows of <code>&lt;input type="text"&gt;</code>, one per category. "Add category" button below (cap at 10 categories). Per-row "Remove" button (X) hidden when only one row remains. The WebAssembly client joins values with literal <code>&lt;/c&gt;</code> separator (no whitespace) when constructing the final prompt. <strong>The user never types <code>&lt;/c&gt;</code> directly.</strong></dd>
+  <dd>N rows of <code>&lt;input type="text"&gt;</code>, one per category. "Add category" button below (cap at 10 categories). Per-row "Remove" button (X) hidden when only one row remains. The WebAssembly client collects the row values into a <code>Vec&lt;String&gt;</code> and emits <code>PromptRequest::Detection(DetectionReq { categories })</code> — <strong>it does NOT join them with <code>&lt;/c&gt;</code></strong>. The categories travel the wire as a list; the LocateAnything-3B server performs the <code>&lt;/c&gt;</code> join when it compiles the prompt. <strong>The user never types <code>&lt;/c&gt;</code> directly, and the client never inserts it.</strong></dd>
 
   <dt><code>phrase_single</code></dt>
   <dd>One <code>&lt;input type="text"&gt;</code> with placeholder "e.g. the red drone closest to the camera".</dd>
@@ -5886,18 +5982,23 @@ loop {
 <p>Every input field has these attributes: <code>maxlength="200"</code>, live character counter, <code>autocapitalize="off"</code>, <code>autocorrect="off"</code>, <code>spellcheck="false"</code>, <code>inputmode="text"</code>.</p>
 
 <h3>23.5 Live preview pane</h3>
-<p>Always rendered below the form. Use a <code>&lt;pre&gt;</code> element with class <code>preview</code>, styled via the external <code>styles.css</code> with <code>white-space: pre-wrap; font-family: ui-monospace;</code>. Label: "Final prompt sent to LocateAnything:". Updates on every keystroke via Leptos reactive signals. <strong>This is the single most important affordance:</strong> the user sees the exact bytes LocateAnything-3B will receive, no template hiding.</p>
+<p>Always rendered below the form. Use a <code>&lt;pre&gt;</code> element with class <code>preview</code>, styled via the external <code>styles.css</code> with <code>white-space: pre-wrap; font-family: ui-monospace;</code>. Label: "Prompt LocateAnything will compile:". Updates on every keystroke via Leptos reactive signals. <strong>This is the single most important affordance:</strong> the user sees the exact prompt LocateAnything-3B will assemble from their typed slots, no template hiding.</p>
+<p><strong>The preview reproduces the LA server's compilation rule, it is not the wire payload.</strong> The client sends the typed <code>PromptRequest</code> (§10.4, §23.8) — it does NOT send this string. The preview renders the canonical-template prefix + the slot value(s) + the trailing period (joining detection categories with <code>&lt;/c&gt;</code> exactly as the LA server will, §10.10's <code>CATEGORY_SEPARATOR</code> being the parity reference) purely so the user can read what the model receives. It mirrors the server's <code>compile</code> step; it does not replace it. (If a future change makes byte-faithful local reproduction undesirable, the preview can instead echo the typed slots themselves — the load-bearing affordance is "no template hiding", which the typed form already delivers.)</p>
 
-<h3>23.6 Frontend validation rules (strict subset of LA's prompt_validator.rs)</h3>
+<h3>23.6 Frontend validation rules (light inline UX; the LA server is authoritative)</h3>
 
-<p>On every input change, the WebAssembly client runs the following checks. <strong>Every check is "show inline error and disable Submit". No "strip-and-warn", no silent mutation of user input.</strong> The user fixes their input; the system never invisibly rewrites it.</p>
+<div class="note note-info">
+<strong>Slot validation is server-authoritative now — the client copy is an optional UX courtesy.</strong> The typed slots travel to LocateAnything-3B inside a <code>PromptRequest</code>, and the LA server's Rust builder (<code>compile(&amp;PromptRequest)</code>) is the single source of truth for slot legality: NFC, no control chars, no leading/trailing whitespace, no literal <code>&lt;/c&gt;</code>, no trailing period, length ≤ 200 per slot, 1..=10 categories, no comma in a category/point phrase, and the compiled-prompt ≤ <code>MAX_PROMPT_CHARS</code> cap. A violation comes back as <code>type:"error", code:"invalid_request"</code> (§23.9), and the LA server REJECTS rather than silently normalizing. <strong>Because the server makes an invalid request unrepresentable downstream, the browser does NOT need to be a second authoritative validator</strong> — it keeps only the lightweight inline checks below so the user gets immediate, in-place feedback instead of a round-trip rejection. The checks mirror the server's rules but are not the guarantee; they may be trimmed without weakening correctness.</p>
+</div>
+
+<p>On every input change, the WebAssembly client runs the following checks. <strong>Every check is "show inline error and disable Submit". No "strip-and-warn", no silent mutation of user input</strong> (a silent fix would diverge from what the server compiles and confuse the user). The user fixes their input; the system never invisibly rewrites it.</p>
 
 <ol>
   <li><strong>Leading or trailing whitespace:</strong> if <code>raw != raw.trim()</code>, show inline error "remove leading/trailing whitespace" and disable Submit. <em>Do not silently trim.</em> The preview pane displays exactly <code>raw</code> so the user sees what they typed.</li>
   <li><strong>Non-empty:</strong> if <code>raw.is_empty()</code> AND the template requires a slot, disable Submit (no error text; an empty required field is self-evident).</li>
   <li><strong>Length cap:</strong> if <code>raw.chars().count() &gt; 200</code>, show inline error "too long (max 200 characters)" and disable Submit. (Well under LocateAnything-3B's whole-prompt cap of <code>MAX_PROMPT_CHARS = 16384</code>; the demo deliberately enforces a tighter cap to match the prompt-builder user-interface idiom.)</li>
   <li><strong>No control characters:</strong> if <code>raw.chars().any(|c| c.is_control())</code>, show inline error "control characters not allowed".</li>
-  <li><strong>No manual <code>&lt;/c&gt;</code> or angle-bracket fragments:</strong> if <code>raw.contains("&lt;/c&gt;")</code> OR <code>raw.contains("&lt;/")</code> OR <code>raw.contains("c&gt;")</code>, show inline error "do not type angle-bracket fragments directly; use Add Category for multiple targets". The broader check catches partial-fragment inputs like <code>"foo&lt;/c"</code> or <code>"c&gt;bar"</code> that would otherwise pass the literal-4-char check and then concatenate ambiguously with the literal <code>&lt;/c&gt;</code> separator during prompt assembly. (LocateAnything-3B's server-side <code>prompt_validator.rs</code> is the ultimate authoritative validator and rejects malformed prompts via the <code>type:"error"</code> reply path that Section 23.9 handles — this client-side rule is defense-in-depth, not the full guarantee.)</li>
+  <li><strong>No manual <code>&lt;/c&gt;</code> fragment:</strong> if <code>raw.contains("&lt;/c&gt;")</code>, show inline error "do not type the category separator directly; use Add Category for multiple targets". A literal <code>&lt;/c&gt;</code> inside a slot is exactly what the LA server's slot validator rejects (it reserves <code>&lt;/c&gt;</code> for the category join it performs during compilation), so the inline check just surfaces that rejection earlier. There is no client-side string assembly to corrupt — categories travel as a <code>Vec&lt;String&gt;</code> (§23.4) — so this is a UX hint, not a guard against a local concatenation bug. (The LA server is the authoritative validator and rejects the request via the <code>type:"error", code:"invalid_request"</code> reply path that Section 23.9 handles.)</li>
   <li><strong>Point slot — no comma:</strong> if the active template is <code>point</code> and <code>raw.contains(',')</code>, show inline error "single category only; no commas".</li>
   <li><strong>Detection row — no comma:</strong> same for each detection row.</li>
   <li><strong>No trailing period in user input:</strong> if <code>raw.ends_with('.')</code>, show inline error "remove the trailing period; the canonical template adds it for you". Disable Submit. <em>Do not silently strip.</em> The user removes the period; the system never invisibly mutates input.</li>
@@ -5906,7 +6007,7 @@ loop {
 
 <p>The Submit button is disabled (visually muted) until every rule passes for every visible slot.</p>
 
-<p><strong>Why no silent mutation:</strong> the user's stated principle is "extremely strict server-side input validation" and "no fallbacks". Silently trimming whitespace or stripping trailing periods is exactly the silently-more-lenient pattern that hides bugs and confuses users when they later observe that LocateAnything-3B received a string that differs from what they typed. The strict rule is: the bytes the LocateAnything-3B server sees are the bytes the user typed inside the slot, surrounded by the canonical-template prefix and the canonical trailing period (or no trailing period for templates that don't require it). Any deviation is the user's responsibility to fix in the input field.</p>
+<p><strong>Why no silent mutation:</strong> the user's stated principle is "extremely strict server-side input validation" and "no fallbacks". Silently trimming whitespace or stripping trailing periods is exactly the silently-more-lenient pattern that hides bugs and confuses users when they later observe that LocateAnything-3B received a slot that differs from what they typed (and would then mismatch the slot the LA server actually validates and compiles). The strict rule is: the slot value placed into the typed <code>PromptRequest</code> is exactly the value the user typed — no trim, no strip, no normalize — and the LocateAnything-3B server compiles it into the canonical-template prefix + trailing period (or no period, for templates that don't append one). Any deviation is the user's responsibility to fix in the input field; the server enforces the same rule and rejects what the inline check would have flagged.</p>
 
 <h3>23.7 Unicode normalization is rejected, not applied</h3>
 
@@ -5917,10 +6018,17 @@ loop {
 <p>Section 7.5's pin table is updated to include <code>unicode-normalization = "=0.1.25", default-features = false</code> as a WebAssembly client dependency.</p>
 
 <h3>23.8 Atomic claim message</h3>
-<p>Submit sends <code>SignalMessage::Claim(ClaimMsg { prompt, generation_mode })</code> with both fields populated atomically. No separate <code>set_prompt</code> message. Why atomic: bundling avoids a race window where the streamer is Claimed but has no prompt. The prompt is locked for the entire ownership session. To change the prompt, the user releases ownership and re-claims.</p>
+<p>Submit builds the typed <code>PromptRequest</code> from the active card's form (the variant for that card, with its typed slots) and sends <code>SignalMessage::Claim(ClaimMsg { request, generation_mode })</code> with both fields populated atomically — <strong>no prompt string is constructed client-side</strong> (§10.6). No separate <code>set_request</code> message. Why atomic: bundling avoids a race window where the streamer is Claimed but has no request. The request is locked for the entire ownership session; the demo server forwards it verbatim to LocateAnything-3B on every frame (§10.11, §19.1). To change the request, the user releases ownership and re-claims.</p>
 
 <h3>23.9 LA error flow</h3>
-<p>If LocateAnything-3B returns <code>{"type":"error","frame_id":...,"code":"...","message":"..."}</code> for a frame, the demo server propagates it back to the streamer as <code>SignalMessage::Error</code> with <code>code: "prompt_rejected"</code>. The WebAssembly client renders the error as a banner ("LocateAnything rejected the prompt: <chained-message>"), then schedules automatic ownership release after 500 milliseconds, then transitions the user-interface state back to the 7-card prompt-builder grid.</p>
+<p>If LocateAnything-3B returns the <code>error</code> variant of its reply sum (§10.11) for a frame, its <code>code</code> is exactly one of the four typed <code>ErrorCode</code> strings — <code>invalid_request</code>, <code>invalid_image</code>, <code>model_deviation</code>, or <code>internal</code>:</p>
+<ul>
+  <li><code>invalid_request</code> — the typed slots failed the LA server's slot validation (§23.6). This is the genuine prompt-fault case: the locked request can never succeed, so ejecting back to the prompt builder is correct.</li>
+  <li><code>invalid_image</code> — the JPEG was undecodable/too small. A per-frame image problem, typically transient (the next decoded frame may be fine).</li>
+  <li><code>model_deviation</code> — the model emitted nothing usable for this single frame (all geometry off-contract). Per-frame and transient.</li>
+  <li><code>internal</code> — a worker-side fault (e.g. OOM/timeout triggering the worker's own ~10-15 s restart). Transient and not the streamer's fault.</li>
+</ul>
+<p>The demo server propagates the error to the streamer as <code>SignalMessage::Error</code> using its own <code>error_code::PROMPT_REJECTED</code> taxonomy (§10.2), carrying the LA <code>ErrorCode</code> string and message in the chained text (e.g. <code>"frame f-12: invalid_request: category 3 ends with '.'"</code>). The WebAssembly client renders it as a banner ("LocateAnything rejected the request: &lt;code&gt;: &lt;chained-message&gt;"), schedules automatic ownership release after 500 milliseconds, then transitions the user-interface state back to the 7-card prompt-builder grid (the §11.7.1 <code>on_la_error_result</code> + wasm auto-release path). <strong>Note (honest boundary, tracked in <code>issues.html</code>):</strong> this single auto-release path treats all four codes alike, but only <code>invalid_request</code> is strictly a prompt fault — the three transient codes eject a streamer for a per-frame or server-side hiccup that the next frame might clear. Differentiating them (banner-only for the transient three, eject only on <code>invalid_request</code>) is the strictly-more-correct refinement and is recorded for the operator's decision, not silently adopted here.</p>
 
 <hr>
 
@@ -6306,12 +6414,12 @@ export LA_WEBSITE_BIND_ALL_INTERFACES=0 # 0 = loopback-only; 1 = bind 0.0.0.0
 <ol>
   <li><strong>Synthetic streamer (<code>TestStreamer</code>):</strong> a <code>str0m::Rtc</code> instance configured with the same <code>clear_codecs().enable_h264(true)</code> chain as a real browser would produce (Section 20.1). Replays a checked-in <code>website/server/tests/fixtures/seed_h264.bin</code> of pre-encoded Constrained Baseline Level 3.1 Network Abstraction Layer Units through str0m's <code>H264Packetizer</code>.</li>
   <li><strong>The actual Selective Forwarding Unit code under test:</strong> the test invokes the server's real axum router and the real Finite State Machine actor task — not a copy, not a stub. Configuration: <code>--la-host 127.0.0.1 --la-port &lt;dyn&gt; --public-host 127.0.0.1 --auth-secret testsupersecretvalue123456</code> with all other arguments wired to test-only paths.</li>
-  <li><strong>Stubbed LocateAnything-3B endpoint:</strong> a <code>tokio-tungstenite</code> WebSocket echo server bound to <code>127.0.0.1:0</code>; the bound port is passed as <code>--la-port</code>. On receiving a frame, the stub returns a canned <code>{"type":"result","frame_id":N,"detections":[{"bbox_norm":[100,100,500,500],"label":"test","score":0.9}],"points":[],"abstained":false,"latency_ms":1,"raw_text":"","prompt_task":"detection","model_output_truncated":false}</code> reply (the <code>points</code> field is always present in the real LocateAnything-3B reply per <code>/home/user/Desktop/locate_anything_setup/worker/inference.py</code>'s <code>InferenceResult</code>; including it in the stub keeps the response shape parser-compatible). Exercises the full Server → LocateAnything-3B WebSocket round-trip code path without depending on the real model.</li>
+  <li><strong>Stubbed LocateAnything-3B endpoint:</strong> a <code>tokio-tungstenite</code> WebSocket echo server bound to <code>127.0.0.1:0</code>; the bound port is passed as <code>--la-port</code>. On receiving a frame, the stub returns a canned <code>boxes</code> variant of the typed LA reply (§10.11): <code>{"type":"boxes","frame_id":"N","boxes":[{"label":"test","bbox_norm":[100,100,500,500],"bbox_px":[192.0,108.0,960.0,540.0]}],"raw_text":"","model_output_truncated":false,"deviations_dropped":0,"image_size":[1920,1080],"resize_plan":{"dst_w":1920,"dst_h":1080,"n_llm_tokens":1,"scale":1.0},"generation_mode_used":"hybrid","latency_ms":1.0,"total_ms":1.0}</code> (the flat tagged union — no <code>detections</code>/<code>score</code>/<code>abstained</code>-bool/<code>prompt_task</code>; <code>label</code> required). The stub echoes the request's <code>frame_id</code> back. Exercises the full Server → LocateAnything-3B WebSocket round-trip code path without depending on the real model.</li>
   <li><strong>Synthetic viewer (<code>TestViewer</code>):</strong> a second <code>str0m::Rtc</code> instance in receive mode, with a Data-Channel subscriber for the "boxes" label.</li>
   <li><strong>Assertions:</strong>
     <ul>
       <li>(i) Within 5 simulated seconds of test start, the viewer receives video <code>Event::MediaData</code> events with <code>is_keyframe=true</code>.</li>
-      <li>(ii) The viewer's Data-Channel receives at least one <code>BoxMessage</code> whose <code>frame_id</code> matches a frame the streamer published.</li>
+      <li>(ii) The viewer's Data-Channel receives at least one <code>BoxOverlay</code> whose <code>frame_id</code> matches a frame the streamer published.</li>
       <li>(iii) The stubbed LocateAnything-3B server's received-frame counter is non-zero (proves the H.264 → YUV → RGB → JPEG → LocateAnything-3B path actually ran).</li>
       <li>(iv) Forcing the streamer to call <code>rtc.disconnect()</code> mid-test produces a clean Finite-State-Machine transition back to <code>Idle</code> within 5 simulated seconds; the viewer receives a <code>"bye"</code> DataChannel message.</li>
     </ul>
@@ -6348,9 +6456,9 @@ sha256sum seed_h264.bin | awk '{print $1}' &gt; seed_h264.bin.sha256
 //
 // End-to-end pipeline integration test: two synthetic str0m::Rtc peers
 // (streamer + viewer) talk to the real SFU task via a real UdpSocket on
-// kernel loopback; a stubbed LocateAnything-3B server echoes canned
-// detections. Verifies that an injected H.264 fixture reaches the viewer
-// with a keyframe AND that a BoxMessage corresponding to a published
+// kernel loopback; a stubbed LocateAnything-3B server echoes a canned
+// `boxes` reply. Verifies that an injected H.264 fixture reaches the viewer
+// with a keyframe AND that a BoxOverlay corresponding to a published
 // frame_id reaches the viewer's "boxes" DataChannel. See test_support.rs
 // for the integration-only seams (DirectApi credentials exchange, etc.).
 
@@ -6604,8 +6712,8 @@ async fn e2e_pipeline_keyframe_box_drain() -&gt; Result&lt;()&gt; {
                 }
                 Event::ChannelData(cd) if !cd.binary =&gt; {
                     if let Ok(txt) = std::str::from_utf8(&amp;cd.data) {
-                        if let Ok(msg) = protocol::parse_box_message(txt) {
-                            if published_frame_ids.contains(&amp;msg.frame_id) {
+                        if let Ok(overlay) = protocol::parse_box_overlay(txt) {
+                            if published_frame_ids.contains(&amp;overlay.frame_id()) {
                                 box_msg_seen = true;
                             }
                         }
@@ -6618,7 +6726,7 @@ async fn e2e_pipeline_keyframe_box_drain() -&gt; Result&lt;()&gt; {
     }
 
     assert!(keyframe_seen, "viewer never received an H.264 keyframe within 8s");
-    assert!(box_msg_seen,  "viewer never received a BoxMessage matching a published frame_id");
+    assert!(box_msg_seen,  "viewer never received a BoxOverlay matching a published frame_id");
     assert!(stub.frames_received() &gt; 0, "stubbed LA never saw a frame");
 
     streamer.rtc.disconnect();
@@ -6671,7 +6779,7 @@ async fn collect_phase_sequence(
   <li><code>Role::{Streamer, Viewer}</code> enum.</li>
   <li><code>TestCfg { la_host: String, la_port: u16, auth_secret: String, public_host: String }</code> struct.</li>
   <li><code>PeerCreds { remote_fingerprint, remote_ice_credentials, sfu_local_addr }</code> struct.</li>
-  <li><code>StubLaServer</code>: bundles an axum router on <code>127.0.0.1:0</code> with two routes — <code>GET /v1/capabilities</code> returns the canonical JSON Section 12.2 mandates; <code>WS /v1/stream</code> increments an <code>AtomicU64</code> on each LA-protocol frame and replies with the canned <code>{"type":"result","frame_id":N,...,"points":[],...}</code>. Provides <code>.tcp_addr</code>, <code>.frames_received() -&gt; u64</code>, and <code>.shutdown()</code> methods.</li>
+  <li><code>StubLaServer</code>: bundles an axum router on <code>127.0.0.1:0</code> with two routes — <code>GET /v1/capabilities</code> returns the canonical JSON Section 12.2 mandates (including typed <code>preset_prompts</code>); <code>WS /v1/stream</code> increments an <code>AtomicU64</code> on each LA-protocol frame and replies with the canned <code>boxes</code> variant <code>{"type":"boxes","frame_id":"N","boxes":[…],…}</code> (§10.11), echoing the request's <code>frame_id</code>. Provides <code>.tcp_addr</code>, <code>.frames_received() -&gt; u64</code>, and <code>.shutdown()</code> methods.</li>
 </ul>
 
 <p><strong>Two str0m 0.20.0 constraints the seam must respect (verified against source on 2026-06-02):</strong></p>
@@ -6719,7 +6827,7 @@ str0m = { version = "=0.20.0", features = ["unversioned"] }   # H264Packetizer +
   <li><strong>No simulated network conditions:</strong> unlike str0m's <code>tests/common.rs</code> netem-based pattern, this test runs on pristine kernel loopback — no jitter, no loss, no reordering. NACK and retransmit code paths are exercised only incidentally if the kernel happens to drop. The smoke-test purpose is "the code path executes end-to-end", not "loss-recovery is exercised"; the latter is the manual browser-matrix's job.</li>
   <li><strong>Single-threaded runtime:</strong> the test uses <code>flavor = "current_thread"</code>; the production SFU runs <code>multi_thread, worker_threads = 4</code> (Section 12.4). Per-thread races among the four production workers are not exercised.</li>
   <li><strong>The H.264 fixture is replayed as-is, not transcoded.</strong> If the committed <code>seed_h264.bin</code> happens to lack an IDR in its first N access units, the keyframe assertion fails not because the SFU broke but because the fixture is wrong. The first AU in a baseline-encoded stream from <code>ffmpeg ... -profile:v baseline</code> IS an IDR per the encoder's invariant; this should not surface in practice but is the failure mode to look at first if <code>keyframe_seen</code> is never set.</li>
-  <li><strong>The DataChannel BoxMessage round-trip is NOT bit-exact.</strong> The test asserts only that a BoxMessage arrives with one of the published <code>frame_id</code>s; the canned LA response always emits identical detections. The SFU's coordinate-normalization step (Section 10.7) is exercised but the test does not verify the resulting numeric values. Stronger assertion (worth adding once the green path lands): verify <code>msg.boxes[0].x1 ≈ 100/W</code> etc.</li>
+  <li><strong>The DataChannel BoxOverlay round-trip is NOT bit-exact.</strong> The test asserts only that a BoxOverlay arrives with one of the published <code>frame_id</code>s; the canned LA response always emits identical boxes. The SFU's coordinate-normalization step (Section 10.7) is exercised but the test does not verify the resulting numeric values. Stronger assertion (worth adding once the green path lands): match the <code>BoxOverlay::Boxes { boxes, .. }</code> variant and verify <code>boxes[0].x1 ≈ 100/1000</code> etc.</li>
   <li><strong>ICE-Lite role asymmetry:</strong> production SFU sets <code>set_ice_lite(true)</code>; the test's synthetic peers are full-ICE agents (str0m default). On kernel loopback this works because the connectivity check is trivial, but the test does not exercise the ICE-Lite role-asymmetry edge cases that show up against real browsers behind NAT.</li>
   <li><strong>DTLS active/passive role pinning:</strong> the test pins the streamer-side synthetic peer to <code>start_dtls(true)</code> (active) and the viewer-side to <code>start_dtls(false)</code> (passive). The production WS-handler-side Rtc derives active/passive from the SDP's <code>a=setup:</code> attribute; the test bypasses SDP, so any future bug introduced into that derivation is invisible to this test.</li>
 </ul>
@@ -7046,7 +7154,7 @@ echo "scripts/lint/no_hardcoded_secrets.sh: clean."
 
 <ol>
   <li><strong>Repository skeleton.</strong> Create <code>website/Cargo.toml</code> (virtual workspace), <code>website/rust-toolchain.toml</code>, <code>website/Trunk.toml</code>, <code>website/.gitignore</code>, <code>website/.dockerignore</code>, <code>website/scripts/lib/common.sh</code>, <code>website/scripts/lib/versions.sh</code>, empty <code>server/Cargo.toml</code> and <code>server/src/main.rs</code>, empty <code>wasm-client/Cargo.toml</code> and <code>wasm-client/src/lib.rs</code> and <code>wasm-client/index.html</code> and <code>wasm-client/styles.css</code>, empty <code>protocol/Cargo.toml</code> and <code>protocol/src/lib.rs</code>. Verify: <code>cargo check --workspace</code> succeeds.</li>
-  <li><strong>The <code>protocol</code> crate.</strong> Write the full <code>protocol/src/lib.rs</code> per Section 10, including the canonical template constants (Section 10.10). Add round-trip unit tests for every <code>SignalMessage</code> variant and <code>BoxMessage</code> shape. <strong>Add the <code>canonical_templates_match_prompts_py_byte_for_byte</code> unit test</strong> that uses <code>include_str!("../../../worker/prompts.py")</code> and asserts byte-equality of each canonical-template constant against the literal string parsed from the Python source. Verify: <code>cargo test -p protocol</code> passes (this test catches drift at build time).</li>
+  <li><strong>The <code>protocol</code> crate.</strong> Write the full <code>protocol/src/lib.rs</code> per Section 10, including the <code>PromptRequest</code> sum (Section 10.4), the <code>BoxOverlay</code> reply sum (Section 10.7), and the canonical template constants (Section 10.10). Add round-trip unit tests for every <code>SignalMessage</code> variant, every <code>PromptRequest</code> variant, and every <code>BoxOverlay</code> variant (boxes / points / abstained). <strong>Add the <code>canonical_templates_match_prompts_py_byte_for_byte</code> unit test</strong> that uses <code>include_str!("../../../worker/prompts.py")</code> and asserts byte-equality of each canonical-template constant against the literal string parsed from the Python source. Verify: <code>cargo test -p protocol</code> passes (this test catches drift at build time).</li>
   <li><strong>Server skeleton.</strong> Write <code>server/src/error.rs</code>, <code>server/src/state.rs</code>, <code>server/src/config.rs</code> (clap CLI for the four operator-required args + the opt-in flag — see Section 24.9), <code>server/src/tls.rs</code> (rcgen cert gen + persistence + wall-clock sanity), <code>server/src/main.rs</code> (tokio runtime, signal handling, <code>const STATE_DIR / DIST_DIR / TCP_PORT / UDP_PORT</code>, AppState construction), and <strong><code>server/src/lib.rs</code></strong> (declares <code>pub mod sfu;</code> unconditionally and <code>#[cfg(any(test, feature = "test-support"))] pub mod test_support;</code> for the integration-test seam — required so the e2e test in <code>server/tests/e2e_pipeline.rs</code> can do <code>use la_website_server::sfu::{FsmCommand, PhaseKind, PeerId};</code>). Add <code>[lib]</code> and <code>[[bin]]</code> targets to <code>server/Cargo.toml</code> so both are built. Verify: <code>cargo build --release --bin la_website_server</code> succeeds. For host-side iteration (outside Docker), run the binary directly with the four CLI args; the binary will try to read/write <code>/var/lib/la-website</code> and serve from <code>/var/dist</code> — neither of which exists outside the container, so this is for compile-check only. Real validation happens inside Docker via <code>./setup.sh</code>.</li>
   <li><strong>Authentication and rate limiting.</strong> Write <code>server/src/auth.rs</code> per Section 17 (the <code>auth_layer</code> tower middleware), and <code>server/src/http.rs</code> (the <code>fn build_router(state: Arc&lt;AppState&gt;) -&gt; Router</code> that composes <code>no_auth_routes</code> + <code>authed_routes</code> per Section 17.5, with the security-header layers applied at the outermost wrap per Section 17.4). Write integration tests using <code>reqwest = "=0.12.23", default-features = false, features = ["rustls-tls-no-provider"]</code> as a dev-dependency in <code>server/Cargo.toml</code> (NOT a runtime dependency); use it to exercise the single-surface-per-protocol policy (Authorization-header path, query-string path, the wrong-surface rejection branches, and the per-IP rate-limit overflow path) AND to verify that <code>GET /</code> succeeds WITHOUT an Authorization header (the SPA bundle is on <code>no_auth_routes</code>; see Section 17.5). The dev-only pin avoids dragging a second TLS-client stack into the runtime image.</li>
   <li><strong>CSP build pipeline + /v1/info.</strong> Write <code>server/build.rs</code> (Section 15.3), <code>server/src/csp.rs</code>, and <code>server/src/info.rs</code> (the <code>/v1/info</code> JSON handler per Section 12.3, reading <code>env!("LA_WEBSITE_GIT_SHA")</code> and the live cert metadata). Write minimal <code>wasm-client/index.html</code> with a placeholder <code>&lt;link data-trunk rel="rust"/&gt;</code>. Verify: <code>cargo build -p la_website_server</code> succeeds after a Trunk build has populated <code>wasm-client/dist/index.html</code>.</li>
