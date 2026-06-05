@@ -12,15 +12,17 @@ The model emits 6-token blocks like:
                                               N sibling <box> blocks, ALL
                                               sharing the label
 
-The literal `None` (capital N, token id 4064 in the released checkpoint)
-inside a box is the per-category abstention marker. Note that NVIDIA's
-DATA_PREPARATION.md:143 shows lowercase `none` but the trained token
-decodes to capital `None`; our regexes are numeric-only so `<box>None</box>`
-is silently dropped regardless of case — identical to NVIDIA's eval parser
-at `Embodied/evaluation/inference_grounding_ddp.py:282-300` (in the
-NVlabs/Eagle repo) which uses the same numeric-only `box_pattern`. The
-lowercase variant is also tolerated by `has_abstention` as a forward-
-compat safety net.
+The literal `None` inside a box (`<box>None</box>`) is the per-category
+abstention marker. It is NOT a dedicated special token — the released
+checkpoint has no `<None>`/`None` added token; `None` decodes as ordinary
+text sub-words between the `<box>`/`</box>` tags (verified against the model's
+`added_tokens.json` at the pinned revision). NVIDIA's DATA_PREPARATION.md:143
+shows lowercase `none`, but the trained output decodes to capital `None`;
+`_NONE_RE` matches both as a forward-compat safety net. `<box>None</box>` is
+an on-contract "this category is absent" signal — it is neither emitted as a
+detection nor counted as a deviation (it matches none of the numeric
+coordinate regexes), mirroring NVIDIA's eval parser at
+`Embodied/evaluation/inference_grounding_ddp.py:282-300` (NVlabs/Eagle).
 
 Multi-instance grounding (template 3) emits ONE <ref> followed by N sibling
 <box> blocks; all N boxes are instances of the same phrase. Our parser mirrors
@@ -32,20 +34,28 @@ ref's label.
 CONTRACT (wire v2): a Detection/Point is only emitted when it carries a
 non-empty `<ref>` label. The seven canonical templates ALWAYS emit a
 `<ref>label</ref>` before each box/point run, so a labeled geometry is the
-only on-contract shape. Two off-contract shapes can appear in non-conforming
+only on-contract shape. THREE off-contract shapes can appear in non-conforming
 model output and are explicitly NOT turned into label=None detections:
-  * an ORPHAN box/point — one with no preceding `<ref>` run at all; and
+  * an ORPHAN box/point — one with no preceding `<ref>` run at all;
   * an EMPTY-REF box/point — one inside a `<ref></ref>` run whose label
-    strips to the empty string.
-Both are dropped from the returned geometry and COUNTED in the second
-element of the (geometry, off_contract_count) tuple `parse_boxes`/
-`parse_points` return. `worker/inference.py` applies the A.3 mapping over
-those return values: it keeps the valid geometry, folds the off-contract
-count (plus any cross-shape geometry for the task) into
-`deviations_dropped`, abstains only on zero geometry of any kind, and emits
-a `model_deviation` error only when geometry was present but zero of it was
-valid for the task. The verbatim token-order emission is always recoverable
-from `InferenceResult.raw_answer`.
+    strips to the empty string; and
+  * a MALFORMED-ARITY block — a `<box>…</box>` whose contents are neither a
+    4-coord box, a 2-coord point, nor `None` (e.g. a 3- or 5-coord arity slip
+    that pure-AR / `slow` decoding can produce). NVIDIA's eval parser drops
+    these SILENTLY; we instead COUNT them via `count_malformed_geometry` so a
+    localization the model attempted can never vanish without a trace.
+All three are dropped from the returned geometry and accounted for: the first
+two in the `off_contract_count` second element of the (geometry,
+off_contract_count) tuple `parse_boxes`/`parse_points` return; the
+malformed-arity count is returned separately by `count_malformed_geometry`.
+`worker/inference.py` applies the A.3 mapping over these: it keeps the valid
+geometry, folds EVERY off-contract count (orphan/empty-ref + cross-shape
+geometry for the task + malformed-arity) into `deviations_dropped`, abstains
+only on zero geometry of any kind, and emits a `model_deviation` error
+whenever geometry was present (valid, cross-shape, or malformed) but zero of
+it was valid for the task — so a frame whose ONLY geometry is malformed is a
+loud `model_deviation`, never a silent `abstained`. The verbatim token-order
+emission is always recoverable from `InferenceResult.raw_answer`.
 
 `has_abstention` is retained as a substring utility used by the BOOT SELF-TEST
 in `worker/calibration.py` to distinguish "model emitted the trained explicit
@@ -97,6 +107,13 @@ _POINT_RE = re.compile(r"<box><(\d+)><(\d+)></box>")
 # Regex for explicit None abstention. The model emits capital-N `None` (mirroring
 # the Python literal); we also accept lowercase as a forward-compat safety net.
 _NONE_RE = re.compile(r"<box>[Nn]one</box>")
+# Regex for ANY <box>…</box> block, valid or not (lazy + DOTALL). Used by
+# `count_malformed_geometry` to surface geometry-shaped blocks that match none
+# of the on-contract numeric forms above (a malformed-arity localization).
+# Requires a closing </box>, so a TRUNCATED final block (open `<box>` with no
+# `</box>`) is NOT matched here — that case is surfaced by
+# `model_output_truncated` instead, not double-counted as a deviation.
+_ANY_BOX_RE = re.compile(r"<box>.*?</box>", flags=re.DOTALL)
 
 
 @dataclass(frozen=True)
@@ -265,9 +282,12 @@ def parse_points(
             # 2nd coord — but defensive against future regex relaxation.)
             if any(abs_start < ie and bs < abs_end for (bs, ie) in box_spans):
                 continue
-            x, y = int(pm.group(1)), int(pm.group(2))
-            if not (0 <= x <= 1000 and 0 <= y <= 1000):
-                continue
+            # Clamp to the [0,1000] grid and KEEP — never silently drop a point
+            # the model localized. This mirrors the box path's `_make_box`
+            # clamp-and-keep; the previous `continue` on out-of-range was a
+            # silent drop, asymmetric with boxes. Real coord tokens are already
+            # in range (<0>..<1000>), so this is defense-in-depth.
+            x, y = _clamp_coord(int(pm.group(1))), _clamp_coord(int(pm.group(2)))
             consumed_point_spans.append((abs_start, abs_end))
             if not label:
                 # Empty-ref point: off-contract (no non-empty label).
@@ -290,11 +310,47 @@ def parse_points(
             continue
         if any(s < ie and cs < e for (cs, ie) in consumed_point_spans):
             continue
-        x, y = int(m.group(1)), int(m.group(2))
-        if not (0 <= x <= 1000 and 0 <= y <= 1000):
-            continue
+        # Orphan point (no <ref> label): off-contract, always COUNTED — never
+        # silently dropped on range (symmetric with the box path's clamp-and-
+        # keep, which never drops a localized box on range either).
         off_contract += 1
     return out, off_contract
+
+
+def count_malformed_geometry(answer: str) -> int:
+    """Count `<box>…</box>` blocks that are geometry-shaped but match NONE of
+    the on-contract forms: a 4-coord box (`_BOX_RE`), a 2-coord point
+    (`_POINT_RE`), or the `<box>None</box>` per-category abstention (`_NONE_RE`).
+
+    These are localization attempts the model emitted in a MALFORMED shape
+    (e.g. a 3- or 5-coord block from an arity slip in pure-AR / `slow`
+    decoding). They are off-contract and MUST be accounted for: `inference.py`
+    folds this count into `deviations_dropped` and treats it as "geometry
+    present", so a frame whose ONLY geometry is malformed reports
+    `model_deviation` (loud) and NEVER a silent `abstained`, and a malformed
+    block co-emitted with valid geometry is reflected in `deviations_dropped`
+    rather than vanishing.
+
+    This is deliberately STRICTER than NVIDIA's eval parser (NVlabs/Eagle),
+    whose numeric-only `box_pattern` drops such blocks with no trace — the one
+    place we are intentionally higher-fidelity than the reference, in service
+    of the project's no-silent-drop contract.
+
+    A truncated final block (open `<box>` with no closing `</box>`) is NOT
+    counted here — `_ANY_BOX_RE` requires a `</box>`, so truncation is left to
+    `model_output_truncated` and not double-signalled as a deviation.
+    """
+    n = 0
+    for m in _ANY_BOX_RE.finditer(answer):
+        block = m.group(0)
+        if (
+            _BOX_RE.fullmatch(block)
+            or _POINT_RE.fullmatch(block)
+            or _NONE_RE.fullmatch(block)
+        ):
+            continue
+        n += 1
+    return n
 
 
 def has_abstention(answer: str) -> bool:

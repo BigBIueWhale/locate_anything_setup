@@ -143,7 +143,7 @@ from PIL import Image, ImageFile, ImageOps
 from transformers import AutoConfig, AutoModel, AutoTokenizer, AutoProcessor
 
 from . import prompts
-from .parsing import parse_boxes, parse_points
+from .parsing import parse_boxes, parse_points, count_malformed_geometry
 from .pixel_token_math import plan_resize
 
 
@@ -1027,12 +1027,15 @@ class InferenceResult:
     # models/LocateAnything-3B/modeling_locateanything.py:464,500-501
     # the loop exits ONLY on `<|im_end|>` emission OR budget exhaustion
     # (max_new_tokens=8192), so missing <|im_end|> ⇔ budget hit. The
-    # response is necessarily incomplete in that case — any block whose
-    # closing </box> did not fit is silently dropped by parse_boxes /
-    # parse_points (same behaviour as NVIDIA's eval at
-    # inference_grounding_ddp.py:282-300 numeric-only regex). Surfaces
-    # the implicit-only signal as a typed boolean so clients no longer
-    # need to substring-check raw_text themselves.
+    # response is necessarily incomplete in that case — a final block whose
+    # closing </box> did not fit has no </box>, so it matches no geometry
+    # regex (and, lacking </box>, is NOT picked up by
+    # count_malformed_geometry either): it is dropped, and THIS boolean is
+    # the signal for it. (A block that DOES close </box> but with a malformed
+    # arity is the separate case that count_malformed_geometry COUNTS as a
+    # deviation — that one is never silently dropped.) Surfaces the
+    # implicit-only signal as a typed boolean so clients no longer need to
+    # substring-check raw_text themselves.
     model_output_truncated: bool
     latency_ms: float
     image_size: tuple
@@ -1554,6 +1557,16 @@ class LocateAnythingInference:
         points_objs, point_off = parse_points(answer, image.width, image.height)
         box_dicts   = [d.to_json() for d in boxes_objs]
         point_dicts = [p.to_json() for p in points_objs]
+        # Geometry the model emitted in a MALFORMED shape — a <box>…</box> block
+        # that is neither a valid 4-coord box, a valid 2-coord point, nor the
+        # <box>None</box> abstention (e.g. an arity slip in pure-AR / `slow`
+        # decoding). NVIDIA's eval parser drops these with no trace; we COUNT
+        # them (parsing.count_malformed_geometry) so a malformed-ONLY frame is a
+        # loud `model_deviation` (never a silent `abstained`), and a malformed
+        # block co-emitted with valid geometry is reflected in
+        # `deviations_dropped`. Truncated open blocks carry no </box>, are NOT
+        # counted here, and surface via `model_output_truncated` instead.
+        malformed = count_malformed_geometry(answer)
 
         # ---- A.3 MODEL-OUTPUT → VARIANT mapping (per-item; keep valid data) ----
         # Separate parsed geometry into valid-for-task vs off-contract, then
@@ -1561,12 +1574,13 @@ class LocateAnythingInference:
         # model_deviation):
         #   * ≥1 valid-for-task geometry → success variant with the valid
         #     geometry; everything else (off-shape geometry for the task +
-        #     unlabeled/orphan/empty-ref of either shape) is DROPPED and counted
-        #     in `deviations_dropped` — kept faithful (NVIDIA's eval keeps
-        #     co-emitted valid detections; a whole-frame error would discard
-        #     them).
-        #   * zero valid-for-task BUT ≥1 geometry block emitted (all off-shape
-        #     / unlabeled) → `model_deviation` error: nothing usable to return.
+        #     unlabeled/orphan/empty-ref of either shape + malformed-arity
+        #     blocks) is DROPPED and counted in `deviations_dropped` — kept
+        #     faithful (NVIDIA's eval keeps co-emitted valid detections; a
+        #     whole-frame error would discard them).
+        #   * zero valid-for-task BUT ≥1 geometry block emitted (off-shape /
+        #     unlabeled / malformed-arity) → `model_deviation` error: nothing
+        #     usable to return.
         #   * zero geometry of ANY shape (only `<box>None</box>` literal or plain
         #     text) → `abstained` (deviations_dropped = 0).
         # Degenerate / zero-area VALID boxes are NOT a deviation — _make_box
@@ -1577,18 +1591,20 @@ class LocateAnythingInference:
             valid_count = len(point_dicts)
             # Off-contract for a point task: cross-shape boxes (valid-labeled
             # OR off-contract) + off-contract points.
-            dropped = len(box_dicts) + box_off + point_off
+            dropped = len(box_dicts) + box_off + point_off + malformed
         else:  # expected == "box"
             valid_kind = KIND_BOXES
             valid_count = len(box_dicts)
             # Off-contract for a box task: cross-shape points (valid-labeled
             # OR off-contract) + off-contract boxes.
-            dropped = len(point_dicts) + point_off + box_off
+            dropped = len(point_dicts) + point_off + box_off + malformed
         # Did the model emit ANY geometry block at all (valid-for-task,
-        # cross-shape, or off-contract)? `<box>None</box>` matches none of the
-        # numeric regexes, so a pure-abstention / pure-text response is False.
+        # cross-shape, off-contract, or MALFORMED-arity)? `<box>None</box>`
+        # matches none of these, so a pure-abstention / pure-text response is
+        # False and correctly routes to `abstained`; a malformed-only response
+        # is True and routes to the loud `model_deviation`.
         any_geometry_block = bool(
-            box_dicts or point_dicts or box_off or point_off
+            box_dicts or point_dicts or box_off or point_off or malformed
         )
 
         model_output_truncated = not answer.endswith("<|im_end|>")
