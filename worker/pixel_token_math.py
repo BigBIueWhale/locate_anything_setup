@@ -66,8 +66,16 @@ def plan_resize(width: int, height: int) -> ImageResize:
     total_patches = (w // PATCH_SIZE) * (h // PATCH_SIZE)
     if total_patches > IN_TOKEN_LIMIT:
         scale = math.sqrt(IN_TOKEN_LIMIT / total_patches)
-        w = max(int(round(w * scale)), PATCH_SIZE)
-        h = max(int(round(h * scale)), PATCH_SIZE)
+        # Match the model's `rescale()` EXACTLY:
+        #   new_w, new_h = int(w * scale), int(h * scale)
+        # (image_processing_locateanything.py) — a plain floor, with NO round()
+        # and NO max-with-PATCH_SIZE. This sqrt-downscale branch is dead for any
+        # image the server accepts (ws.rs / inference reject
+        # (w//14)*(h//14) > 25600 before this runs), so plan_resize is purely an
+        # informational mirror of the processor; mirroring it faithfully keeps
+        # the reported resize_plan byte-exact to what the model would compute.
+        w = int(w * scale)
+        h = int(h * scale)
     # Target dims: next multiple of 28 on each axis (the processor
     # anamorphically resizes the image to these — it does not border-pad).
     grid = PATCH_SIZE * MERGE_KERNEL

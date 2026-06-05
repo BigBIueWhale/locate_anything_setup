@@ -423,17 +423,23 @@ async fn process_binary(
     //       internally BICUBIC-rescale to fit; the client's frame_id would
     //       then refer to a different spatial frame than the one returned.
     //
-    //   (b) `W // 14 < 512` AND `H // 14 < 512` — line 68 of rescale().
-    //       The MoonViT positional embedding is a 64×64 base learnable
-    //       embedding bicubic-interpolated up to the runtime grid; 512
-    //       patches per side is the documented "Exceed pos emb" hard cap
-    //       (image_processing_locateanything.py line 68-69). Beyond this
-    //       the preprocessor raises a Python ValueError — we want a clean
-    //       client-side rejection at the WS edge instead.
+    //   (b) `target_W // 14 < 512` AND `target_H // 14 < 512` — line 67-68 of
+    //       rescale(). The MoonViT positional embedding is a 64×64 base
+    //       learnable embedding bicubic-interpolated up to the runtime grid;
+    //       512 patches per side is the documented "Exceed pos emb" hard cap.
+    //       Beyond it the preprocessor raises a Python ValueError — we want a
+    //       clean client-side rejection at the WS edge instead.
     //
-    //   (NB: the formula uses FLOOR-DIV on the raw 14-px patch grid, NOT
-    //   ceil-div on the merged 28-px grid. We had this wrong in a prior
-    //   revision — verified against NVIDIA's code at the SHA pin.)
+    //   (NB: the cap is FLOOR-DIV by the raw 14-px patch size, but on the
+    //   POST-resize dimensions. rescale() reassigns `w, h = image.size` at
+    //   line 67, AFTER the anamorphic ceil-to-28 step, so the gate is on
+    //   `target = ceil(dim/28)*28`, NOT on the raw input. Because we already
+    //   reject anything over IN_TOKEN_LIMIT (so the model performs no sqrt-
+    //   downscale on an image we accept), the model's post-resize side is
+    //   exactly `ceil(raw/28)*28` — we compute that below and gate on it, so
+    //   the edge check is bit-faithful to the model's own gate. A prior
+    //   revision gated on the raw input and was off by the ceil step; verified
+    //   against NVIDIA's code at the SHA pin.)
     //
     // At the current LA_MAX_IMAGE_DIM=2240, both checks are dormant
     // (2240/14 = 160 per side → 25,600 patches square / 160 < 512), so
@@ -463,19 +469,27 @@ async fn process_binary(
             ),
         };
     }
-    if w_patches >= POS_EMB_PATCH_CAP || h_patches >= POS_EMB_PATCH_CAP {
+    // Pos-emb cap on the POST-resize grid (rescale() line 67-68): the dims
+    // after the anamorphic ceil-to-28 step. For an image we accept (no sqrt-
+    // downscale, since we rejected > IN_TOKEN_LIMIT above) the model's
+    // post-resize side is exactly `ceil(raw/28)*28`.
+    const LLM_TOKEN_PX: u64 = 28; // patch(14) * merge(2) — the 28-px resize grid
+    let target_w = (w as u64).div_ceil(LLM_TOKEN_PX) * LLM_TOKEN_PX;
+    let target_h = (h as u64).div_ceil(LLM_TOKEN_PX) * LLM_TOKEN_PX;
+    let w_patches_post = target_w / PATCH_PX;
+    let h_patches_post = target_h / PATCH_PX;
+    if w_patches_post >= POS_EMB_PATCH_CAP || h_patches_post >= POS_EMB_PATCH_CAP {
         return BinaryOutcome::PerFrame {
             frame_id,
             code: ErrorCode::InvalidImage,
             message: format!(
-                "image dimensions {}x{} would map to a {}×{} patch grid; the \
-                 MoonViT positional embedding's bicubic-interpolation cap is \
-                 {} patches per side (= {} px), per the model's preprocessor \
-                 at image_processing_locateanything.py line 68 (\"Exceed pos \
-                 emb\"). Reduce each dimension to < {} px.",
-                w, h, w_patches, h_patches,
-                POS_EMB_PATCH_CAP, POS_EMB_PATCH_CAP * PATCH_PX,
-                POS_EMB_PATCH_CAP * PATCH_PX
+                "image dimensions {}x{} resize to {}×{} on the 28-px grid = a \
+                 {}×{} ViT patch grid; the MoonViT positional embedding's \
+                 bicubic-interpolation cap is {} patches per side, per the \
+                 model's preprocessor rescale() (\"Exceed pos emb\"). Reduce \
+                 each dimension so ceil(dim/28)*2 < {}.",
+                w, h, target_w, target_h, w_patches_post, h_patches_post,
+                POS_EMB_PATCH_CAP, POS_EMB_PATCH_CAP
             ),
         };
     }
