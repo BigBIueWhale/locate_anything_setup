@@ -94,45 +94,77 @@ diagnostic includes that URL so the client always knows where to look.
 `models/LocateAnything-3B/modeling_locateanything.py:347-353` and
 `models/LocateAnything-3B/generate_utils.py`.
 
-* **fast** — Multi-Token Prediction (MTP) only. Predicts the 6-token
-  `<box>...<...>...</box>` block in a single forward pass and never
-  falls back to autoregressive decoding. ~3x faster than slow.
-* **hybrid** (default) — MTP first; if the predicted block doesn't
-  match the box pattern, switch to AR for the malformed coords,
-  switch back to MTP after `</box>`. Best balance.
-* **slow** — pure AR, the way training was supervised. Highest
-  accuracy on hard / dense / tiny cases.
+* **fast** — Multi-Token Prediction (MTP) only ("Parallel Box Decoding"
+  in NVIDIA's README; "SDLM" block-diffusion in the code). Predicts a
+  6-slot `<box>x1 x2 y1 y2</box>` block in one forward pass through the
+  single shared `lm_head` (no draft heads, no speculative verification)
+  and keeps it; never falls back to autoregressive. **15.3 blocks/sec —
+  ~3.6× faster than slow.**
+* **hybrid** (default) — MTP first; if a predicted box block is malformed
+  (coords don't cleanly close) switch to AR for that block's coordinates,
+  then switch back to MTP after `</box>`. **12.7 blocks/sec — ~2.9×
+  faster than slow.** Best balance.
+* **slow** — pure AR, the way training was supervised. **4.3 blocks/sec.**
+  Highest accuracy on hard / dense / tiny / text cases.
 
-### NVIDIA paper Table 12 — per-task mode F1
+> The decode is **lossy** parallel block prediction, NOT lossless
+> speculative decoding — the code has no verify-against-the-base-model
+> step, so the chosen mode genuinely changes the emitted tokens (hence the
+> task-dependent F1 deltas below); it is not merely a speed knob.
 
-The F1@mIoU delta between modes is task-dependent and sometimes very
-large. Quoted directly from paper §C.4:
+### NVIDIA paper Table 12 — per-task mode metrics
 
-| Task                            | fast | hybrid | **slow** | Pick |
-|---------------------------------|------|--------|----------|------|
-| LVIS (open-vocab detection)     | ~50  | 50.7   | 50.9     | hybrid |
-| COCO (detection)                | 54.0 | 54.7   | 54.9     | hybrid |
-| Dense200 (dense detection)      | 46.8 | 61.3   | **61.5** | hybrid or slow |
-| **VisDrone (tiny / sky-like)**  | 34.4 | 39.8   | **40.2** | **slow** |
-| RefCOCOg test (referring)       | 75.8 | 77.6   | 77.5     | hybrid |
-| HumanRef (people referring)     | 76.4 | 78.7   | 78.9     | hybrid |
-| ScreenSpot-Pro (GUI point)      | 60.3 | 60.4   | 60.2     | **fast** |
-| **OCR HierText**                | 28.8 | 29.1   | **43.2** | **slow** |
-| **OCR SROIE**                   | 38.8 | 39.3   | **64.4** | **slow** |
-| OCR ICDAR2015 / TotalText       | ~50  | ~50    | ~50      | hybrid |
-| Layout DocLayNet                | 75.8 | 76.8   | 76.9     | hybrid |
-| Pointing VisDrone               | 58.1 | 60.4   | **61.3** | slow |
+The per-mode delta is task-dependent and sometimes very large. Quoted
+verbatim from the paper's **Appendix C.2** ("Comprehensive Performance
+Across Decoding Modes"), Table 12. Metric is **F1@mIoU** unless noted —
+ScreenSpot-Pro is top-1 **Accuracy**, the Pointing block is **F1@Point**.
+COCO and LVIS were evaluated at short-side 840 px; every other benchmark
+at its original resolution (paper §C.5).
+
+| Task                            | Metric   | fast | hybrid | **slow** |
+|---------------------------------|----------|------|--------|----------|
+| COCO (detection)                | F1@mIoU  | 52.2 | 54.7   | **55.1** |
+| LVIS (open-vocab detection)     | F1@mIoU  | 47.0 | 50.7   | **52.6** |
+| Dense200 (dense detection)      | F1@mIoU  | 46.8 | 61.3   | **61.5** |
+| **VisDrone (tiny / sky-like)**  | F1@mIoU  | 34.4 | 39.8   | **40.2** |
+| OCR HierText                    | F1@mIoU  | 28.8 | 29.1   | **43.2** |
+| OCR ICDAR2015                   | F1@mIoU  | 26.6 | 26.4   | **27.3** |
+| OCR TotalText                   | F1@mIoU  | 44.4 | 44.6   | **47.5** |
+| **OCR SROIE**                   | F1@mIoU  | 38.8 | 39.3   | **64.4** |
+| Layout DocLayNet                | F1@mIoU  | 67.2 | 77.7   | **80.4** |
+| Layout M6Doc                    | F1@mIoU  | 64.1 | **70.5** | 69.7   |
+| GUI ScreenSpot-Pro              | Accuracy | 59.7 | 60.3   | **60.5** |
+| HumanRef (people referring)     | F1@mIoU  | 66.8 | 78.5   | **79.1** |
+| RefCOCOg val (referring)        | F1@mIoU  | 70.8 | **73.4** | 72.4   |
+| RefCOCOg test (referring)       | F1@mIoU  | 72.5 | **74.8** | 73.8   |
+| Pointing COCO                   | F1@Point | 83.1 | 83.9   | **84.8** |
+| Pointing LVIS                   | F1@Point | 74.4 | 76.6   | **76.9** |
+| Pointing Dense200               | F1@Point | **89.4** | 87.6 | 88.3   |
+| **Pointing VisDrone**           | F1@Point | 58.1 | 60.4   | **61.3** |
 
 **Recommendations baked from this table:**
 
-- **Tiny / distant objects (drones, surveillance, VisDrone-style)**:
-  use `slow`. Up to **+5 F1** over fast on this regime.
-- **OCR (HierText, SROIE)**: use `slow`. Up to **+25 F1** over hybrid
-  on SROIE — the largest mode-delta in the entire benchmark.
-- **GUI grounding**: `fast` is fine — the three modes are within 0.2
-  F1 of each other and fast is 3× cheaper.
-- **Detection / referring / layout** (the bulk of normal use):
-  `hybrid` is the right default — the slow upside is sub-1-F1.
+- **OCR / dense text (HierText, SROIE)**: use `slow`. SROIE is **+25.1 F1**
+  over hybrid (64.4 vs 39.3) — the largest mode-delta in the whole
+  benchmark; HierText is +14.1. (TotalText +2.9, ICDAR2015 ~+1.)
+- **Tiny / distant objects (drones, VisDrone)**: use `slow`. +5.8 F1 over
+  fast on detection (+0.4 over hybrid); +3.2 over fast on pointing.
+- **Layout (DocLayNet)**: `slow` buys +2.7 over hybrid for fine layout;
+  M6Doc is the exception (hybrid 70.5 > slow 69.7).
+- **Detection (COCO/LVIS/Dense200)**: `hybrid` is the right live-video
+  default — but note open-vocab LVIS buys **+1.9 F1** at `slow`
+  (52.6 vs 50.7) when accuracy outweighs throughput.
+- **Referring (RefCOCOg, HumanRef)**: `hybrid` — it is the *best* mode on
+  both RefCOCOg splits (beats slow) and within ~0.6 on HumanRef.
+- **GUI grounding (ScreenSpot-Pro)**: the three modes are within ~0.8;
+  `slow` is marginally best and `fast` marginally **worst**, so `hybrid`
+  is the safe middle. (A prior version of this table inverted this row and
+  claimed `fast` was best — a transcription error, corrected against §C.2.)
+
+`fast` collapses on **dense** content (Dense200 46.8 vs hybrid 61.3, a
+14.5-pt cliff; all OCR), so it is never the right pick for this project's
+detection/OCR workloads — only mode-insensitive GUI / easy-content
+pointing tolerate it.
 
 Every Frame's `generation_mode` field is required per request — the
 server applies no default. Clients should pick based on the task per
@@ -148,28 +180,42 @@ FA4-class cutlass kernels are not buildable on consumer Blackwell —
 see [`docs/PINNED_VERSIONS.md`](./PINNED_VERSIONS.md) §`flash-attn
 (source build, sm_120 only)` for the structural reason and
 [`worker/inference.py`](../worker/inference.py) lines 16-46 for the
-mask-equivalence argument. The two paths construct identical
-block-causal masks (verified by branch at `modeling_qwen2.py:1321-1335`
-on `_attn_implementation`) and apply them to the same
-`softmax(QK^T/√d + mask)V`; the per-call delta is bf16
-reduction-order ULP noise (verified in-container: ~1e-3 abs per
-attention call). The mathematical audit bound: < 1 % of generated
-coord tokens shift by ≤ 1 quantization step (≤ 2.24 px at the
-2240 px image cap). Treat the table as accurate to ≈ ±0.2 F1; do
-not treat it as attention-backend-identical to your measurements.
+mask-equivalence argument. The two paths are INDEPENDENTLY-written mask
+constructors (magi's `build_magi_ranges` vs the sdpa
+`update_causal_mask_for_one_gen_window_2d`, dispatched at
+`modeling_qwen2.py:1321-1335` on `_attn_implementation`); they produce
+**identical attention support** — the same attend / don't-attend pattern
+for every (query, key) pair — on **every (q_len, kv_len) regime this
+server can actually reach** (prefill, steady-state MTP blocks, and AR
+steps), confirmed by reconstructing both constructors from the
+pinned-SHA source and diffing their boolean masks. This is a
+*reachability* argument, not a closed-form proof of function-equality:
+the one corner where the two diverge — `q_len == kv_len == block_size (6)`,
+where the sdpa overlay's blocked column `K-B-1 == -1` negative-index-wraps
+while magi guards it out — is structurally **unreachable** here (the
+sequence is always image + prompt tokens ≫ 6, and that forward is
+prefill/AR, which skips the overlay entirely). Within that identical
+support the only difference is bf16 reduction-order ULP noise (~1e-3 abs
+per attention call; it can perturb a softmax value but cannot flip an
+attend decision); the audit bound is < 1 % of generated coord tokens
+shifting by ≤ 1 quantization step (≤ 2.24 px at the 2240 px image cap).
+So treat the table as accurate to ≈ ±0.2 F1, not as
+attention-backend-identical to your own measurements.
 
-The MoonViT vision encoder uses the same SDPA (scaled-dot-product-attention, PyTorch's built-in) mem-eff override (its
-own sdpa_attention is rebuilt with bf16 additive masks + 4D tensors
-via `_patch_vit_sdpa_to_mem_efficient`). Asymmetric-aspect numerical
-equivalence was directly measured against the upstream math-backend
-fallback on multi-segment masks: max absolute delta **6e-5** across
-grids from 2×2 to 160×160 patches and aspect ratios from 1:70 to 70:1
-— below the bf16 ULP at the encoder's output magnitude range, i.e.
-bit-equivalent within representable precision. Verified in-container
-on synthetic 2240×280 panorama, 280×2240 portrait, and 64×64 tiny
-inputs; 10-trial stability on the 16:1 panorama showed y-stdev of
-2.9 pixels (strongly self-consistent across the 27-layer × 16-head
-attention stack).
+The MoonViT vision encoder runs its trained **FlashAttention-2** kernel,
+NOT sdpa: unlike the LLM's magi kernel, MoonViT's FA2 *is* buildable on
+sm_120, and `worker/inference.py`'s `_force_vit_flash_attn_2` pins it
+there. The sdpa mem-eff override for the ViT
+(`_patch_vit_sdpa_to_mem_efficient` — it rebuilds the encoder's
+sdpa_attention with bf16 additive masks + 4D tensors) is a **dormant
+fallback** on this deployment, faithful but off the happy path. The
+numerical-equivalence figures that follow therefore validate that
+fallback, not the FA2 encoder the server actually runs: max absolute
+delta **6e-5** vs the upstream math backend across grids from 2×2 to
+160×160 patches and aspect ratios from 1:70 to 70:1 — below the bf16 ULP
+at the encoder's output magnitude range. Verified in-container on
+synthetic 2240×280 panorama, 280×2240 portrait, and 64×64 tiny inputs;
+10-trial stability on the 16:1 panorama showed a y-stdev of 2.9 pixels.
 
 ## Generation parameters (used by every benchmark in the paper)
 
