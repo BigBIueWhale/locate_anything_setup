@@ -437,8 +437,7 @@ async fn process_binary(
     //   reject anything over IN_TOKEN_LIMIT (so the model performs no sqrt-
     //   downscale on an image we accept), the model's post-resize side is
     //   exactly `ceil(raw/28)*28` — we compute that below and gate on it, so
-    //   the edge check is bit-faithful to the model's own gate. A prior
-    //   revision gated on the raw input and was off by the ceil step; verified
+    //   the edge check is bit-faithful to the model's own gate, verified
     //   against NVIDIA's code at the SHA pin.)
     //
     // At the current LA_MAX_IMAGE_DIM=2240, both checks are dormant

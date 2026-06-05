@@ -1421,22 +1421,26 @@ class LocateAnythingInference:
         # for the Rust front-end's checks. The model's
         # image_processing_locateanything.py:rescale() enforces:
         #   (a) `(W // 14) * (H // 14) <= in_token_limit (=25,600)`
-        #       (line 52). FLOOR-div on the raw 14-px patch grid, NOT
-        #       ceil-div on the merged 28-px grid (a prior revision of
-        #       this gate had it wrong).
-        #   (b) `W // 14 < 512` AND `H // 14 < 512` (line 68 — "Exceed
-        #       pos emb"). The MoonViT base learned positional embedding
-        #       is 64×64, bicubic-interpolated to the runtime grid;
-        #       512 patches per side is the documented hard cap.
-        # Both are dormant at the current LA_MAX_IMAGE_DIM=2240 (each
-        # check needs W or H ≥ 2254 / ≥ 7168 respectively to trip) but
-        # enforce the trained-correct contract regardless of cap.
+        #       (line 52) — FLOOR-div on the raw 14-px patch grid. Above
+        #       this the model would BICUBIC-downscale to fit; we refuse
+        #       instead, so detections are never relative to a silently
+        #       resized frame.
+        #   (b) `target // 14 < 512` per side (line 67-68, "Exceed pos
+        #       emb"), where `target = ceil(dim/28)*28` is the POST-resize
+        #       dimension — rescale() reassigns `w, h = image.size` AFTER
+        #       the anamorphic ceil-to-28 step, so the cap is on the resized
+        #       grid, not the raw input. For an image that passes (a) the
+        #       model does no sqrt-downscale, so `target = ceil(raw/28)*28`.
+        #       The MoonViT base learned positional embedding is 64×64,
+        #       bicubic-interpolated to the runtime grid; 512 patches per
+        #       side is the documented hard cap.
+        # Both are dormant at the current LA_MAX_IMAGE_DIM=2240 (they need
+        # W or H ≥ 2254 / ≥ 7141 respectively to trip) but enforce the
+        # trained-correct contract regardless of cap.
         w, h = image.width, image.height
-        PATCH_PX, IN_TOKEN_LIMIT, POS_EMB_CAP = 14, 25600, 512
-        w_patches = w // PATCH_PX
-        h_patches = h // PATCH_PX
-        n_patches = w_patches * h_patches
-        if n_patches > IN_TOKEN_LIMIT:
+        PATCH_PX, GRID_PX, IN_TOKEN_LIMIT, POS_EMB_CAP = 14, 28, 25600, 512
+        if (w // PATCH_PX) * (h // PATCH_PX) > IN_TOKEN_LIMIT:
+            n_patches = (w // PATCH_PX) * (h // PATCH_PX)
             raise ValueError(
                 f"image dimensions {w}x{h} produce {n_patches} ViT patches "
                 f"((W // {PATCH_PX}) × (H // {PATCH_PX})), exceeding the "
@@ -1446,13 +1450,17 @@ class LocateAnythingInference:
                 f"to send within budget. Reduce dimensions so "
                 f"(W // {PATCH_PX}) × (H // {PATCH_PX}) ≤ {IN_TOKEN_LIMIT}."
             )
-        if w_patches >= POS_EMB_CAP or h_patches >= POS_EMB_CAP:
+        # 512 cap on the POST-resize grid, matching rescale() line 67-68:
+        # target = ceil(dim / 28) * 28, then target // 14 (= ceil(dim/28) * 2).
+        target_w = ((w + GRID_PX - 1) // GRID_PX) * GRID_PX
+        target_h = ((h + GRID_PX - 1) // GRID_PX) * GRID_PX
+        wp, hp = target_w // PATCH_PX, target_h // PATCH_PX
+        if wp >= POS_EMB_CAP or hp >= POS_EMB_CAP:
             raise ValueError(
-                f"image dimensions {w}x{h} would map to a "
-                f"{w_patches}×{h_patches} patch grid, exceeding MoonViT's "
-                f"positional-embedding cap of {POS_EMB_CAP} patches per "
-                f"side (= {POS_EMB_CAP * PATCH_PX} px). Reduce each "
-                f"dimension to < {POS_EMB_CAP * PATCH_PX} px."
+                f"image dimensions {w}x{h} resize to {target_w}x{target_h} "
+                f"on the 28-px grid = a {wp}×{hp} ViT patch grid, exceeding "
+                f"MoonViT's positional-embedding cap of {POS_EMB_CAP} patches "
+                f"per side. Reduce each dimension so ceil(dim/28)*2 < {POS_EMB_CAP}."
             )
 
         # Plan resize before model touches it — log for debug/audit.

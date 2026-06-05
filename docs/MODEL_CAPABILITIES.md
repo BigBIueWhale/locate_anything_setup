@@ -158,8 +158,7 @@ at its original resolution (paper §C.5).
   both RefCOCOg splits (beats slow) and within ~0.6 on HumanRef.
 - **GUI grounding (ScreenSpot-Pro)**: the three modes are within ~0.8;
   `slow` is marginally best and `fast` marginally **worst**, so `hybrid`
-  is the safe middle. (A prior version of this table inverted this row and
-  claimed `fast` was best — a transcription error, corrected against §C.2.)
+  is the safe middle.
 
 `fast` collapses on **dense** content (Dense200 46.8 vs hybrid 61.3, a
 14.5-pt cliff; all OCR), so it is never the right pick for this project's
