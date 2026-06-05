@@ -74,7 +74,7 @@
 <body>
 
 <h1>Plan Review — Open Issues &amp; Principle-Violations</h1>
-<p><strong>Companion to <code>plan.html</code>.</strong> Living open-issues register — first compiled 2026-06-02, last updated 2026-06-03.</p>
+<p><strong>Companion to <code>plan.html</code>.</strong> Living open-issues register — first compiled 2026-06-02, last updated 2026-06-05.</p>
 
 <div class="note note-info">
 This is the <strong>living, single source of truth</strong> for open issues in <code>website/plan.html</code> — not a frozen snapshot. It began as the verbatim issue list from the plan review and is now kept by one rule: <strong>anything we confirm gets documented here; anything we fix in the plan gets removed.</strong> Each entry follows one shape: <em>why the planner reached for it</em> (it almost always had a good reason), and <em>why it may nonetheless be an issue</em> — including the ones that look perfectly legitimate but quietly violate a stated principle. These are arguments to have and bugs to consider, recorded for the operator's decision.
@@ -92,7 +92,7 @@ This is the <strong>living, single source of truth</strong> for open issues in <
 
 <p class="lead">Now the lineup.</p>
 
-<div class="issue"><strong>1. The locked request.</strong> The request is chosen once at claim — typed and slot-validated — then frozen for the whole ownership session: clean, atomic, no half-claimed states. (The old cruelty is gone: the model disliking a single frame no longer ejects you — it banners and you keep streaming; only a structurally-bad request, which the typed builder all but prevents, releases the slot.) What's left is milder but real — on a demo whose entire sport is fiddling with prompts, changing yours mid-session still costs you the chair: you must release and re-claim.</div>
+<div class="issue"><strong>1. The locked request.</strong> The request is chosen once at claim — typed and slot-validated — then frozen for the whole ownership session: clean, atomic, no half-claimed states. The friction: on a demo whose entire sport is fiddling with prompts, changing yours mid-session costs you the chair — you must release the slot and re-claim.</div>
 
 <div class="issue"><strong>2. The clock bouncer.</strong> Refuse to boot if the wall clock reads before 2024, because Transport Layer Security can't validate a certificate against a 1970 clock — honest failure. But a "sovereign, never-goes-down" box that won't start until Network Time Protocol whispers it the time is a small external dependency wearing a large independence badge.</div>
 
@@ -102,9 +102,9 @@ This is the <strong>living, single source of truth</strong> for open issues in <
 
 <div class="issue"><strong>5. The Internet-Protocol-version-4 doorman.</strong> You named <code>127.0.0.1</code> and <code>0.0.0.0</code>, neither is version 6, so: IPv4 only, no IPv6 socket, ever. But that reads "two example addresses" as "outlaw the other protocol," and silently bars every viewer stranded on an IPv6-only phone behind Carrier-Grade Network Address Translation. For "everybody viewing," that's a real somebody.</div>
 
-<div class="issue"><strong>6. The blurry star of the show.</strong> Cap capture at 1280×720 because the forced H.264 Constrained Baseline Level 3.1 codec can't legally climb higher. But we then hand the grounding model a deliberately shrunk frame — against its stated appetite for 1440p — and paint its answers a full second late over buttery video. The detection is the act; we dimmed the spotlight to make the curtains sway nicely.</div>
+<div class="issue"><strong>6. The codec caps the pixels-on-target.</strong> Capture is pinned at 1280×720 because the forced H.264 Constrained Baseline Level 3.1 — chosen for cross-browser reach — can't legally climb higher. The model is native-resolution and would use every pixel it's handed, but this demo's headline job is <em>tiny, distant</em> objects — drones — where pixels-on-target is the whole game. So the one place the demo most needs resolution is exactly where the codec, not the model, draws the line.</div>
 
-<div class="issue"><strong>7. The unfair referee.</strong> A per-frame model hiccup no longer ejects the streamer — it banners now, and streaming continues. But the asymmetry survives one layer up: if the LocateAnything-3B WebSocket itself drops (an LA restart, a LAN blip, the 5 AM router cycle), the streamer is fast-drained with no grace, while their own network blip earns a cozy 30-second one. Still punished hardest for the thing — the model's connection — that was never theirs to control.</div>
+<div class="issue"><strong>7. The unfair referee.</strong> If the LocateAnything-3B WebSocket drops — an LA restart, a LAN blip, the 5 AM router cycle — the streamer is fast-drained with no resume grace, while their own network blip earns a cozy 30-second one. Punished hardest for the thing they don't control: the model's connection.</div>
 
 <div class="issue"><strong>8. One waiter, whole restaurant.</strong> Run the entire Selective Forwarding Unit on a single actor task — no locks, no shared-state races, gloriously correct. But "everybody viewing" then squeezes through one thread sized for ~50 guests, and the plan itself shrugs that 100 is untested. Correct, right up until it's a queue.</div>
 
