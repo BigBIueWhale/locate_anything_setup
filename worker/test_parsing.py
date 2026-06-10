@@ -18,6 +18,7 @@ import sys
 # heavyweight worker package __init__ (torch/PIL).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import parsing  # noqa: E402
+import prompts  # noqa: E402
 
 W, H = 1920, 1080
 
@@ -83,8 +84,49 @@ def test_parse_points_valid():
 
 
 def test_orphan_point_counted_not_dropped():
+    # Bare point with no point_label (a BOX task): cross-shape, off-contract —
+    # counted, never silently dropped. On the `point` task the same bare point
+    # is instead LABELED with the queried phrase; see the point-task tests below.
     pts, off = parsing.parse_points("<box><10><20></box>", W, H)
     assert pts == [] and off == 1
+
+
+# ---- parse_points point-task labeling: the bare-point fix ---------------------
+
+def test_bare_point_labeled_with_queried_phrase():
+    # Template 7's TRAINED output is a bare <box><x><y></box> with no <ref>
+    # (DATA_PREPARATION.md:195). On the point task it must be LABELED with the
+    # queried phrase, not dropped — the bug this fix closes.
+    pts, off = parsing.parse_points(
+        "<box><950><30></box>", W, H, point_label="drone in the sky"
+    )
+    assert off == 0 and len(pts) == 1
+    assert pts[0].label == "drone in the sky"
+    assert pts[0].point_norm == [950, 30]
+
+
+def test_multiple_bare_points_all_get_phrase():
+    # Per-category pointing can return several points for the one queried
+    # category; every bare point inherits that single phrase label.
+    s = "<box><950><30></box><box><500><80></box><box><120><640></box>"
+    pts, off = parsing.parse_points(s, W, H, point_label="drone")
+    assert off == 0 and len(pts) == 3
+    assert all(p.label == "drone" for p in pts)
+
+
+def test_bare_point_clamped_and_labeled():
+    # Defensive: an out-of-grid coord is clamped-and-kept, still labeled.
+    pts, off = parsing.parse_points("<box><1500><30></box>", W, H, point_label="x")
+    assert off == 0 and len(pts) == 1 and pts[0].point_norm == [1000, 30]
+
+
+def test_ref_labeled_point_keeps_ref_not_point_label():
+    # A point inside a <ref> run is labeled by that ref; point_label only labels
+    # BARE points (pass 2), so a ref-labeled point is unaffected by it.
+    pts, off = parsing.parse_points(
+        "<ref>icon</ref><box><10><20></box>", W, H, point_label="ignored"
+    )
+    assert off == 0 and len(pts) == 1 and pts[0].label == "icon"
 
 
 # ---- parse_boxes regression (unchanged behaviour) -----------------------------
@@ -114,10 +156,16 @@ def test_parse_boxes_multi_category_some_absent():
 
 # ---- routing simulation: malformed-only -> model_deviation, not abstained -----
 
-def _route(answer, expected_shape):
-    """Mirror inference.py's A.3 arithmetic over the parser primitives."""
+def _route(answer, expected_shape, point_label=None):
+    """Mirror inference.py's A.3 arithmetic over the parser primitives.
+
+    `point_label` is threaded into parse_points only for the point task, exactly
+    as inference.py passes `prompts.point_phrase(prompt)` for the `point` task
+    and None otherwise."""
     boxes, box_off = parsing.parse_boxes(answer, W, H)
-    points, point_off = parsing.parse_points(answer, W, H)
+    points, point_off = parsing.parse_points(
+        answer, W, H, point_label=(point_label if expected_shape == "point" else None)
+    )
     malformed = parsing.count_malformed_geometry(answer)
     if expected_shape == "point":
         valid = len(points)
@@ -149,6 +197,51 @@ def test_valid_plus_malformed_keeps_valid_and_counts():
         "<ref>cat</ref><box><10><20><30><40></box><box><1><2><3></box>", "box"
     )
     assert kind == "success" and dropped == 1
+
+
+def test_point_task_bare_points_route_to_success():
+    # THE fix end-to-end: the point task's trained bare-point output used to
+    # route to model_deviation (0 points). With the queried phrase as the label
+    # it must now be a success carrying the labeled point, dropping nothing.
+    kind, dropped = _route("<box><950><30></box>", "point", point_label="drone")
+    assert kind == "success" and dropped == 0
+
+
+def test_point_task_cross_shape_box_still_deviates():
+    # A 4-coord box under the point task is genuinely cross-shape (the model
+    # gave a box when asked to point) → loud model_deviation, count the drop.
+    kind, dropped = _route(
+        "<ref>x</ref><box><10><20><30><40></box>", "point", point_label="drone"
+    )
+    assert kind == "model_deviation" and dropped == 1
+
+
+def test_point_task_none_still_abstains():
+    # `<box>None</box>` on the point task is the trained "nothing here" → abstain.
+    kind, dropped = _route("<box>None</box>", "point", point_label="drone")
+    assert kind == "abstained" and dropped == 0
+
+
+# ---- prompts.point_phrase: byte-exact inverse of the point template -----------
+
+def test_point_phrase_round_trips():
+    assert prompts.point_phrase(prompts.point_to("drone in the sky")) == "drone in the sky"
+    assert prompts.point_phrase("Point to: quadcopter.") == "quadcopter"
+
+
+def test_point_phrase_preserves_interior_period():
+    # The slot validator forbids a TRAILING '.' but allows interior ones; only
+    # the template's single trailing period is removed.
+    assert prompts.point_phrase("Point to: the U.S. flag.") == "the U.S. flag"
+
+
+def test_point_phrase_rejects_non_point_prompt():
+    try:
+        prompts.point_phrase("Detect all the text in box format.")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected ValueError on a non-point prompt")
 
 
 if __name__ == "__main__":

@@ -1562,7 +1562,17 @@ class LocateAnythingInference:
         # which are off-contract for wire v2 and dropped+counted, never
         # emitted (see worker/parsing.py module docstring).
         boxes_objs, box_off = parse_boxes(answer, image.width, image.height)
-        points_objs, point_off = parse_points(answer, image.width, image.height)
+        # For the `point` task the model's TRAINED output is a BARE point
+        # (`<box><x><y></box>`, no `<ref>`); label each with the queried phrase,
+        # recovered from the canonical prompt via the single-source template
+        # module (`prompts.point_phrase`), matching NVIDIA's per-category
+        # pointing attribution (inference_grounding_ddp.py:297-312). For every
+        # other task `point_label` is None, so a bare point is cross-shape and
+        # off-contract.
+        point_label = prompts.point_phrase(prompt) if prompt_task == "point" else None
+        points_objs, point_off = parse_points(
+            answer, image.width, image.height, point_label=point_label
+        )
         box_dicts   = [d.to_json() for d in boxes_objs]
         point_dicts = [p.to_json() for p in points_objs]
         # Geometry the model emitted in a MALFORMED shape — a <box>…</box> block
@@ -1581,11 +1591,13 @@ class LocateAnythingInference:
         # resolve to exactly one variant (boxes XOR points XOR abstained XOR
         # model_deviation):
         #   * ≥1 valid-for-task geometry → success variant with the valid
-        #     geometry; everything else (off-shape geometry for the task +
-        #     unlabeled/orphan/empty-ref of either shape + malformed-arity
-        #     blocks) is DROPPED and counted in `deviations_dropped` — kept
-        #     faithful (NVIDIA's eval keeps co-emitted valid detections; a
-        #     whole-frame error would discard them).
+        #     geometry; everything else (geometry in the wrong shape for the
+        #     task + orphan/empty-ref boxes + a bare point on a BOX task +
+        #     malformed-arity blocks) is DROPPED and counted in
+        #     `deviations_dropped` — kept faithful (NVIDIA's eval keeps
+        #     co-emitted valid detections; a whole-frame error would discard
+        #     them). A bare point on the `point` task is NOT dropped: it is the
+        #     trained output, labeled with the queried phrase by parse_points.
         #   * zero valid-for-task BUT ≥1 geometry block emitted (off-shape /
         #     unlabeled / malformed-arity) → `model_deviation` error: nothing
         #     usable to return.
@@ -1648,12 +1660,12 @@ class LocateAnythingInference:
                 deviation_message=(
                     f"model emitted geometry but zero valid {shape_word}(s) for "
                     f"the '{prompt_task}' task: dropped {dropped} off-contract "
-                    "item(s) (off-shape geometry and/or boxes/points with no "
-                    "non-empty <ref> label) and nothing usable remained. The "
-                    "verbatim model output is preserved in raw_text. This is a "
-                    "task->shape / labeling deviation from the trained output "
-                    "contract (empirically 0 across 3,444 trials at the trained "
-                    "sampling params)."
+                    "item(s) (geometry in the wrong shape for the task, "
+                    "geometry with no label, or malformed-arity blocks) and "
+                    "nothing usable remained. The verbatim model output is "
+                    "preserved in raw_text. This is a task->shape / labeling "
+                    "deviation from the trained output contract (empirically 0 "
+                    "across 3,444 trials at the trained sampling params)."
                 ),
                 raw_answer=answer,
                 deviations_dropped=dropped,

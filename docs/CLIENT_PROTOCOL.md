@@ -374,8 +374,11 @@ there is nothing there."
 `deviations_dropped` (in the metadata of `boxes`/`points`/`abstained`)
 counts **off-contract items the server dropped while keeping the valid
 geometry**: output in the wrong shape for the task (a point on a
-box-shaped task, or vice-versa) and any box/point the model emitted with
-no non-empty `<ref>` label. It is usually `0` and is **non-fatal** —
+box-shaped task, or a box on the `point` task) and any box the model
+emitted with no `<ref>` label. (On the `point` task the model's trained
+output is a *bare* `<box><x><y></box>` with no `<ref>`; the server labels
+each such point with the queried phrase and returns it — these are **not**
+dropped.) It is usually `0` and is **non-fatal** —
 co-emitted valid geometry is still returned in the variant's array. The
 dropped tokens remain verbatim in `raw_text`. Zero cross-shape events
 were observed in 3,444 trials at trained sampling params spanning all 7

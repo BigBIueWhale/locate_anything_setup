@@ -31,12 +31,25 @@ NVIDIA's eval-time `<ref>(category)</ref>((?:<box>.*?</box>)+)` capture
 `inference_detection_ddp.py:282-300`) so every sibling box inherits the
 ref's label.
 
-CONTRACT (wire v2): a Detection/Point is only emitted when it carries a
-non-empty `<ref>` label. The seven canonical templates ALWAYS emit a
-`<ref>label</ref>` before each box/point run, so a labeled geometry is the
-only on-contract shape. THREE off-contract shapes can appear in non-conforming
-model output and are explicitly NOT turned into label=None detections:
-  * an ORPHAN box/point — one with no preceding `<ref>` run at all;
+CONTRACT (wire v2): every emitted Detection/Point carries a non-empty label —
+a label-less geometry is unrepresentable on the wire
+(rust_server/src/protocol.rs::LabeledBox/LabeledPoint). The label's SOURCE is
+shape-specific:
+  * BOX templates (1-6) emit an explicit `<ref>label</ref>` before every box
+    run, so a box is labeled by its `<ref>`.
+  * The POINT template (7, `Point to: PHRASE.`) is the exception: its TRAINED
+    output is a BARE `<box><x><y></box>` with NO `<ref>` (DATA_PREPARATION.md:
+    195). `parse_points` labels each bare point with the `point_label` it is
+    given — the queried phrase, recovered via `prompts.point_phrase` and passed
+    in by `worker/inference.py` for the `point` task — mirroring NVIDIA's eval,
+    which attributes a single-category pointing call's bare points to the one
+    queried category (inference_grounding_ddp.py:297-312). A point that instead
+    arrives inside a `<ref>` run is labeled by that ref.
+Off-contract shapes appear only in NON-conforming output and are explicitly NOT
+turned into label=None geometry:
+  * an ORPHAN box, or a bare point on a BOX task — geometry with no `<ref>` and
+    no queried-phrase label to attribute it to (a bare point on the `point`
+    task is NOT orphan: it is the trained output, labeled as above);
   * an EMPTY-REF box/point — one inside a `<ref></ref>` run whose label
     strips to the empty string; and
   * a MALFORMED-ARITY block — a `<box>…</box>` whose contents are neither a
@@ -44,9 +57,8 @@ model output and are explicitly NOT turned into label=None detections:
     that pure-AR / `slow` decoding can produce). NVIDIA's eval parser drops
     these SILENTLY; we instead COUNT them via `count_malformed_geometry` so a
     localization the model attempted can never vanish without a trace.
-All three are dropped from the returned geometry and accounted for: the first
-two in the `off_contract_count` second element of the (geometry,
-off_contract_count) tuple `parse_boxes`/`parse_points` return; the
+The orphan/empty-ref counts ride the `off_contract_count` second element of the
+(geometry, off_contract_count) tuple `parse_boxes`/`parse_points` return; the
 malformed-arity count is returned separately by `count_malformed_geometry`.
 `worker/inference.py` applies the A.3 mapping over these: it keeps the valid
 geometry, folds EVERY off-contract count (orphan/empty-ref + cross-shape
@@ -67,7 +79,7 @@ Verified against NVlabs/Eagle's `Embodied/locateanything_worker.py`
 
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 import re
 
 # Regex for a <ref>label</ref> ref-run followed by ONE OR MORE sibling <box>
@@ -143,8 +155,12 @@ class Detection:
 class Point:
     """A point detection with its (required, non-empty) label.
 
-    Like Detection, a Point is only constructed for a 2-coord box that carries
-    a non-empty `<ref>` label; orphan / empty-ref points are off-contract."""
+    A Point's label is either its enclosing `<ref>` (when the model emits a
+    point inside a ref-run) or — for the `point` task, whose trained output is
+    a bare `<box><x><y></box>` with no `<ref>` — the queried phrase supplied as
+    `parse_points(point_label=…)`. The label is never empty; a 2-coord block
+    with neither label source (a bare point on a box task) is off-contract and
+    never becomes a Point (see module docstring)."""
     label: str
     point_norm: list  # [x, y]
     point_px:   list  # [x, y] in pixels relative to source image
@@ -228,29 +244,41 @@ def parse_boxes(
 
 
 def parse_points(
-    answer: str, image_width: int, image_height: int
+    answer: str, image_width: int, image_height: int,
+    point_label: Optional[str] = None,
 ) -> Tuple[List[Point], int]:
-    """Parse `<ref>label</ref><box><x><y></box>` point runs into Point objects.
+    """Parse the model's pointing / grounding-point output into Point objects.
 
-    Returns a `(points, off_contract_count)` tuple with the same contract as
-    `parse_boxes`: valid points carry a non-empty `<ref>` label; orphan and
-    empty-ref points are off-contract (counted, never emitted).
+    Returns a `(points, off_contract_count)` tuple. Every emitted Point carries
+    a non-empty label; where the label comes from depends on the shape the
+    model emitted:
 
-    Mirrors NVIDIA's eval-time parser at
-    NVlabs/Eagle's `Embodied/evaluation/inference_grounding_ddp.py:564-587`,
-    which runs BOTH a point_pattern AND a box_pattern over each captured
-    ref-run, attaching the run's category to every match.
+      * `<ref>label</ref><box><x><y></box>` (a point inside a ref-run) → the
+        Point is labeled with the run's `<ref>` (the grounding-point shape;
+        NVIDIA's grounding eval parses points from ref-runs at
+        inference_grounding_ddp.py:564-587).
+      * a BARE `<box><x><y></box>` (no `<ref>`) → this is the TRAINED output of
+        template 7 `Point to: PHRASE.` (DATA_PREPARATION.md:195 maps it to a
+        bare point with no ref). When `point_label` is supplied (the worker
+        passes the queried phrase for the `point` task) each bare point is
+        labeled with it — exactly how NVIDIA's eval attributes a single-
+        category pointing call's bare points to the one queried category
+        (inference_grounding_ddp.py:297-312). When `point_label` is None (the
+        prompt was a BOX task) a bare point is cross-shape and off-contract:
+        counted, never emitted.
+
+    `point_label` is therefore the queried phrase for the `point` task and None
+    for every other task; `worker/inference.py` supplies it via
+    `prompts.point_phrase(prompt)`. The resulting non-empty label is what the
+    wire contract requires (rust_server/src/protocol.rs::LabeledPoint.label).
 
     Two-pass design:
       (1) For each <ref>label</ref><box>...</box>... ref-run, extract every
-          valid 2-coord <box> inside via _POINT_RE. A non-empty label yields
+          valid 2-coord <box> inside via _POINT_RE. A non-empty ref labels the
           Points; an empty-ref run's points are off-contract (counted).
-          Template 7 (`Point to: PHRASE.`) emits this shape:
-          `<ref>PHRASE</ref><box><x><y></box>` — single labeled point per
-          query.
-      (2) Orphan points — 2-coord blocks not inside any ref-run and not
-          shadowed by a 4-coord box span. Off-contract (counted). The model
-          can also emit bare points without a <ref> prefix.
+      (2) Bare points — 2-coord blocks not inside any ref-run and not shadowed
+          by a 4-coord box span. Labeled with `point_label` (point task) or
+          counted off-contract (box task / `point_label` None).
 
     De-dup rule: a 2-coord <box><x><y></box> is a strict substring of the
     `<box><x><y>...` prefix of any 4-coord box, but _POINT_RE requires
@@ -260,7 +288,7 @@ def parse_points(
     point spans to avoid double-counting points that live inside ref-runs.
 
     Critically, we do NOT dedup against _REF_RUN_RE spans whole — the
-    ref-run span contains the box content, and for template 7 the box
+    ref-run span contains the box content, and for a ref-labeled point the box
     content IS the point we want to extract.
     """
     box_spans: List[tuple] = [m.span() for m in _BOX_RE.finditer(answer)]
@@ -282,38 +310,35 @@ def parse_points(
             # 2nd coord — but defensive against future regex relaxation.)
             if any(abs_start < ie and bs < abs_end for (bs, ie) in box_spans):
                 continue
-            # Clamp to the [0,1000] grid and KEEP — never silently drop a point
-            # the model localized. This mirrors the box path's `_make_box`
-            # clamp-and-keep; the previous `continue` on out-of-range was a
-            # silent drop, asymmetric with boxes. Real coord tokens are already
-            # in range (<0>..<1000>), so this is defense-in-depth.
-            x, y = _clamp_coord(int(pm.group(1))), _clamp_coord(int(pm.group(2)))
             consumed_point_spans.append((abs_start, abs_end))
             if not label:
                 # Empty-ref point: off-contract (no non-empty label).
                 off_contract += 1
                 continue
-            out.append(
-                Point(
-                    label=label,
-                    point_norm=[x, y],
-                    point_px=[round(x / 1000.0 * image_width, 2),
-                              round(y / 1000.0 * image_height, 2)],
-                )
-            )
+            # _make_point clamps each coord to the [0,1000] grid and KEEPS it —
+            # a point the model localized is never silently dropped on range
+            # (symmetric with the box path's `_make_box`).
+            out.append(_make_point(label, int(pm.group(1)), int(pm.group(2)),
+                                   image_width, image_height))
 
-    # Pass 2: orphan points — 2-coord blocks not inside any 4-coord box
-    # and not already emitted/counted by pass 1. Off-contract (counted).
+    # Pass 2: bare points — 2-coord blocks not inside any 4-coord box and not
+    # already emitted/counted by pass 1. For the POINT task these ARE the
+    # trained output (the model emits `<box><x><y></box>` with no `<ref>`); we
+    # label each with `point_label`, the queried phrase, matching NVIDIA's eval
+    # (a single-category pointing call's bare points all carry that one queried
+    # category). For every other task `point_label` is None → a bare point is
+    # cross-shape and off-contract: COUNTED, never silently dropped.
     for m in _POINT_RE.finditer(answer):
         s, e = m.span()
         if any(s < ie and bs < e for (bs, ie) in box_spans):
             continue
         if any(s < ie and cs < e for (cs, ie) in consumed_point_spans):
             continue
-        # Orphan point (no <ref> label): off-contract, always COUNTED — never
-        # silently dropped on range (symmetric with the box path's clamp-and-
-        # keep, which never drops a localized box on range either).
-        off_contract += 1
+        if point_label:
+            out.append(_make_point(point_label, int(m.group(1)),
+                                   int(m.group(2)), image_width, image_height))
+        else:
+            off_contract += 1
     return out, off_contract
 
 
@@ -410,5 +435,30 @@ def _make_box(
             round(y_lo / 1000.0 * image_height, 2),
             round(x_hi / 1000.0 * image_width, 2),
             round(y_hi / 1000.0 * image_height, 2),
+        ],
+    )
+
+
+def _make_point(
+    label: str,
+    x: int,
+    y: int,
+    image_width: int,
+    image_height: int,
+) -> Point:
+    """Build a Point from two raw coordinate-token values.
+
+    Mirrors `_make_box`: each coord is clamped to the [0,1000] token grid and
+    KEPT — a point the model localized is never silently dropped on range. The
+    model decodes the two coordinate positions independently (per the model's
+    `generate_utils.py`), so the same clamp-and-keep discipline as the box path
+    applies; the verbatim token-order emission stays in `raw_answer`."""
+    xc, yc = _clamp_coord(x), _clamp_coord(y)
+    return Point(
+        label=label,
+        point_norm=[xc, yc],
+        point_px=[
+            round(xc / 1000.0 * image_width, 2),
+            round(yc / 1000.0 * image_height, 2),
         ],
     )

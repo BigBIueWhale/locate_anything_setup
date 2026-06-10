@@ -489,6 +489,17 @@ mod wire_tests {
         );
     }
     #[test]
+    fn resp_rejects_unlabeled_point() {
+        // Symmetric to resp_rejects_unlabeled_box: a point's `label` is REQUIRED.
+        // It is the queried phrase the worker attributes to the model's BARE
+        // pointing output (`<box><x><y></box>`, no `<ref>`); a label-less point
+        // is rejected at the egress, so the worker producing one would fail loud
+        // here rather than reach the client.
+        rejects::<Response>(
+            r#"{"type":"points","frame_id":"f","points":[{"point_norm":[500,300],"point_px":[960.0,324.0]}],"raw_text":"x","model_output_truncated":false,"deviations_dropped":0,"image_size":[1,1],"resize_plan":{"dst_w":1,"dst_h":1,"n_llm_tokens":1,"scale":1.0},"generation_mode_used":"slow","latency_ms":1.0,"total_ms":2.0}"#,
+        );
+    }
+    #[test]
     fn resp_rejects_negative_norm() {
         // bbox_norm is u16 → a negative coordinate is unrepresentable.
         rejects::<Response>(

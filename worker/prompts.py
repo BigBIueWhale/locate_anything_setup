@@ -214,6 +214,46 @@ def point_to(phrase: str) -> str:
     return f"{POINT_PREFIX}{phrase.strip()}."
 
 
+def point_phrase(prompt: str) -> str:
+    """Recover the queried phrase from a compiled `point` (template 7) prompt.
+
+    Exact inverse of `point_to`/`ground_gui(..., "point")` and of the Rust
+    builder (`rust_server/src/prompt_validator.rs::compile`, Point arm): all
+    three render `f"{POINT_PREFIX}{phrase}."` from an already-validated phrase
+    slot that — per the A.1 slot rules — is non-empty, carries no leading or
+    trailing whitespace, and does NOT itself end with `.`. Stripping the
+    canonical prefix and the single trailing period therefore recovers the
+    phrase byte-exactly (a slot may contain interior `.`, e.g. `the U.S. flag`,
+    but never a trailing one, so exactly one period is removed).
+
+    The worker uses this to LABEL the model's pointing output. Template 7 is the
+    one template whose trained target carries NO `<ref>`: the model emits a bare
+    `<box><x><y></box>` (DATA_PREPARATION.md:195), and NVIDIA's eval attributes
+    each single-category pointing call's bare points to the one queried category
+    (inference_grounding_ddp.py:297-312). That queried category is the phrase
+    recovered here, which becomes the point's required wire label
+    (`rust_server/src/protocol.rs::LabeledPoint.label`).
+
+    Raises ValueError if `prompt` is not a canonical point prompt — an
+    unreachable state on the served path (the Rust validator emits the `point`
+    wire-name and this prompt from one atomic match arm, and the boot drift
+    check pins POINT_PREFIX across both sides), surfaced loudly, never guessed.
+    """
+    if not prompt.startswith(POINT_PREFIX):
+        raise ValueError(
+            f"point_phrase requires a canonical point prompt beginning with "
+            f"{POINT_PREFIX!r} (see {CANONICAL_REFERENCE_URL}); got {prompt!r}"
+        )
+    body = prompt[len(POINT_PREFIX):]
+    phrase = body[:-1] if body.endswith(".") else body
+    if not phrase:
+        raise ValueError(
+            f"point prompt {prompt!r} has an empty phrase slot once the "
+            f"{POINT_PREFIX!r} prefix and trailing period are removed"
+        )
+    return phrase
+
+
 def classify_prompt(prompt: str) -> str:
     """Classify a canonical prompt string into its `prompt_task` wire name
     (one of TEMPLATE_WIRE_NAMES). This is the Python mirror of the Rust
